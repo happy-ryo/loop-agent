@@ -185,30 +185,34 @@ class HumanGate:
             else f"gate-{state.iteration}"
         )
 
+        # 未登録なら pending を登録する。``request_decision`` は冪等で、**自分の
+        # transaction 内で読んだ権威ある現在行** を返す。get_decision で None を見た後に
+        # 別接続が insert/resolve する TOCTOU 窓があるため、None のときは
+        # request_decision の戻り値 (= 並行作成済みなら相手の行) を権威として扱う。
         entry = self.store.get_decision(self.run_id, gate_key)
-        if entry is not None:
-            # 既存行 (pending/resolved/executed): どの分岐に進む前に **必ず** 登録時の
-            # action と現在の提案 action の一致を確認する。提案列が resume 間でずれ、
-            # 別の不可逆 action が同じ gate_key に来た場合に、(a) 古い決定を現在の別 action
-            # へ誤適用する / (b) 実行済みとして新しい不可逆 action を silent に握り潰す /
-            # (c) resolver が古い pending を承認して現在の別 action を実行する、のいずれも
-            # 防ぐ (新規登録は context そのものなので下の request_decision 後は自明一致)。
-            self._guard_action_matches(entry, context, gate_key)
-            if entry["status"] == "executed":
-                # 既に実行済みの不可逆 action。resume 再生では再実行せず skip する。
-                return self._already_executed_skip(gate_key)
-            if entry["status"] == "resolved":
-                # resume などで既に下されている決定を適用 (人間に二度問わない)。
-                return self._apply_resolved(
-                    Decision(entry["decision"], entry["payload"]), context, gate_key
-                )
-            # status == "pending": 下の未解決パスへ落ちる (request_decision は冪等)。
+        if entry is None:
+            entry = self.store.request_decision(self.run_id, gate_key, context)
 
-        # 未解決 (未登録 or pending): まず pending を登録 (冪等)。
-        pending = self.store.request_decision(self.run_id, gate_key, context)
+        # どの分岐に進む前に **必ず** 登録時の action と現在の提案 action の一致を確認する。
+        # 提案列が resume 間でずれ、別の不可逆 action が同じ gate_key に来た場合に、(a) 古い
+        # 決定を現在の別 action へ誤適用 / (b) 実行済みとして新しい不可逆 action を silent に
+        # 握り潰す / (c) resolver が古い pending を承認して現在の別 action を実行する、の
+        # いずれも防ぐ (新規登録は context そのものなので自明一致)。
+        self._guard_action_matches(entry, context, gate_key)
 
+        if entry["status"] == "executed":
+            # 既に実行済みの不可逆 action (replay 再生 or 並行 resume の勝者)。再実行せず skip。
+            return self._already_executed_skip(gate_key)
+        if entry["status"] == "resolved":
+            # 既に下されている決定を適用 (人間に二度問わない)。並行 resolve も
+            # get_decision/request_decision の権威行でここに合流する。
+            return self._apply_resolved(
+                Decision(entry["decision"], entry["payload"]), context, gate_key
+            )
+
+        # status == "pending": 未解決。
         if self.resolver is not None:
-            decision = self.resolver(pending)
+            decision = self.resolver(entry)
             if not isinstance(decision, Decision):
                 raise TypeError(
                     "resolver must return a Decision, got "
@@ -224,7 +228,7 @@ class HumanGate:
 
         # resolver 無し: 中断して人間の決定を待つ。決定は store に永続化済みなので
         # 同じ run_id で再実行すれば上の resolved 分岐で適用される。
-        return GateReview(disposition=GATE_PAUSE, pending=pending)
+        return GateReview(disposition=GATE_PAUSE, pending=entry)
 
     def _guard_action_matches(
         self, entry: dict[str, Any], context: Any, gate_key: str

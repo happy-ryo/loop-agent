@@ -319,6 +319,32 @@ def test_synchronous_resolver_resolves_inline(tmp_path):
     assert store.get_decision(RUN_ID, "gate-1")["decision"] == "approve"
 
 
+def test_existing_resolution_is_honored_over_resolver(tmp_path):
+    # 既に resolved 済みの決定 (= 並行 resume の勝者が先に解決した状況) は、resolver が
+    # 設定されていても resolver を呼ばず保存済み決定を適用する (再 check の保証)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
+    store.request_decision(RUN_ID, "gate-1", "deploy")
+    store.resolve_decision(RUN_ID, "gate-1", "reject")  # 別者が先に reject
+
+    resolver_calls = []
+
+    def resolver(pending):
+        resolver_calls.append(pending["gate_key"])
+        return Decision("approve")  # resolver は approve したいが、保存済み reject が勝つ
+
+    gather, act, executed = make_world(ACTIONS)
+    gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID, resolver=resolver)
+    run_loop(
+        act=act, verify=never_done, conditions=[MaxIterations(3)],
+        gather=gather, gate=gate,
+    )
+    assert resolver_calls == []  # 既決のため resolver は呼ばれない
+    assert executed == ["work", "work2"]  # reject が反映され deploy は実行されない
+    assert store.get_decision(RUN_ID, "gate-1")["decision"] == "reject"
+
+
 def test_run_gated_loop_forwards_initial_state(tmp_path):
     # run_gated_loop に initial_state を渡すと #14 の中断地点継続 resume になる
     # (iteration 0 からの replay でなく、既実行 reversible を再実行しない)。
