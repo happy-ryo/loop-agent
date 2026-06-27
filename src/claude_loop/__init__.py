@@ -30,6 +30,16 @@ from .conditions import (
     Timeout,
     TokenBudget,
 )
+from .discovery import (
+    AdoptionResult,
+    BlockedCandidate,
+    Candidate,
+    Proposal,
+    Triage,
+    WorkDiscovery,
+    discover_next,
+    triage,
+)
 from .events import (
     LOOP_BEGIN,
     LOOP_END,
@@ -92,6 +102,15 @@ __all__ = [
     "HumanGate",
     "Decision",
     "run_gated_loop",
+    # work-discovery 入力選定 (report.md S3.5 / S4.6 / S5 Phase 3; Issue #24)
+    "Candidate",
+    "BlockedCandidate",
+    "Triage",
+    "triage",
+    "Proposal",
+    "AdoptionResult",
+    "WorkDiscovery",
+    "discover_next",
 ]
 
 __version__ = "0.0.1"
