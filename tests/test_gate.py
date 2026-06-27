@@ -382,6 +382,25 @@ def test_double_resolve_is_rejected(tmp_path):
         store.resolve_decision(RUN_ID, "g1", "reject")
 
 
+def test_gated_action_must_be_json_native(tmp_path):
+    # gated action は resume の同一性比較の基準になるため JSON ネイティブ厳守。
+    # 非ネイティブ (repr に潰れて別 action と誤一致しうる) は登録時に loud に弾く。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    store.load_or_init(RUN_ID)
+
+    class Obj:
+        pass
+
+    with pytest.raises(ValueError, match="JSON-native"):
+        store.request_decision(RUN_ID, "g1", Obj())
+    # tuple も list へ化けて lossy なので弾く (誤一致防止)。
+    with pytest.raises(ValueError, match="JSON-native"):
+        store.request_decision(RUN_ID, "g2", (1, 2))
+    # str/dict/list/数値はそのまま通る。
+    assert store.request_decision(RUN_ID, "g3", {"cmd": "deploy"})["action"] == {"cmd": "deploy"}
+
+
 def test_edit_payload_must_be_json_native(tmp_path):
     # edit の置換 action は resume で store から復元されて実行されるため、JSON 往復で
     # 欠損する非ネイティブ値 (任意オブジェクト) は記録時に loud に弾く。

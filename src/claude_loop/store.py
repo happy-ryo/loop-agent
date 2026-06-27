@@ -220,6 +220,26 @@ def _encode_observation(observation: Any) -> str:
     )
 
 
+def _require_json_native(value: Any, what: str) -> str:
+    """``value`` を JSON 符号化して返すが、**round-trip lossless** でなければ弾く。
+
+    :func:`_encode_observation` は observation の best-effort 永続化のため非 JSON
+    ネイティブ値 (任意オブジェクト / tuple / NaN 等) を ``repr`` 等へ潰すが、人間ゲートの
+    **実行される / 同一性比較される** 値 (gated action・edit の置換 action) でそれを許すと、
+    ``(1, 2)`` が ``[1, 2]`` に化けて別 action と誤一致したり、オブジェクトが ``'<x>'`` 文字列
+    として実行される事故になる。符号化→復号して元と一致しない (= 欠損する) 値は、その場で
+    ``ValueError`` で loud に弾く (safety-sensitive な値は fidelity を厳格化する)。
+    """
+    encoded = _encode_observation(value)
+    if json.loads(encoded) != value:
+        raise ValueError(
+            f"{what} must be JSON-native (round-trippable) so it survives "
+            f"persistence/comparison losslessly; got {value!r} which does not. "
+            "Use str/int/float/bool/None/list/dict."
+        )
+    return encoded
+
+
 class LoopStore:
     """接続に束ねた loop 状態の writer/reader。StateWriter 風の明示的 transaction。
 
@@ -574,10 +594,14 @@ class LoopStore:
         pause 後の resume で同じ action を再評価しても、既に下した決定 (resolved) や
         登録済みの pending を壊さない (= 人間に二重に問わない)。新規登録時のみ
         ``loop_gate`` event を 1 件追記する。
+
+        ``action`` は **JSON ネイティブ (round-trip lossless)** を要求する。gated action は
+        resume 時に同一性比較 (誤適用防止) の基準になり、欠損符号化を許すと別 action と
+        誤一致しうるため (:func:`_require_json_native` 参照)。
         """
         if not gate_key:
             raise ValueError("request_decision: gate_key must be a non-empty string")
-        action_json = _encode_observation(action)
+        action_json = _require_json_native(action, "gated action")
         with self.transaction():
             existing = self.conn.execute(
                 "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
@@ -627,17 +651,14 @@ class LoopStore:
             raise ValueError(
                 f"unknown decision {decision!r}; expected one of {DECISION_KINDS}"
             )
-        payload_json = _encode_observation(payload) if payload is not None else None
-        if (
-            decision == "edit"
-            and payload_json is not None
-            and json.loads(payload_json) != payload
-        ):
-            raise ValueError(
-                "edit payload must be JSON-native (round-trippable) so the "
-                "replacement action survives pause/resume losslessly; got "
-                f"{payload!r} which does not. Use str/int/float/bool/None/list/dict."
-            )
+        if payload is None:
+            payload_json = None
+        elif decision == "edit":
+            # edit の置換 action は resume で復元され *実行される* ので JSON ネイティブ厳守。
+            payload_json = _require_json_native(payload, "edit payload")
+        else:
+            # respond 等のメッセージは best-effort (実行されないので従来どおり符号化)。
+            payload_json = _encode_observation(payload)
         with self.transaction():
             existing = self.conn.execute(
                 "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",

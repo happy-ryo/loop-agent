@@ -78,7 +78,7 @@ from .loop import (
     run_loop,
 )
 from .state import LoopState
-from .store import DECISION_KINDS, LoopStore, _encode_observation
+from .store import DECISION_KINDS, LoopStore, _require_json_native
 
 # 不可逆判定の述語: 提案された action (gather が返す context) を見て interrupt すべきか。
 IrreversiblePredicate = Callable[[Any], bool]
@@ -209,12 +209,12 @@ class HumanGate:
                     "resolver must return a Decision, got "
                     f"{type(decision).__name__}"
                 )
+            # resolve_decision は edit payload に JSON ネイティブを要求するので、ここに
+            # 到達した時点で payload はロスレス。store 復号を介さず resolver が返した元の
+            # Decision をそのまま適用し、不要な往復を避ける。
             self.store.resolve_decision(
                 self.run_id, gate_key, decision.kind, decision.payload
             )
-            # store 経由でなく resolver が返した元の Decision を適用する (edit の
-            # 置換 action が非 JSON ネイティブでも忠実に act へ渡す。store 復号値は
-            # JSON 往復で repr 化しうる)。
             return self._apply_resolved(decision, context, gate_key)
 
         # resolver 無し: 中断して人間の決定を待つ。決定は store に永続化済みなので
@@ -229,10 +229,14 @@ class HumanGate:
         gate key は不可逆 action の出現順 seq から決まるので、提案列が resume 間で
         決定的なら登録時と同じ action に同じキーが割り当たる (契約)。万一ずれた場合に
         **別の不可逆 action へ誤って決定を適用する** のを silent に許さず、loud に弾く。
-        登録時と同じ符号化で比較するため、提案列が決定的なら誤検知しない。
+
+        ``stored`` は登録時に :func:`_require_json_native` 検証済みでロスレス。比較する
+        現在の ``context`` も JSON ネイティブを要求して同様にロスレス化する。これを怠ると
+        ``(1, 2)`` が ``[1, 2]`` に化けて別 action と誤一致しうる。提案列が決定的かつ
+        JSON ネイティブなら誤検知しない。
         """
         stored = entry.get("action")
-        current = json.loads(_encode_observation(context))
+        current = json.loads(_require_json_native(context, "gated action"))
         if stored != current:
             raise ValueError(
                 f"gate {gate_key}: proposed action does not match the action this "
