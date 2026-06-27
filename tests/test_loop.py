@@ -6,7 +6,10 @@ import pytest
 
 from claude_loop import (
     ActOutcome,
+    GoalCheck,
+    GoalMet,
     MaxIterations,
+    NoProgress,
     Timeout,
     TokenBudget,
     VerifyOutcome,
@@ -101,6 +104,124 @@ def test_goal_beats_caps_on_the_same_iteration():
     )
     assert result.goal_met is True
     assert result.iterations == 3
+
+
+# -- dual stop: semantic conditions driving the loop -----------------------
+
+
+def test_goal_met_condition_stops_loop_as_success():
+    # The verify hook never fires; termination comes from the GoalMet condition
+    # inspecting accumulated state. It is reported as a stop, but the trigger
+    # name marks it a *success* rather than a mechanical cut-off.
+    result = run_loop(
+        act=acting(tokens=0),
+        verify=never_done,
+        conditions=[GoalMet(lambda state: state.iteration >= 3), MaxIterations(100)],
+    )
+    assert result.status == "stopped"
+    assert result.stop.name == "goal_met"
+    assert result.reason == "goal verified"
+    assert result.iterations == 3
+    # `goal_met` reflects only the verify-hook channel, so it stays False here;
+    # `succeeded` collapses both success channels and must be True.
+    assert result.goal_met is False
+    assert result.succeeded is True
+
+
+def test_succeeded_distinguishes_success_channels_from_aborts():
+    # Natural (verify-hook) success: both goal_met and succeeded are True.
+    natural = run_loop(
+        act=acting(tokens=0),
+        verify=done_after(2),
+        conditions=[MaxIterations(100)],
+    )
+    assert natural.goal_met is True
+    assert natural.succeeded is True
+
+    # NoProgress abort: a stop, but not a success on either accessor.
+    abort = run_loop(
+        act=acting(tokens=0, observation="noop"),
+        verify=never_done,
+        conditions=[NoProgress(window=3, repeat=3), MaxIterations(100)],
+    )
+    assert abort.stop.name == "no_progress"
+    assert abort.goal_met is False
+    assert abort.succeeded is False
+
+    # Mechanical cut-off: likewise not a success.
+    capped = run_loop(
+        act=acting(tokens=0),
+        verify=never_done,
+        conditions=[MaxIterations(2)],
+    )
+    assert capped.goal_met is False
+    assert capped.succeeded is False
+
+
+def test_goal_met_detail_surfaces_in_result_reason():
+    def verifier(state):
+        met = state.iteration >= 2
+        return GoalCheck(met=met, detail="suite green" if met else "")
+
+    result = run_loop(
+        act=acting(tokens=0),
+        verify=never_done,
+        conditions=[GoalMet(verifier), MaxIterations(100)],
+    )
+    assert result.stop.name == "goal_met"
+    assert result.reason == "goal verified: suite green"
+    assert result.iterations == 2
+
+
+def test_no_progress_condition_aborts_thrashing_loop():
+    # Every step emits the same observation -> the loop is stuck; NoProgress
+    # cuts it off well before the mechanical backstop.
+    result = run_loop(
+        act=acting(tokens=0, observation="noop"),
+        verify=never_done,
+        conditions=[NoProgress(window=3, repeat=3), MaxIterations(100)],
+    )
+    assert result.status == "stopped"
+    assert result.stop.name == "no_progress"
+    assert result.iterations == 3
+    assert "repeated 3 times" in result.reason
+
+
+def test_dual_stop_goal_beats_no_progress_on_same_guard():
+    # A loop that both makes no progress *and* has met its goal must terminate
+    # as a success: GoalMet is declared first, so OR ordering reports it.
+    result = run_loop(
+        act=acting(tokens=0, observation="noop"),
+        verify=never_done,
+        conditions=[
+            GoalMet(lambda state: state.iteration >= 3),
+            NoProgress(window=3, repeat=3),
+            MaxIterations(100),
+        ],
+    )
+    assert result.stop.name == "goal_met"
+    assert result.iterations == 3
+
+
+def test_mechanical_cap_still_bounds_a_never_satisfied_dual_stop():
+    # Neither semantic condition can fire (goal never met; every action is
+    # distinct so there is no repeat); the hard cap must still terminate (R3).
+    seq = iter(range(1000))
+
+    def act(_ctx):
+        return ActOutcome(observation=next(seq), tokens=0)
+
+    result = run_loop(
+        act=act,
+        verify=never_done,
+        conditions=[
+            GoalMet(lambda state: False),
+            NoProgress(window=3, repeat=3),
+            MaxIterations(5),
+        ],
+    )
+    assert result.stop.name == "max_iterations"
+    assert result.iterations == 5
 
 
 # -- boundary / guard-before-first-step ------------------------------------

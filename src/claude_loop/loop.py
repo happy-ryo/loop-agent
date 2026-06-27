@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
-from .conditions import AnyOf, StopCondition, StopTrigger
+from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
 from .state import LoopState, StepRecord
 
 
@@ -48,7 +48,14 @@ class VerifyOutcome:
 
 @dataclass
 class LoopResult:
-    """Outcome of a loop run. ``stop`` is ``None`` when the goal was met."""
+    """Outcome of a loop run.
+
+    ``stop`` is ``None`` only on *natural* termination (the ``verify`` hook met
+    the goal). Otherwise it names the fired condition -- which may itself be a
+    success (a ``GoalMet`` stop, ``stop.name == "goal_met"``) or a halt
+    (``no_progress`` / a mechanical cap). Prefer :attr:`succeeded` over
+    :attr:`goal_met` to test for success regardless of channel.
+    """
 
     status: str  # "goal_met" | "stopped"
     stop: Optional[StopTrigger]
@@ -56,7 +63,29 @@ class LoopResult:
 
     @property
     def goal_met(self) -> bool:
+        """True only for *natural* termination via the ``verify`` hook.
+
+        This reflects the ``verify``-hook channel specifically (``status ==
+        "goal_met"``). A goal reached instead by a :class:`~claude_loop.conditions.GoalMet`
+        *stop condition* terminates with ``status == "stopped"`` and leaves this
+        ``False`` -- use :attr:`succeeded` to detect success across both channels.
+        """
         return self.status == "goal_met"
+
+    @property
+    def succeeded(self) -> bool:
+        """True when the goal was reached by *either* success channel.
+
+        The goal can be verified two ways (report.md S4.5): the ``verify`` hook
+        ending the loop naturally (:attr:`goal_met`), or a
+        :class:`~claude_loop.conditions.GoalMet` stop condition firing at the
+        guard (``stop.name == "goal_met"``). Both are successes, distinct from a
+        ``NoProgress`` abort or a mechanical cut-off; this collapses them so a
+        caller can ask "did it succeed?" without knowing which channel fired.
+        """
+        if self.goal_met:
+            return True
+        return self.stop is not None and self.stop.name == GoalMet.name
 
     @property
     def iterations(self) -> int:

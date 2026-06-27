@@ -21,7 +21,10 @@ from __future__ import annotations
 
 from .conditions import (
     AnyOf,
+    GoalCheck,
+    GoalMet,
     MaxIterations,
+    NoProgress,
     StopCondition,
     StopTrigger,
     Timeout,
@@ -44,6 +47,9 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
+    "GoalMet",
+    "GoalCheck",
+    "NoProgress",
     "ProgressLog",
     "read_progress",
 ]

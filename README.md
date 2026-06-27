@@ -28,8 +28,9 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ ループドライバ + 機械的な合成 stop 条件（発火した条件と理由を保持）
 - ✅ `act` / `verify` は**注入可能なフック**（PoC は in-memory スタブで駆動。LLM 実呼び出しは抽象境界のみ用意）
 - ✅ **暴走防止の保証**: ゴール未達・無進捗・反復アクションでも、上限で必ず停止することを sandbox test で証明（`tests/test_runaway_guard.py`）
+- ✅ **二重終了条件（意味的 stop）**: 機械的上限に加え、`GoalMet`（検証可能ゴールの達成＝成功終了）と `NoProgress`（無進捗・反復アクションの検出＝打ち切り）を同じ `AnyOf` 合成に載せる
 - ✅ **最小状態（進捗ファイル）**: 各反復の記録を JSON Lines で外部ファイルに追記し、プロセスをまたいで進捗が残る（`ProgressLog` / state.db SoT の最小の前身）
-- ⛔ 人間ゲート・state.db SoT・Reflexion・NoProgress 高度検出は**非スコープ**（Phase 2/3）
+- ⛔ 人間ゲート・state.db SoT・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
 
 ### インストール
 
@@ -81,6 +82,34 @@ assert result.stop.name == "max_iterations"   # 発火した条件
 print(result.reason)                          # "reached max iterations (2/2)"
 ```
 
+#### 二重終了条件（GoalMet / NoProgress）
+
+機械的上限と同じ `AnyOf` 合成に**意味的 stop** を載せられる。`GoalMet` は検証可能ゴール
+（テスト / lint / rubric の callable）が満たされたら**成功**として停止し、`NoProgress` は同じ
+アクションが反復されて進捗が出ない場合に**打ち切り**として停止する。どちらも発火は既存の
+`StopTrigger` 形式（`stop.name` = `"goal_met"` / `"no_progress"`）で、宣言順 OR で機械的上限と
+矛盾なく共存する:
+
+```python
+from claude_loop import run_loop, GoalMet, GoalCheck, NoProgress, MaxIterations
+
+result = run_loop(
+    act=act,
+    verify=lambda o: VerifyOutcome(goal_met=False),  # verify フックは使わず条件側で判定
+    conditions=[
+        GoalMet(lambda state: GoalCheck(met=run_tests() == 0, detail="suite green")),
+        NoProgress(window=5, repeat=3),   # 直近 5 ステップで同じアクションが 3 回 → 打ち切り
+        MaxIterations(50),                # 機械的バックストップ（R3）
+    ],
+)
+# 成功判定は result.succeeded（verify フック自然終了と GoalMet 条件の両方を吸収）。
+# スタックなら stop.name == "no_progress"、どちらも起きなければ "max_iterations" が必ず止める。
+```
+
+> `result.goal_met` は **verify フックによる自然終了のみ** を表す（`status == "goal_met"`）。
+> `GoalMet` 条件が発火した成功は `status == "stopped"` / `stop.name == "goal_met"` で返るため
+> `goal_met` は False のまま。チャネルを問わず成功を判定したい場合は `result.succeeded` を使う。
+
 ### 最小状態（進捗ファイル）
 
 各反復の記録を JSON Lines で外部ファイルに追記する最小の永続状態。`ProgressLog.on_step`
@@ -106,7 +135,9 @@ records = read_progress("progress.jsonl")     # 反復ごとの "step" 行 + 末
 | `ActOutcome(observation, tokens)` | `act` フックの返り値（行動結果 + 消費トークン） |
 | `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
 | `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
-| `LoopResult` | `status` / `stop`(発火条件) / `reason` / `iterations` / `tokens_used` / `elapsed` / `history` |
+| `GoalMet(verifier)` | 検証可能ゴールの達成で**成功**停止（`stop.name="goal_met"`）。`verifier(state)` は `bool` か `GoalCheck(met, detail)` を返す |
+| `NoProgress(window, repeat, key=…)` | 直近 `window` ステップで同一 `key`（既定は observation）が `repeat` 回以上 → 無進捗として**打ち切り**（`stop.name="no_progress"`） |
+| `LoopResult` | `status` / `stop`(発火条件) / `reason` / `succeeded`(成功=goal_met 自然終了 or GoalMet 条件発火) / `goal_met`(verify フック自然終了のみ) / `iterations` / `tokens_used` / `elapsed` / `history` |
 | `ProgressLog(path)` | 各反復を JSON Lines で追記する最小の永続状態。`on_step` を `run_loop` に渡し、`record_result(result)` で終了理由を追記 |
 | `read_progress(path)` | 進捗ファイルを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 
