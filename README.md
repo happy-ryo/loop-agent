@@ -379,9 +379,56 @@ result = run_reflexion(
 # result.succeeded is True / result.best_score == 0.95
 ```
 
+#### 外側 Reflexion の永続化/resume（epoch・lesson テーブル + 評価器 version registry）
+
+外側ループの**学習状態**（epoch 進行・episodic memory の lesson・各 epoch で固定された評価器の
+version）を state.db に永続化し、**再起動後も学習の続きから resume** する（Issue #29）。内側
+resume（`LoopStore.load_or_init` / #14）と store lease（#21）を土台に、外側専用の 4 表
+（`reflexion_run` / `reflexion_episode` / `reflexion_lesson` / `reflexion_evaluator`）を**内側
+スキーマと独立・additive**（`IF NOT EXISTS`）に追加する。
+
+- **settled state を SoT に**: `run_reflexion(..., persist=log.on_episode)` の `persist` フックは
+  各 episode が**完全に確定した後**（epoch 昇格・評価器入れ替えを含む境界処理の*後*）に発火する。
+  `DBReflexionLog` がそれを受けて「episode 行 + memory の全 lesson + reflexion_run スカラ + 評価器
+  version 登録」を**1 トランザクション**に束ねて書く。中断地点から resume すると **通し実行と一致**
+  する（episode 数 / epoch / 採用 lesson / 評価器 version / best ground-truth）。
+- **評価器 version registry + fail-loud**: 各 epoch で固定された評価器の version を
+  `reflexion_evaluator` に追記（audit）、現行 version を `reflexion_run` が持つ。resume 時に復元
+  `evaluator_version` と渡された `evaluator.version` が食い違えば `run_reflexion` が**loud に弾く**
+  （callable は直列化できないので別評価器に silently 差し替えない。PR #28 の安全核を継ぐ）。
+  `declared_keys` も同様に整合を要求する（stale な集約での誤収束を防ぐ）。
+- **memory 容量ポリシーも往復**: `cap` / `per_lesson_chars` / `render_byte_cap` を保存し、復元時に
+  同じ上限の `EpisodicMemory` を組み直すので eviction 挙動が resume をまたいで一致する。`paused`
+  episode は未確定なので persist しない（resume で同じ episode を再実行できる）。
+
+```python
+from claude_loop import DBReflexionLog, run_reflexion, MaxEpisodes
+
+# 第 1 プロセス: 3 episode 走って中断（接続を閉じる = プロセス終了相当）
+log = DBReflexionLog("outer.db", "run-1")          # 新規なら空・既存なら復元した途中状態
+result = run_reflexion(
+    episode=episode, ground_truth=ground_truth, reflect=reflect, evaluator=evaluator,
+    convergence=[MaxEpisodes(3)], declared_keys=("correctness",),
+    production_tasks=["fix"], held_out=held_out,
+    initial_state=log.state, memory=log.memory, persist=log.on_episode,   # ← 永続化配線
+)
+log.record_result(result); log.close()
+
+# 第 2 プロセス: 同じ DB を開き直して resume（epoch・採用 lesson・評価器 version ごと継続）
+log2 = DBReflexionLog("outer.db", "run-1")          # state.db から学習状態を復元
+result2 = run_reflexion(
+    episode=episode, ground_truth=ground_truth, reflect=reflect, evaluator=evaluator,
+    convergence=[MaxEpisodes(6)], declared_keys=("correctness",),
+    production_tasks=["fix"], held_out=held_out,
+    initial_state=log2.state, memory=log2.memory, persist=log2.on_episode,
+)
+# result2 は通し MaxEpisodes(6) と episode 数/epoch/採用 lesson/評価器 version/best が一致する
+```
+
 **スコープ境界**: 単一プロセスの self-improving に集中する（分散協調は Issue #21）。外側
-ループの**永続化/resume**（epoch・lesson テーブル + 評価器 version の checksum 検証）と
-OTel 観測の dashboard 化は追跡 follow-up（本 PR は安全核 + 配線の eval 実証に絞る）。
+ループの**永続化/resume**（epoch・lesson テーブル + 評価器 version registry）は **state.db へ
+実装済み（Issue #29。`ReflexionStore` / `DBReflexionLog`）**。残る追跡 follow-up は OTel 観測の
+dashboard 化（安全核 = 二信号モデル / epoch 昇格ゲート / 取込前検証には踏み込まない）。
 
 ### wake 配送 transport（push 一次 / pull fallback / at-most-once）
 
@@ -498,7 +545,9 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す。`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume の in-progress リース調整用（#21） |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | `HumanGate` を組んで `run_loop` を回す入口（`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume 用, #21） |
-| `run_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, epoch_len=4, epsilon=0.02, delta=0.0, propose_evaluator=…, admit_lesson=…, memory=…, on_episode=…, initial_state=…)` | 外側 Reflexion ループ駆動。内側 `run_loop` を 1 episode として呼び、`reflect` の言語的指針を memory へ取り込み次 context へ配線。`ReflexiveResult` を返す |
+| `run_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, epoch_len=4, epsilon=0.02, delta=0.0, propose_evaluator=…, admit_lesson=…, memory=…, on_episode=…, persist=…, initial_state=…)` | 外側 Reflexion ループ駆動。内側 `run_loop` を 1 episode として呼び、`reflect` の言語的指針を memory へ取り込み次 context へ配線。`ReflexiveResult` を返す。`persist` は各 episode の **settled state**（epoch 境界処理後）を受ける永続化フック、`initial_state` に復元 `ReflexionState` を渡すと中断地点から**再開**（resume #29） |
+| `ReflexionStore(conn)` | 外側 Reflexion 状態の writer/reader（内側 `LoopStore` の対）。生成時に `reflexion_run`/`reflexion_episode`/`reflexion_lesson`/`reflexion_evaluator` の 4 表を **additive・非破壊**に適用。`load_or_init(run_id, memory=…)`（新規は空・既存は復元 = resume seed）/ `persist_episode(run_id, record, state)`（episode+memory+スカラ+version を 1 tx で atomic 永続化）/ `record_result(run_id, result)`（終端メタデータ）/ `get_run` / `read_episodes` / `read_evaluator_versions`（評価器 version registry） |
+| `DBReflexionLog(db, run_id, *, memory=…)` | DB-backed の外側進捗記録（内側 `DBProgressLog` の対・drop-in）。`.state`（復元した `ReflexionState` = resume seed）/ `.memory`（live memory）/ `on_episode`（`run_reflexion(persist=…)` に渡す）/ `record_result(result)` / context manager。`memory` は fresh run の容量ポリシー指定（resume では DB 保存値が優先） |
 | `ReflexionContext(episode, epoch, task, evaluator, memory_block)` | `episode` フックに渡る文脈。`memory_block`（前試行の学び）を内側 gather に折り込む |
 | `ReflexiveResult` | `status`(`converged`/`stopped`/`paused`) / `succeeded`（成功条件が成立 = 順序非依存）/ `paused`（内側 episode が人間ゲートで中断）/ `pending`（中断中の内側 pending）/ `best_score` / `episodes` / `epochs` / `reason` / `state`（`ReflexionState`: `episodes` / `gt_aggregate_history` / `memory` …）。内側 episode が `HumanGate` で pause すると外側も score/reflect せず pause を伝播し、決定を永続化して resume すれば同じ episode を再実行する（Issue #15 の pause/resume 契約） |
 | `Score(ground_truth, components=…, judge=…)` | 多軸スコア。`aggregate(declared_keys)` は宣言軸の**最小値**（欠落軸=0.0・judge は除外） |

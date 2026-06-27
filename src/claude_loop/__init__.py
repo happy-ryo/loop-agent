@@ -88,6 +88,7 @@ from .reflexion import (
     ReflexiveResult,
     run_reflexion,
 )
+from .reflexion_store import DBReflexionLog, ReflexionStore
 from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
@@ -161,6 +162,9 @@ __all__ = [
     "ReflexiveResult",
     "EpisodeRecord",
     "EpisodeOutcome",
+    # 外側 Reflexion ループの永続化/resume (Issue #29)
+    "ReflexionStore",
+    "DBReflexionLog",
     "Score",
     "GroundTruthSignal",
     "Evaluator",
