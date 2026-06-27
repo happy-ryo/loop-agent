@@ -171,6 +171,28 @@ def test_evaluator_frozen_within_epoch_updates_only_at_boundary():
     # reward が epoch 内で動いていない (境界でのみ変化) ことが freeze の実証。
 
 
+def test_no_evaluator_update_on_terminal_boundary():
+    """収束/打ち切りが epoch 境界と同時に成立したら、その境界では昇格を走らせない。"""
+
+    def explode(outer, inc):
+        raise AssertionError("propose_evaluator must not run on a terminal boundary")
+
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=lambda ctx: make_result(True),
+            ground_truth=gt_from_success(),
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(2)],   # episode==2 = epoch 境界 (epoch_len=2) と同時に発火
+            held_out=held_out_matching(0.0, 0.5, 1.0),
+            epoch_len=2,
+            propose_evaluator=explode,
+        )
+    )
+    assert result.stop.name == "max_episodes"
+    assert result.state.evaluator_version == HONEST.version  # 終端で書き換えない
+    assert result.epochs == 0
+
+
 def test_gaming_evaluator_rejected_at_boundary():
     """境界で提案された緩い評価器は held-out 一致度が低く昇格できない。"""
     records = []

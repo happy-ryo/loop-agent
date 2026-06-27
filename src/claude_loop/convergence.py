@@ -105,6 +105,12 @@ class ScorePlateau:
     単調改善していれば発火せず、改善が止まった (flat / sawtooth で正味ゲイン無し) ときに
     発火する。range(max-min) ベースだと、緩い実進捗を誤って打ち切り、sawtooth を永遠に
     打ち切れない (それを避ける)。これは成功ではない打ち切り。
+
+    判定は「window 区間の best-so-far の伸びが ``min_delta`` **以下**」(``<=``)。``<`` だと
+    best-so-far は単調非減少なので伸びは常に ``>= 0`` となり、``min_delta=0`` (= 正味ゲインゼロで
+    打ち切りたい flat/sawtooth) が一度も発火しない no-op になってしまう。``<=`` にすることで
+    ``min_delta=0`` は「全く伸びていない」ときだけ発火し、正の ``min_delta`` は「規定の最小進捗に
+    届かない」ときに発火する。
     """
 
     window: int
@@ -123,11 +129,11 @@ class ScorePlateau:
             return None
         best_now = max(history)
         best_past = max(history[: len(history) - self.window])
-        if best_now - best_past < self.min_delta:
+        if best_now - best_past <= self.min_delta:
             return (
                 f"no progress: best ground-truth aggregate improved by "
                 f"{best_now - best_past:.4f} over last {self.window} episodes "
-                f"(< min_delta {self.min_delta:g})"
+                f"(<= min_delta {self.min_delta:g})"
             )
         return None
 

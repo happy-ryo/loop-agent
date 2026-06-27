@@ -71,6 +71,14 @@ def test_plateau_quiet_until_window_filled():
     assert cond.check(_state(gt_aggregate_history=(0.5, 0.5))) is None
 
 
+def test_plateau_zero_delta_fires_on_flat_history():
+    """min_delta=0 は「正味ゲインゼロ」で発火する (no-op にならない)。"""
+    cond = ScorePlateau(window=2, min_delta=0.0)
+    assert cond.check(_state(gt_aggregate_history=(0.5, 0.5, 0.5))) is not None
+    # わずかでも伸びていれば発火しない。
+    assert cond.check(_state(gt_aggregate_history=(0.5, 0.6, 0.7))) is None
+
+
 # -- 予算条件 -------------------------------------------------------------------
 
 

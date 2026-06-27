@@ -407,7 +407,14 @@ def run_reflexion(
             on_episode(record, state)
 
         # (4) epoch 境界: incumbent を入れ替えてよい **唯一** の場所。
-        if state.episode % epoch_len == 0:
+        # ただし、この episode で収束/打ち切り条件が既に成立しているなら昇格しない:
+        # 次以降の episode が無いのに propose/admit を走らせると、終端 run の evaluator_version を
+        # 無用に書き換えたり、proposal hook の例外で終端 run を倒したりしうるため
+        # (次の while ガードで同じ stop が発火して即終了する)。
+        if (
+            state.episode % epoch_len == 0
+            and stop.first_triggered(state.outer_state()) is None
+        ):
             state.epoch += 1
             if propose_evaluator is not None:
                 candidate = propose_evaluator(state.outer_state(), incumbent)
