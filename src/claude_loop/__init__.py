@@ -30,6 +30,7 @@ from .conditions import (
 from .loop import ActOutcome, LoopResult, VerifyOutcome, run_loop
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
+from .store import DBProgressLog, LoopStore, connect
 
 __all__ = [
     "run_loop",
@@ -46,6 +47,9 @@ __all__ = [
     "Timeout",
     "ProgressLog",
     "read_progress",
+    "connect",
+    "LoopStore",
+    "DBProgressLog",
 ]
 
 __version__ = "0.0.1"
