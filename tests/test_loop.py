@@ -12,7 +12,7 @@ from claude_loop import (
     VerifyOutcome,
     run_loop,
 )
-from conftest import FakeClock, acting, done_after, never_done
+from conftest import ManualClock, acting, done_after, never_done, stepping_for
 
 
 # -- natural termination (goal met) ----------------------------------------
@@ -61,17 +61,18 @@ def test_token_budget_cap_stops_loop():
 
 
 def test_timeout_cap_stops_loop():
-    clock = FakeClock(start=0.0, step=2.0)
+    clock = ManualClock()
     result = run_loop(
-        act=acting(tokens=0),
+        act=stepping_for(clock, seconds=2.0),  # each step takes 2s
         verify=never_done,
         conditions=[Timeout(5.0)],
         time_fn=clock,
     )
     assert result.stop.name == "timeout"
-    # start consumes the 0.0 reading; guards then see elapsed 2, 4, 6 -> the
-    # first >= 5 is 6 at the 3rd guard, after 2 completed steps.
-    assert result.iterations == 2
+    # guards see elapsed 0, 2, 4 (run), 6 -> first >= 5 at the 4th guard, after
+    # 3 completed steps. Independent of how often the loop reads the clock.
+    assert result.iterations == 3
+    assert result.elapsed == 6.0
 
 
 # -- reason discrimination across composed caps ----------------------------
@@ -152,6 +153,25 @@ def test_on_step_observes_every_completed_iteration():
         ),
     )
     assert observed == [(0, 2), (1, 4), (2, 6)]
+
+
+def test_on_step_sees_state_consistent_with_record():
+    # On the goal-achieving iteration the observer must see the loop-level
+    # goal_met flag already in sync with the per-step record (and elapsed
+    # refreshed for this step), not the stale pre-step state.
+    clock = ManualClock()
+    seen = []
+    run_loop(
+        act=stepping_for(clock, seconds=1.0),
+        verify=done_after(2),
+        conditions=[MaxIterations(10)],
+        time_fn=clock,
+        on_step=lambda record, state: seen.append(
+            (record.iteration, record.goal_met, state.goal_met, state.elapsed)
+        ),
+    )
+    assert seen[0] == (0, False, False, 1.0)
+    assert seen[-1] == (1, True, True, 2.0)
 
 
 # -- validation -------------------------------------------------------------

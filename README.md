@@ -96,7 +96,7 @@ print(result.reason)                          # "reached max iterations (2/2)"
 ### テスト
 
 ```bash
-python3 -m pytest        # 20 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 など
+python3 -m pytest        # 21 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 など
 ```
 
 ## レポートの要約

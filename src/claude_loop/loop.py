@@ -158,13 +158,15 @@ def run_loop(
         )
         state.history.append(record)
         state.iteration += 1
+        # Refresh post-step fields *before* on_step so the observer (and the
+        # returned result) see state consistent with this iteration's record:
+        # elapsed includes the step just run, and goal_met reflects its verdict.
+        state.elapsed = time_fn() - start
+        if verdict.goal_met:
+            state.goal_met = True
 
         if on_step is not None:
             on_step(record, state)
 
         if verdict.goal_met:
-            state.goal_met = True
-            # Refresh so elapsed includes the final goal-achieving step, keeping
-            # it consistent with the post-step tokens_used / iteration counters.
-            state.elapsed = time_fn() - start
             return LoopResult(status="goal_met", stop=None, state=state)

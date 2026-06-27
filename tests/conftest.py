@@ -7,25 +7,23 @@ from typing import Callable
 from claude_loop import ActOutcome, VerifyOutcome
 
 
-class FakeClock:
-    """Deterministic monotonic clock for timeout tests.
+class ManualClock:
+    """Deterministic clock whose value only moves when explicitly advanced.
 
-    Returns ``start`` on the first call and advances by ``step`` seconds on each
-    subsequent call, so the loop's elapsed time is fully predictable regardless
-    of real wall-clock speed.
+    Reads (``clock()``) are free of side effects, so the result is independent
+    of *how many times* the loop happens to read the clock per iteration. Tests
+    advance it inside the ``act`` hook to model wall-clock time elapsing during
+    a step (see :func:`stepping_for`).
     """
 
-    def __init__(self, start: float = 0.0, step: float = 1.0) -> None:
-        self._now = start
-        self._step = step
-        self._first = True
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
 
     def __call__(self) -> float:
-        if self._first:
-            self._first = False
-            return self._now
-        self._now += self._step
-        return self._now
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def acting(tokens: int = 0, observation: object = None) -> Callable[[object], ActOutcome]:
@@ -33,6 +31,16 @@ def acting(tokens: int = 0, observation: object = None) -> Callable[[object], Ac
 
     def _act(_ctx: object) -> ActOutcome:
         return ActOutcome(observation=observation, tokens=tokens)
+
+    return _act
+
+
+def stepping_for(clock: ManualClock, seconds: float, tokens: int = 0):
+    """An ``act`` stub that advances ``clock`` by ``seconds`` each step."""
+
+    def _act(_ctx: object) -> ActOutcome:
+        clock.advance(seconds)
+        return ActOutcome(observation=None, tokens=tokens)
 
     return _act
 
