@@ -6,7 +6,7 @@
 
 ## 現在のステータス
 
-**PoC → MVP 移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**と、それに載る**中断 → 再開（resume）**を導入した（report.md §5 Phase 2）。残りの MVP / 本格（人間ゲート・Reflexion・観測の本格化）は今後（report.md §5 Phase 2/3）。
+**MVP → 本格（Phase 3）移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**・**中断 → 再開（resume）**・**限定人間ゲート**を導入し、Phase 3 として内側 ReAct の外に**外側 Reflexion ループ + RQGM epoch 安全核**を載せた（report.md §5 Phase 2/3）。残りの本格（transport / work-discovery / dashboard・外側ループの永続化）は今後（report.md §5 Phase 3 / Issue #4）。
 
 ## 成果物
 
@@ -17,6 +17,7 @@
 | [`src/claude_loop/`](./src/claude_loop) | PoC ループコア（ループドライバ + 合成可能 stop 条件） |
 | [`examples/verify_driven_demo.py`](./examples/verify_driven_demo.py) | 検証駆動デモ（sandbox テストが green になるまで回す実走デモ） |
 | [`examples/observed_demo.py`](./examples/observed_demo.py) | 観測デモ（`loop_begin/step/end` を JSONL へ流し、終了理由/メトリクスを見る） |
+| [`examples/reflexion_demo.py`](./examples/reflexion_demo.py) | 外側 Reflexion デモ（失敗 episode の学びを次 episode の context へ配線し ground-truth を改善する） |
 
 `report.html` はブラウザで直接開けます（外部 CSS/JS 依存なし）。内容の正本は `report.md` です。
 
@@ -34,7 +35,9 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
 - ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤）
 - ✅ **中断 → 再開（resume）**: 永続化済み step から `LoopState` を復元し、`run_loop(initial_state=…)` で状態欠落なく途中から継続（iteration・コスト累積・`elapsed`・history を引き継ぐ）。中断して再開した結果が通し実行と一致することを回帰テストで実証（`tests/test_resume.py` / Issue #14）
-- ⛔ 人間ゲート・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
+- ✅ **限定人間ゲート**: 不可逆操作のみ approve/edit/reject/respond で interrupt（state 永続化で pause/resume・不可逆は exactly-once。Issue #15）
+- ✅ **外側 Reflexion ループ + RQGM epoch 安全核**: 内側 ReAct を 1 episode として包み、失敗からの言語的指針を episodic memory へ取り込み次 context へ配線する self-improving（report.md §5 Phase 3 / Issue #22。下記）
+- ⛔ transport / work-discovery / dashboard・外側ループ永続化は**非スコープ**（report.md §5 Phase 3 残り / Issue #4）
 
 ### インストール
 
@@ -284,6 +287,83 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 - `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も
   書かれない（resume で続行できる）。各 step の正本は `step` 行に残るので監査はそこから行う。
 
+### 外側 Reflexion ループ + RQGM epoch 安全核（self-improving）
+
+本格（report.md §4.4 / §5 Phase 3 / §6 / Issue #22・#4 の RQGM コメント）では、内側 ReAct
+ループの**外**に Reflexion 型の試行間ループを重ねる。`run_reflexion(...)` は内側 `run_loop`
+を **1 episode** として呼び（driver は内側に手を入れない）、episode 境界で
+`reflect(trajectory, signal, reward)` を回して**言語的指針（lesson）**を episodic memory に
+取り込み、次 episode の context へ配線する。失敗トラジェクトリからの学びが次ループで eval
+改善につながることを実証する（成功条件 a）。
+
+**二信号モデル（設計の肝・安全核）**: 各 episode は 2 つの異なる信号を生む。
+
+- `signal`（**ground-truth 一次**）: 内側 verify（test/lint/exit-code）と `LoopResult.succeeded`
+  に由来し driver が計算する。収束/頭打ち/best/評価器昇格/lesson 採用 ― **帰結ある制御は
+  すべてこれが駆動**する（評価器の入れ替えに依存しないスケール）。
+- `reward`（**epoch 内で固定**した rubric 評価器の出力）: Reflexion の verbal reinforcement
+  として **`reflect` だけが消費**する。収束/採用判定には一切載らない。
+
+これにより「gameable な評価器スカラを押し上げて収束を宣言する」抜け道が**構造的に**塞がれる。
+
+**安全不変条件（report.md §6 + RQGM。コメントでなく `tests/test_reflexion.py` 等で実証）**:
+
+- **評価器を固定して self-optimize させない**: epoch 構造で epoch 内は評価基準を凍結し、
+  評価器の更新は **epoch 境界でのみ**。更新は held-out の**固定 gold ラベル**に対する一致度で
+  incumbent を ε 超で上回り、かつどの fold/critical probe でも後退しないときに限る
+  （ε-best-belief + dominance。`admit_evaluator`）。`epoch_len>=2` / `epsilon>0` を構成時に強制。
+- **ground-truth 一次**（test/lint/exit-code）、judge は rubric + 限定（`Score` は多様軸の
+  最小値で集約し、欠落軸は 0.0・judge は集約から除外）。
+- **早期停止**（`ScorePlateau` の best-so-far トレンドで頭打ちを打ち切り）/ **多様評価** /
+  **dual-component 分離**（測定経路は事前収録 probe を採点するだけで production の act/gate に
+  触れない。task 名前空間の素性を構成時に検証）/ **memory 取込前検証**（`default_admit` の
+  構造的ゲートで grounding を要求し、support は driver が再計算して上書き ＝ 自己申告を信用
+  しない。false lesson 注入を弾く）。
+- **反省の肥大化・劣化を反復上限で防ぐ**（`EpisodicMemory` の件数/文字/描画バイト上限 +
+  `ReflectionBudget` / `MaxEpisodes`）。
+
+```python
+from claude_loop import (
+    run_reflexion, Evaluator, Score, GroundTruthSignal, HeldOut, Probe,
+    Lesson, MaxEpisodes, RubricThreshold, run_loop, ActOutcome, VerifyOutcome,
+    MaxIterations,
+)
+from claude_loop.memory import step_signature
+
+def episode(ctx):                                    # 1 episode = 内側 run_loop を 1 回
+    has_lesson = "increment by 1" in ctx.memory_block
+    act = lambda _c: ActOutcome(observation="fixed" if has_lesson else "bug", tokens=5)
+    verify = lambda o: VerifyOutcome(goal_met="fixed" in o.observation)
+    return run_loop(act=act, verify=verify, conditions=[MaxIterations(2)])
+
+def ground_truth(o):                                 # 一次信号は内側 verify 由来（評価器ではない）
+    v = 0.95 if o.succeeded else 0.2
+    return GroundTruthSignal(succeeded=o.succeeded,
+                             score=Score(ground_truth=v, components={"correctness": v}))
+
+def reflect(history, signal, reward):                # 失敗から grounded な lesson を抽出
+    if signal.succeeded: return None
+    return Lesson(text="increment by 1", episode=0,
+                  provenance=step_signature(history[-1]), support=1.0)
+
+result = run_reflexion(
+    episode=episode, ground_truth=ground_truth, reflect=reflect,
+    evaluator=Evaluator(score=lambda o: Score(ground_truth=1.0 if o.succeeded else 0.0),
+                        name="rubric"),
+    convergence=[RubricThreshold(0.8, sustain=1), MaxEpisodes(5)],
+    declared_keys=("correctness",),
+    production_tasks=["fix-off-by-one"],
+    held_out=HeldOut((Probe("h0", {"truth": 0.0}, 0.0), Probe("h1", {"truth": 1.0}, 1.0))),
+    epoch_len=2,
+)
+# ep0 は memory 空で fail(0.20) → 学びを取込 → ep1 は配線された指針で pass(0.95)
+# result.succeeded is True / result.best_score == 0.95
+```
+
+**スコープ境界**: 単一プロセスの self-improving に集中する（分散協調は Issue #21）。外側
+ループの**永続化/resume**（epoch・lesson テーブル + 評価器 version の checksum 検証）と
+OTel 観測の dashboard 化は追跡 follow-up（本 PR は安全核 + 配線の eval 実証に絞る）。
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -309,6 +389,18 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True)` | `HumanGate` を組んで `run_loop` を回す入口 |
+| `run_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, epoch_len=4, epsilon=0.02, delta=0.0, propose_evaluator=…, admit_lesson=…, memory=…, on_episode=…, initial_state=…)` | 外側 Reflexion ループ駆動。内側 `run_loop` を 1 episode として呼び、`reflect` の言語的指針を memory へ取り込み次 context へ配線。`ReflexiveResult` を返す |
+| `ReflexionContext(episode, epoch, task, evaluator, memory_block)` | `episode` フックに渡る文脈。`memory_block`（前試行の学び）を内側 gather に折り込む |
+| `ReflexiveResult` | `status`(`converged`/`stopped`) / `succeeded`（成功条件が成立 = 順序非依存）/ `best_score` / `episodes` / `epochs` / `reason` / `state`（`ReflexionState`: `episodes` / `gt_aggregate_history` / `memory` …） |
+| `Score(ground_truth, components=…, judge=…)` | 多軸スコア。`aggregate(declared_keys)` は宣言軸の**最小値**（欠落軸=0.0・judge は除外） |
+| `GroundTruthSignal(succeeded, score, ground_truth_backed=True)` | 一次信号（内側 verify 由来）。`ground_truth_backed=False` は収束に算入しない |
+| `Evaluator(score, rubric=…, name=…, version=…)` | epoch 内で固定する rubric 評価器（reflect 用 reward を出す。`version` は content-hash） |
+| `Probe(case_id, outcome, gold_label, fold=0, critical=False)` / `HeldOut(probes)` | 評価器昇格の測定基盤（固定 gold ラベル。`fold(k)` で回転） |
+| `agreement(evaluator, held_out)` / `admit_evaluator(inc, cand, held_out, *, epsilon, delta=0.0)` | gold への一致度（校正）/ ε-best-belief + dominance の昇格ゲート（`AdmissionResult`） |
+| `Lesson(text, episode, provenance, support)` / `LessonVerdict(admit, reason)` | 言語的指針 / 取込前検証の判定 |
+| `EpisodicMemory(*, cap=8, per_lesson_chars=512, render_byte_cap=4096)` | 有界な episodic memory（`admit` / `render` / 決定的・価値考慮 eviction） |
+| `default_admit(lesson, outcome)` | LLM 非依存の構造的取込前検証（grounding + support + 上限。注入 lesson を弾く） |
+| `MaxEpisodes(n)` / `RubricThreshold(target, sustain=1)` / `ScorePlateau(window, min_delta)` / `ReflectionBudget(n)` / `EvaluatorUpdateBudget(n)` | 外側収束条件（`AnyOf` 互換。`RubricThreshold` は成功条件） |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。

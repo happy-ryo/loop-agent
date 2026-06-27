@@ -41,9 +41,43 @@ from .events import (
     LoopEvent,
     read_events,
 )
+from .convergence import (
+    EvaluatorUpdateBudget,
+    MaxEpisodes,
+    OuterState,
+    ReflectionBudget,
+    RubricThreshold,
+    ScorePlateau,
+    is_success_condition,
+)
+from .evaluator import (
+    AdmissionResult,
+    Evaluator,
+    GroundTruthSignal,
+    HeldOut,
+    Probe,
+    Score,
+    admit_evaluator,
+    agreement,
+)
 from .gate import Decision, HumanGate, run_gated_loop
 from .loop import ActionGate, ActOutcome, GateReview, LoopResult, VerifyOutcome, run_loop
+from .memory import (
+    EpisodicMemory,
+    Lesson,
+    LessonVerdict,
+    default_admit,
+    step_signature,
+)
 from .observe import LoopObserver, run_observed_loop
+from .reflexion import (
+    EpisodeOutcome,
+    EpisodeRecord,
+    ReflexionContext,
+    ReflexionState,
+    ReflexiveResult,
+    run_reflexion,
+)
 from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
@@ -92,6 +126,33 @@ __all__ = [
     "HumanGate",
     "Decision",
     "run_gated_loop",
+    # 外側 Reflexion ループ + RQGM epoch 安全核 (report.md S4.4 / S5 Phase3; Issue #22)
+    "run_reflexion",
+    "ReflexionContext",
+    "ReflexionState",
+    "ReflexiveResult",
+    "EpisodeRecord",
+    "EpisodeOutcome",
+    "Score",
+    "GroundTruthSignal",
+    "Evaluator",
+    "Probe",
+    "HeldOut",
+    "agreement",
+    "admit_evaluator",
+    "AdmissionResult",
+    "Lesson",
+    "LessonVerdict",
+    "EpisodicMemory",
+    "default_admit",
+    "step_signature",
+    "OuterState",
+    "MaxEpisodes",
+    "RubricThreshold",
+    "ScorePlateau",
+    "ReflectionBudget",
+    "EvaluatorUpdateBudget",
+    "is_success_condition",
 ]
 
 __version__ = "0.0.1"
