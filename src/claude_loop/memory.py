@@ -147,6 +147,19 @@ class EpisodicMemory:
         """現在保持している lesson の **読み取り専用** ビュー (gather 配線用)。"""
         return tuple(self._lessons)
 
+    def copy(self) -> "EpisodicMemory":
+        """同じ上限と lesson 群を持つ独立コピーを返す (resume seed の非破壊コピー用)。
+
+        ``Lesson`` は frozen なので浅くコピーして共有してよい (内部 list だけ複製する)。
+        """
+        clone = EpisodicMemory(
+            cap=self.cap,
+            per_lesson_chars=self.per_lesson_chars,
+            render_byte_cap=self.render_byte_cap,
+        )
+        clone._lessons = list(self._lessons)
+        return clone
+
     def __len__(self) -> int:
         return len(self._lessons)
 

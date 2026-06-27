@@ -573,6 +573,32 @@ def test_resume_accepts_matching_evaluator_version():
     assert result.state.episode == 4  # 復元 episode=2 から継続して 4 で停止
 
 
+def test_resume_does_not_mutate_seed_state():
+    """initial_state を破壊的に使わない (caller の snapshot は不変)。"""
+    from claude_loop.reflexion import ReflexionState
+
+    seed = ReflexionState(episode=1, epoch=0, gt_aggregate_history=[0.2])
+    seed_mem_len = len(seed.memory)
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=lambda ctx: make_result(False),
+            reflect=true_reflect,
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(3)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+            initial_state=seed,
+        )
+    )
+    # 走行後も seed は最初のまま (進んだのは内部コピー)。
+    assert seed.episode == 1
+    assert seed.gt_aggregate_history == [0.2]
+    assert len(seed.memory) == seed_mem_len
+    # コピーは前進している。
+    assert result.state.episode == 3
+    assert result.state is not seed
+
+
 def test_production_path_never_runs_held_out_probes():
     """dual-component: episode() は production task のみ受け取り probe を実行しない。"""
     seen_tasks = []

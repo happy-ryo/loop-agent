@@ -301,21 +301,38 @@ def run_reflexion(
     stop = _normalize_conditions(convergence)
 
     if initial_state is not None:
-        state = initial_state
-        if memory is not None:
-            state.memory = memory
         # 外側 resume: 前 run が境界で評価器を昇格していたら、復元 state の evaluator_version は
         # その昇格後の version を指す。評価器 (callable) は直列化できず復元できないため、
         # **silently 別 evaluator に差し替えない**。復元 version と渡された evaluator.version が
         # 食い違うなら、resume 地点で有効だった評価器を渡すよう loud に要求する (epoch-freeze の
         # 監査証跡を resume の継ぎ目で壊さない。version→Evaluator registry での完全復元は follow-up)。
-        if state.evaluator_version and state.evaluator_version != evaluator.version:
+        if (
+            initial_state.evaluator_version
+            and initial_state.evaluator_version != evaluator.version
+        ):
             raise ValueError(
-                f"resume: persisted evaluator_version {state.evaluator_version!r} does not "
-                f"match supplied evaluator.version {evaluator.version!r}. Outer resume cannot "
+                f"resume: persisted evaluator_version {initial_state.evaluator_version!r} does "
+                f"not match supplied evaluator.version {evaluator.version!r}. Outer resume cannot "
                 "reconstruct an evaluator (callables are not serializable); supply the evaluator "
                 "that was active at the resume point (its version must match the persisted one)."
             )
+        # 内側 run_loop と同じく seed を **破壊的に使わない**: caller が保持する resume snapshot を
+        # その場で進めてしまうと、失敗/再試行の再 resume が既に進んだ seed から始まり episode を
+        # 飛ばす。list と memory を複製した独立 state にコピーする (EpisodeRecord/Lesson は
+        # append-only かつ frozen なので浅く共有してよい)。memory が明示指定されていればそれを
+        # live で使う (caller が満たす目的で渡した live オブジェクト)。
+        state = ReflexionState(
+            episode=initial_state.episode,
+            epoch=initial_state.epoch,
+            evaluator_version=initial_state.evaluator_version,
+            gt_aggregate_history=list(initial_state.gt_aggregate_history),
+            best_gt_aggregate=initial_state.best_gt_aggregate,
+            reflections=initial_state.reflections,
+            evaluator_updates=initial_state.evaluator_updates,
+            declared_keys=initial_state.declared_keys,
+            episodes=list(initial_state.episodes),
+            memory=memory if memory is not None else initial_state.memory.copy(),
+        )
     else:
         # `memory or EpisodicMemory()` は不可: 空の EpisodicMemory は __len__==0 で falsy のため
         # 渡された空 memory が捨てられる。明示的に None 判定する。
