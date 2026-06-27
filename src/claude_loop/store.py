@@ -615,12 +615,29 @@ class LoopStore:
         ``respond`` の応答メッセージを載せる (JSON 符号化)。``pending`` 行のみ遷移可能で、
         既に ``resolved`` 済みなら ``ValueError`` (terminal: 一度下した決定は再決定しない)。
         確定時に ``loop_gate`` event を 1 件追記する。
+
+        ``edit`` の ``payload`` は **JSON ネイティブ (round-trip lossless)** を要求する。
+        この payload は resume 時に store から復元されて *実行される action* になるため、
+        非 JSON ネイティブ値 (任意オブジェクト / tuple / NaN 等) を許すと repr 文字列へ
+        潰れて *別の action を実行* する事故になる。記録時点で round-trip 検査し、欠損する
+        なら loud に弾く (observation は best-effort な journal なので潰すが、実行される
+        edit は厳格にする方針)。
         """
         if decision not in DECISION_KINDS:
             raise ValueError(
                 f"unknown decision {decision!r}; expected one of {DECISION_KINDS}"
             )
         payload_json = _encode_observation(payload) if payload is not None else None
+        if (
+            decision == "edit"
+            and payload_json is not None
+            and json.loads(payload_json) != payload
+        ):
+            raise ValueError(
+                "edit payload must be JSON-native (round-trippable) so the "
+                "replacement action survives pause/resume losslessly; got "
+                f"{payload!r} which does not. Use str/int/float/bool/None/list/dict."
+            )
         with self.transaction():
             existing = self.conn.execute(
                 "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",

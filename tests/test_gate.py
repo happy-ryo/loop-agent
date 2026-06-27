@@ -361,6 +361,51 @@ def test_double_resolve_is_rejected(tmp_path):
         store.resolve_decision(RUN_ID, "g1", "reject")
 
 
+def test_edit_payload_must_be_json_native(tmp_path):
+    # edit の置換 action は resume で store から復元されて実行されるため、JSON 往復で
+    # 欠損する非ネイティブ値 (任意オブジェクト) は記録時に loud に弾く。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    store.load_or_init(RUN_ID)
+    store.request_decision(RUN_ID, "g1", "deploy")
+
+    class Obj:  # 非 JSON ネイティブ (repr に潰れてしまう)
+        pass
+
+    with pytest.raises(ValueError, match="JSON-native"):
+        store.resolve_decision(RUN_ID, "g1", "edit", payload=Obj())
+    # JSON ネイティブな置換 action は通る (dict/list/str/数値)。
+    ok = store.resolve_decision(RUN_ID, "g1", "edit", payload={"cmd": "deploy", "safe": True})
+    assert ok["payload"] == {"cmd": "deploy", "safe": True}
+
+
+def test_edit_with_structured_payload_executes_on_resume(tmp_path):
+    # JSON ネイティブな構造化 edit payload が resume 後そのまま act に渡る (fidelity)。
+    db_path = tmp_path / "s.db"
+    actions = ["deploy"]
+    replacement = {"cmd": "deploy", "target": "staging"}
+
+    conn1 = connect(db_path)
+    store1 = LoopStore(conn1)
+    gather1, act1, _ = make_world(actions)
+    res1 = run_loop(
+        act=act1, verify=never_done, conditions=[MaxIterations(1)],
+        gather=gather1, gate=HumanGate(on=is_deploy, store=store1, run_id=RUN_ID),
+    )
+    assert res1.paused
+    conn1.close()
+
+    conn2 = connect(db_path)
+    store2 = LoopStore(conn2)
+    store2.resolve_decision(RUN_ID, "gate-0", "edit", payload=replacement)
+    gather2, act2, executed2 = make_world(actions)
+    run_loop(
+        act=act2, verify=never_done, conditions=[MaxIterations(1)],
+        gather=gather2, gate=HumanGate(on=is_deploy, store=store2, run_id=RUN_ID),
+    )
+    assert executed2 == [replacement]  # 構造化置換 action がそのまま実行された
+
+
 def test_resolve_unknown_decision_kind_raises(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
