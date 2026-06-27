@@ -235,12 +235,15 @@ class HumanGate:
         """既に実行済みの不可逆 action を再生時に skip する GateReview を返す。
 
         observation は hashable な文字列にする (NoProgress 既定 key 対策。
-        :meth:`_apply_resolved` 参照)。
+        :meth:`_apply_resolved` 参照)。``persist=False``: これは前 run で実行・永続化済みの
+        step を resume が読み飛ばすだけの replay no-op なので、on_step に流して本来の
+        step 行 (本来の observation / tokens) を上書きで壊さないようにする。
         """
         return GateReview(
             disposition=GATE_SKIP,
             observation=f"gate-skipped:already-executed:{gate_key}",
             detail=f"gate {gate_key} already executed in a prior run",
+            persist=False,
         )
 
     def _apply_resolved(

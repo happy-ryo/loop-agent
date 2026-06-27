@@ -460,6 +460,57 @@ def test_same_gate_instance_reused_across_resume(tmp_path):
     assert store.get_decision(RUN_ID, "gate-1") is None
 
 
+def test_multi_gate_resume_with_db_does_not_corrupt_step_history(tmp_path):
+    # DBProgressLog 併用で複数ゲートを resume しても、既実行ゲートの replay skip が
+    # 前 run の本来の step 行 (observation/tokens) を上書きで壊さないこと。
+    db_path = tmp_path / "s.db"
+    actions = ["deploy1", "work", "deploy2"]
+
+    def run_once(conn):
+        db = DBProgressLog(conn, RUN_ID)
+        gather, act, _ = make_world(actions)
+
+        def act_with_tokens(action):
+            # 不可逆 action には目に見えるトークンを課す (上書きされたら 0 になる)。
+            tokens = 10 if action.startswith("deploy") else 1
+            return ActOutcome(observation=action, tokens=tokens)
+
+        gate = HumanGate(on=is_deploy_prefix, store=db.store, run_id=RUN_ID)
+        res = run_loop(
+            act=act_with_tokens, verify=never_done, conditions=[MaxIterations(3)],
+            gather=gather, gate=gate, on_step=db.on_step,
+        )
+        db.record_result(res)
+        return res
+
+    conn1 = connect(db_path)
+    assert run_once(conn1).paused  # gate-0 で pause
+    LoopStore(conn1).resolve_decision(RUN_ID, "gate-0", "approve")
+    conn1.close()
+
+    conn2 = connect(db_path)
+    assert run_once(conn2).paused  # deploy1 実行後 gate-1 で pause
+    LoopStore(conn2).resolve_decision(RUN_ID, "gate-1", "approve")
+    conn2.close()
+
+    conn3 = connect(db_path)
+    assert run_once(conn3).status == "stopped"
+    conn3.close()
+
+    # 永続化された step 履歴は deploy1 / work / deploy2 が本来の observation・tokens で
+    # 揃い、replay skip プレースホルダ (observation=gate-skipped..., tokens=0) で
+    # 上書き・破壊されていないこと (= codex P1 の step 履歴破壊の修正)。
+    store = LoopStore(connect(db_path))
+    steps = store.read_steps(RUN_ID)
+    assert [s["observation"] for s in steps] == ["deploy1", "work", "deploy2"]
+    assert [s["tokens"] for s in steps] == [10, 1, 10]
+    # per-step の永続値 (監査の正本) は完全。これらの合計が真のコスト。
+    assert sum(s["tokens"] for s in steps) == 21
+    # 注: run 集計 tokens_used は replay-resume では最後の run の in-memory 累計を映し、
+    # 全 run を跨いだ総和にはならない (skip した deploy1 分を再加算しない)。完全な
+    # 集計復元 = loop-state 復元は #14 の領分。step 行が正本という契約は守られる。
+
+
 def test_pending_re_asks_again_on_resume_without_resolution(tmp_path):
     # 登録済みだが未 resolve のまま resume すると、再び同じ gate_key で pause する
     # (pending を二重登録せず、loop_gate(pending) も 1 件のまま)。

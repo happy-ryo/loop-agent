@@ -96,6 +96,11 @@ class GateReview:
     observation: Any = None
     detail: str = ""
     pending: Optional[Any] = None
+    # GATE_SKIP のとき、この skip を観測フック (on_step) に流すか。既定 True。
+    # resume 再生で既実行ゲートを読み飛ばすだけの "replay no-op" な skip は False にして、
+    # 前 run が永続化済みの本来の step 行を上書き (UNIQUE(run_id, iteration) upsert) で
+    # 壊さないようにする。
+    persist: bool = True
 
 
 @runtime_checkable
@@ -300,7 +305,9 @@ def run_loop(
                 state.history.append(record)
                 state.iteration += 1
                 state.elapsed = time_fn() - start
-                if on_step is not None:
+                # replay no-op な skip (review.persist=False) は on_step を呼ばない:
+                # 前 run が永続化した本来の step 行を上書きで壊さないため。
+                if on_step is not None and review.persist:
                     on_step(record, state)
                 continue
             # GATE_PROCEED: execute the (possibly edited) action. An unset
