@@ -260,12 +260,18 @@ def run_observed_loop(
     span_name: str = "claude_loop.loop",
     on_sink_error: Optional[SinkErrorHandler] = None,
     time_fn: Optional[Callable[[], float]] = None,
+    initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
     """観測を配線して :func:`~claude_loop.loop.run_loop` を回す一括の入口。
 
     ``run_loop`` と同じ ``act`` / ``verify`` / ``conditions`` / ``gather`` を取り、
     観測用に ``sinks`` と OTel 設定を足す。利用者の ``on_step`` があれば観測フックと
     合成して両方呼ぶ。返り値は ``run_loop`` の :class:`~claude_loop.loop.LoopResult`。
+
+    ``initial_state`` を渡すと中断したループを観測を保ったまま **resume** できる
+    (``run_loop`` の同名引数へ素通し; 詳細・限界はそちらの docstring 参照)。観測は
+    新プロセスの run として begin/step/end を出すので、loop_begin の iteration は 0 から
+    だが、step/end の iteration・累積メトリクスは復元 state から継続する。
 
     loop_begin（最初のステップ前）→ loop_step×N → loop_end（復帰後）の順で必ず emit
     される。ループ本体の例外は ``status="error"`` の loop_end を残してから再送出する。
@@ -288,10 +294,13 @@ def run_observed_loop(
             observer.on_step(record, state)
             user_on_step(record, state)
 
-    # time_fn を渡されたときだけ run_loop に転送し、既定（time.monotonic）を尊重する。
+    # time_fn / initial_state は渡されたときだけ run_loop に転送し、既定（time.monotonic
+    # / fresh start）を尊重する。
     run_kwargs: dict[str, Any] = {}
     if time_fn is not None:
         run_kwargs["time_fn"] = time_fn
+    if initial_state is not None:
+        run_kwargs["initial_state"] = initial_state
 
     with observer:
         result = run_loop(

@@ -22,6 +22,7 @@ from claude_loop import (
     JsonlEventSink,
     ListSink,
     LoopObserver,
+    LoopState,
     MaxIterations,
     Timeout,
     TokenBudget,
@@ -365,6 +366,31 @@ def test_manual_wiring_matches_run_observed_loop():
         observer.record_result(result)
     assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
     assert _only(sink, LOOP_END).payload["tokens_used"] == 6
+
+
+def test_run_observed_loop_forwards_initial_state_for_resume():
+    # 観測入口でも initial_state を素通しして resume できる: 復元 seed から step/end の
+    # iteration・累積メトリクスが継続する (新規 run の begin は iteration 0 から)。
+    sink = ListSink()
+    seed = LoopState(iteration=2, tokens_used=20)
+    result = run_observed_loop(
+        act=acting(tokens=10),
+        verify=never_done,
+        conditions=[MaxIterations(4)],
+        sinks=[sink],
+        otel=False,
+        initial_state=seed,
+    )
+    # seed の iteration 2 から継続 -> 2 step 回して cap 4 で停止。
+    assert result.iterations == 4
+    assert result.tokens_used == 40
+    assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
+    # step event の iteration は復元 state から継続 (2, 3)。
+    assert [e.iteration for e in sink.of_kind(LOOP_STEP)] == [2, 3]
+    assert _only(sink, LOOP_END).payload["iterations"] == 4
+    assert _only(sink, LOOP_END).payload["tokens_used"] == 40
+    # seed は mutate されない (run_loop が copy する)。
+    assert seed.iteration == 2 and seed.tokens_used == 20
 
 
 def test_record_result_is_idempotent():
