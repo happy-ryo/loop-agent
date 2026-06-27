@@ -21,13 +21,29 @@ from __future__ import annotations
 
 from .conditions import (
     AnyOf,
+    GoalCheck,
+    GoalMet,
     MaxIterations,
+    NoProgress,
     StopCondition,
     StopTrigger,
     Timeout,
     TokenBudget,
 )
+from .events import (
+    LOOP_BEGIN,
+    LOOP_END,
+    LOOP_STEP,
+    CallableSink,
+    EventSink,
+    JsonlEventSink,
+    ListSink,
+    LoopEvent,
+    read_events,
+)
 from .loop import ActOutcome, LoopResult, VerifyOutcome, run_loop
+from .observe import LoopObserver, run_observed_loop
+from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
 from .store import DBProgressLog, LoopStore, connect
@@ -45,8 +61,26 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
+    "GoalMet",
+    "GoalCheck",
+    "NoProgress",
     "ProgressLog",
     "read_progress",
+    # observability (report.md S4.5 / S5 Phase 2)
+    "LoopEvent",
+    "EventSink",
+    "ListSink",
+    "CallableSink",
+    "JsonlEventSink",
+    "read_events",
+    "LOOP_BEGIN",
+    "LOOP_STEP",
+    "LOOP_END",
+    "LoopObserver",
+    "run_observed_loop",
+    "LoopSpan",
+    "otel_available",
+    # state SoT (report.md S3.4 / S4.6 / S5 Phase 2)
     "connect",
     "LoopStore",
     "DBProgressLog",
