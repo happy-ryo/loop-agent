@@ -316,6 +316,20 @@ def run_reflexion(
                 "reconstruct an evaluator (callables are not serializable); supply the evaluator "
                 "that was active at the resume point (its version must match the persisted one)."
             )
+        # 同様に declared_keys の整合も要求する: 復元 state の gt_aggregate_history /
+        # best_gt_aggregate は **当時の declared_keys で集約された値**。別の軸集合で resume すると、
+        # その stale な集約に対して RubricThreshold 等が誤発火し、過去 episode が満たしていない
+        # rubric で「収束」を宣言しうる。一致しなければ loud に弾く (集約は遡及再計算しない方針)。
+        if (
+            initial_state.declared_keys
+            and tuple(initial_state.declared_keys) != tuple(declared_keys)
+        ):
+            raise ValueError(
+                f"resume: persisted declared_keys {tuple(initial_state.declared_keys)!r} do not "
+                f"match supplied {tuple(declared_keys)!r}; the persisted ground-truth aggregate "
+                "history was computed under the old axes and would be stale. Supply the same "
+                "declared_keys used for the original run (or start a fresh run)."
+            )
         # 内側 run_loop と同じく seed を **破壊的に使わない**: caller が保持する resume snapshot を
         # その場で進めてしまうと、失敗/再試行の再 resume が既に進んだ seed から始まり episode を
         # 飛ばす。list と memory を複製した独立 state にコピーする (EpisodeRecord/Lesson は

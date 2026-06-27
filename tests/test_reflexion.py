@@ -618,6 +618,28 @@ def test_resume_rejects_mismatched_evaluator_version():
         )
 
 
+def test_resume_rejects_mismatched_declared_keys():
+    """別の declared_keys で resume すると stale な集約で誤収束しうるので loud に弾く。"""
+    from claude_loop.reflexion import ReflexionState
+
+    seed = ReflexionState(
+        episode=2, epoch=1, evaluator_version=HONEST.version,
+        declared_keys=("old_axis",), gt_aggregate_history=[0.9, 0.9],
+    )
+    with pytest.raises(ValueError, match="declared_keys"):
+        run_reflexion(
+            **_base_kwargs(
+                episode=lambda ctx: make_result(False),
+                evaluator=HONEST,
+                declared_keys=("primary",),  # seed と異なる軸
+                convergence=[MaxEpisodes(4)],
+                held_out=held_out_matching(0.2, 0.8),
+                epoch_len=2,
+                initial_state=seed,
+            )
+        )
+
+
 def test_resume_accepts_matching_evaluator_version():
     """復元 version と一致する評価器なら resume できる (継続する)。"""
     from claude_loop.reflexion import ReflexionState
