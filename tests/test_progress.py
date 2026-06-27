@@ -205,6 +205,24 @@ def test_read_tolerates_a_truncated_final_line(tmp_path):
     assert [r["kind"] for r in records] == ["step", "step", "step", "result"]
 
 
+def test_read_raises_on_a_corrupt_but_complete_final_line(tmp_path):
+    # A fully-written (newline-terminated) final record that is corrupt is NOT a
+    # crash-truncation -- it is genuine corruption (e.g. a mangled terminal
+    # `result` line) and must be raised, not silently dropped.
+    path = tmp_path / "progress.jsonl"
+    _run_with_progress(
+        path,
+        act=acting(tokens=0),
+        verify=never_done,
+        conditions=[MaxIterations(3)],
+    )
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("{corrupt but terminated}\n")  # note the trailing newline
+
+    with pytest.raises(json.JSONDecodeError):
+        read_progress(path)
+
+
 def test_read_raises_on_a_corrupt_interior_line(tmp_path):
     path = tmp_path / "progress.jsonl"
     _run_with_progress(

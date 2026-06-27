@@ -114,14 +114,24 @@ class ProgressLog:
 def read_progress(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
     """Read back every record from a progress file, in write order.
 
-    Blank lines are skipped. A trailing partial line (the signature of a crash
-    mid-append) is tolerated and dropped; a corrupt line anywhere *before* the
-    end is a real inconsistency and is raised, so silent data loss never hides a
-    bug. Returns an empty list when the file does not exist.
+    Blank lines are skipped. The *only* tolerated corruption is a truncated
+    final record -- an in-flight append cut off by a crash, recognised by the
+    file not ending in the ``\\n`` record terminator; it is dropped. A corrupt
+    record that is fully written (newline-terminated), or any bad line before
+    the end, is a real inconsistency and is raised, so silent data loss never
+    hides a bug -- including corruption of the terminal ``result`` line. Returns
+    an empty list when the file does not exist.
     """
     p = Path(path)
     if not p.exists():
         return []
+
+    text = p.read_text(encoding="utf-8")
+    # A final record is only "in-flight" (crash-truncated) when the file does
+    # not end with the writer's terminator: every completed append ends in '\n',
+    # so an un-terminated tail is the signature of a partial write. A corrupt
+    # *terminated* final line, by contrast, is genuine corruption and must raise.
+    final_is_truncated = bool(text) and not text.endswith("\n")
 
     records: list[dict[str, Any]] = []
     # Split on '\n' only -- the exact framing the writer uses. ``str.splitlines``
@@ -130,12 +140,12 @@ def read_progress(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
     # valid record whose detail/observation carried one of those characters
     # would be torn into two halves and wrongly read as corruption. The trailing
     # '' left by a final newline is dropped by the ``ln.strip()`` filter.
-    lines = [ln for ln in p.read_text(encoding="utf-8").split("\n") if ln.strip()]
+    lines = [ln for ln in text.split("\n") if ln.strip()]
     for idx, line in enumerate(lines):
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError:
-            if idx == len(lines) - 1:
-                break  # tolerate a single truncated final record
+            if idx == len(lines) - 1 and final_is_truncated:
+                break  # tolerate a single truncated (un-terminated) final record
             raise
     return records
