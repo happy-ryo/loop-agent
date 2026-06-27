@@ -233,6 +233,14 @@ def run_loop(
             f"got {type(conditions).__name__}"
         )
 
+    # Let a stateful gate reset any per-run counters at the start of this run, so
+    # the same gate instance can be reused across pause/resume runs without its
+    # gate-key sequence drifting (optional hook; gates without it are unaffected).
+    if gate is not None:
+        begin = getattr(gate, "begin", None)
+        if callable(begin):
+            begin()
+
     start = time_fn()
     state = LoopState()
 

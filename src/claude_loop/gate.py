@@ -138,6 +138,17 @@ class HumanGate:
         # run 行を確保する (request_decision の FK と begin event を冪等に満たす)。
         self.store.load_or_init(run_id)
 
+    def begin(self) -> None:
+        """run 開始時に gate key の出現順カウンタを 0 へ戻す (run_loop が呼ぶ)。
+
+        gate key は不可逆 action の出現順 seq から決まる。:func:`run_loop` は resume を
+        iteration 0 からの再生として扱うため、**同じ HumanGate インスタンスを複数 run で
+        使い回しても** seq が前 run から持ち越されてキーがずれない (gate-1 ではなく
+        gate-0 に揃う) よう、run の先頭でリセットする。run ごとに新しい gate を作る
+        :func:`run_gated_loop` 経由なら元から 0 なので冪等。
+        """
+        self._seq = 0
+
     def review(self, context: Any, state: LoopState) -> GateReview:
         """提案 action を審査して disposition を返す (:class:`ActionGate` 実装)。
 

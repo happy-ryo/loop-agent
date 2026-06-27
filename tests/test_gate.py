@@ -387,6 +387,35 @@ def test_multi_gate_resume_executes_each_irreversible_action_once(tmp_path):
     conn3.close()
 
 
+def test_same_gate_instance_reused_across_resume(tmp_path):
+    # 同じ HumanGate インスタンスを pause→resume で使い回しても、run 先頭で seq が
+    # リセットされ gate-0 に揃う (キーが gate-1 へずれて承認を取りこぼさない)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
+
+    gather1, act1, ex1 = make_world(ACTIONS)
+    res1 = run_loop(
+        act=act1, verify=never_done, conditions=[MaxIterations(3)],
+        gather=gather1, gate=gate,
+    )
+    assert res1.paused and res1.pending["gate_key"] == "gate-0" and ex1 == ["work"]
+
+    store.resolve_decision(RUN_ID, "gate-0", "approve")
+
+    # 同一 gate インスタンスのまま resume。
+    gather2, act2, ex2 = make_world(ACTIONS)
+    res2 = run_loop(
+        act=act2, verify=never_done, conditions=[MaxIterations(3)],
+        gather=gather2, gate=gate,
+    )
+    assert res2.status == "stopped"
+    assert ex2 == ["work", "deploy", "work2"]
+    # 余計な pending が増えていない (gate-1 の重複登録が起きていない)。
+    assert store.list_pending_decisions(RUN_ID) == []
+    assert store.get_decision(RUN_ID, "gate-1") is None
+
+
 def test_pending_re_asks_again_on_resume_without_resolution(tmp_path):
     # 登録済みだが未 resolve のまま resume すると、再び同じ gate_key で pause する
     # (pending を二重登録せず、loop_gate(pending) も 1 件のまま)。
