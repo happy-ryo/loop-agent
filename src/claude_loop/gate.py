@@ -162,6 +162,9 @@ class HumanGate:
         entry = self.store.get_decision(self.run_id, gate_key)
         if entry is not None and entry["status"] == "executed":
             # 既に実行済みの不可逆 action。resume 再生では再実行せず skip する。
+            # resolved 同様に action 一致を確認し、提案列がずれて *別の* 不可逆 action が
+            # 同じキーに来た場合に silent に skip (= 新しい不可逆 action を握り潰す) のを防ぐ。
+            self._guard_action_matches(entry, context, gate_key)
             return GateReview(
                 disposition=GATE_SKIP,
                 observation={

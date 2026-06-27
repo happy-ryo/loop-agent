@@ -497,6 +497,25 @@ def test_resume_with_diverged_action_is_rejected(tmp_path):
         )
 
 
+def test_resume_with_diverged_action_on_executed_gate_is_rejected(tmp_path):
+    # executed 済みのゲートに、提案列のずれで *別の* 不可逆 action が同じキーで来た場合も
+    # silent に skip せず loud に弾く (新しい不可逆 action を握り潰さない)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
+    store.request_decision(RUN_ID, "gate-0", "deploy-A")
+    store.resolve_decision(RUN_ID, "gate-0", "approve")
+    store.mark_executed(RUN_ID, "gate-0")  # 既に実行済みにする
+
+    gather, act, _ = make_world(["deploy-B"])
+    gate = HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
+    with pytest.raises(ValueError, match="does not match"):
+        run_loop(
+            act=act, verify=never_done, conditions=[MaxIterations(1)],
+            gather=gather, gate=gate,
+        )
+
+
 def test_resolver_must_return_a_decision(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
