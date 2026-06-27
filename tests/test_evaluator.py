@@ -234,6 +234,22 @@ def test_version_detects_in_place_body_change():
     assert e_a.version != e_b.version
 
 
+def test_version_detects_factory_default_argument_change():
+    """既定引数で振る舞いを変える factory scorer は別 version になる。"""
+
+    def make(bias):
+        def score(o, bias=bias):
+            return Score(ground_truth=bias)
+
+        return score
+
+    e1 = Evaluator(score=make(0.1), name="f")
+    e2 = Evaluator(score=make(0.9), name="f")
+    assert e1.version != e2.version
+    # 同じ既定引数なら再現的に一致する。
+    assert Evaluator(score=make(0.1), name="f").version == e1.version
+
+
 def test_version_reproducible_for_identical_source():
     src = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=0.5)\n"
     ns1: dict = {}

@@ -86,21 +86,31 @@ def _scorer_identity(score: ScoreFn) -> str:
     ``__qualname__`` だけだと別ソース位置の lambda が同名 (``<lambda>``) で衝突し、振る舞いの
     違う評価器が同じ version になって epoch-freeze の監査証跡を壊す。``__code__`` があれば
     **定義ソース位置** (filename:firstlineno) に加え、**実装そのもの** ― バイトコード
-    ``co_code`` + 定数 ``co_consts`` + 参照名 ``co_names`` ― のハッシュを足す。これにより
-    定義位置を動かさず本体を書き換えた (例: ``0.5`` を ``1.0`` に変えた) 評価器も別 version に
-    なり、resume/audit が in-place な振る舞い変更を silently 受理しない。同一ソースなら同じ
-    version になる (プロセスを跨いで再現)。free 変数を capture した closure (同一 code object・
-    別 capture) はなお衝突しうるので、振る舞いが違うなら明示 ``version`` を渡すこと。
+    ``co_code`` + 定数 ``co_consts`` + 参照名 ``co_names`` + **既定引数** ``__defaults__`` /
+    ``__kwdefaults__`` ― のハッシュを足す。これにより定義位置を動かさず本体を書き換えた
+    (例: ``0.5`` を ``1.0`` に) 評価器も、既定引数で振る舞いを変える factory
+    (``def score(o, bias=bias): ...``) も別 version になり、resume/audit が振る舞い変更を
+    silently 受理しない。同一ソース・同一既定引数なら同じ version になる (プロセスを跨いで再現)。
+
+    **境界**: free 変数を ``__closure__`` cell で capture した closure (同一 code object・
+    既定引数なし・cell 値だけ違う) はなお衝突しうる。cell 内容は任意オブジェクトで安定ハッシュ
+    できないため、本関数は意図的にそこまで踏み込まない。そのような parameterized scorer は
+    振る舞いが違うなら明示 ``version`` を渡すこと (docstring 参照)。
     """
     qual = getattr(score, "__qualname__", repr(score))
     code = getattr(score, "__code__", None)
     if code is not None:
         import hashlib
 
+        def _b(value: Any) -> bytes:
+            return repr(value).encode("utf-8", "surrogatepass")
+
         body = hashlib.sha256(
             code.co_code
-            + repr(code.co_consts).encode("utf-8", "surrogatepass")
-            + repr(code.co_names).encode("utf-8", "surrogatepass")
+            + _b(code.co_consts)
+            + _b(code.co_names)
+            + _b(getattr(score, "__defaults__", None))
+            + _b(getattr(score, "__kwdefaults__", None))
         ).hexdigest()[:16]
         return f"{qual}@{code.co_filename}:{code.co_firstlineno}#{body}"
     return qual
