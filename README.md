@@ -16,6 +16,7 @@
 | [`report.html`](./report.html) | 同内容の閲覧用単一 HTML（CSS インライン・ブラウザで直接開ける） |
 | [`src/claude_loop/`](./src/claude_loop) | PoC ループコア（ループドライバ + 合成可能 stop 条件） |
 | [`examples/verify_driven_demo.py`](./examples/verify_driven_demo.py) | 検証駆動デモ（sandbox テストが green になるまで回す実走デモ） |
+| [`examples/observed_demo.py`](./examples/observed_demo.py) | 観測デモ（`loop_begin/step/end` を JSONL へ流し、終了理由/メトリクスを見る） |
 
 `report.html` はブラウザで直接開けます（外部 CSS/JS 依存なし）。内容の正本は `report.md` です。
 
@@ -98,6 +99,33 @@ progress.record_result(result)               # 終了理由（"result" 行）を
 records = read_progress("progress.jsonl")     # 反復ごとの "step" 行 + 末尾 "result" 行
 ```
 
+### 観測（loop_begin / loop_step / loop_end + OTel span）
+
+ループの一生を **構造化イベント** として外に出す観測層（report.md §4.5 / §5 Phase 2）。`run_observed_loop` にループを通すと、`loop_begin` → `loop_step` × N → `loop_end` のイベントが **sink** へ流れる。各イベントは反復番号・累積トークン・elapsed・**終了理由**を運び、ループが「なぜ・どう終わったか」を事後解析できる。同じ run は OTel が入っていれば 1 本の **GenAI span**（`gen_ai.*` + 反復番号 + 終了理由）にもなる。
+
+```python
+from claude_loop import run_observed_loop, JsonlEventSink, ListSink, read_events, MaxIterations
+
+mem = ListSink()                                  # in-memory（テスト/検査向け）
+result = run_observed_loop(
+    act=act, verify=verify,
+    conditions=[MaxIterations(5)],
+    sinks=[JsonlEventSink("events.jsonl"), mem],  # journal 風 JSONL + in-memory（複数 sink 可）
+)
+
+events = read_events("events.jsonl")              # loop_begin / loop_step×N / loop_end
+end = mem.of_kind("loop_end")[0]
+print(end.payload["status"], end.payload["stop"], end.payload["reason"])
+# "stopped" "max_iterations" "reached max iterations (5/5)"
+```
+
+- **全終了理由が `loop_end` に残る**: `goal_met` / `max_iterations` / `token_budget` / `timeout`、さらにループ本体が例外で抜けた場合の `error` まで、`status` / `stop` / `reason` として記録される。
+- **メトリクスが追える**: `loop_step` は反復番号・`tokens`・累積 `tokens_used`・`elapsed` を運び、`loop_end` の集計と整合する。
+- **OTel は optional 依存**: 未導入環境でも `LoopSpan` が **no-op に degrade** し、JSONL / event sink はそのまま機能する。SDK を入れて span を実検査したい場合は `pip install -e .[dev]`（or `.[otel]`）。
+- **既存 `ProgressLog` と同じ作法**: 手で配線するなら `LoopObserver` を context manager として使い、`on_step` を `run_loop` に渡して `record_result(result)` を呼ぶ（`sink` 例外はループを殺さず警告に倒す best-effort）。
+
+実走デモは [`examples/observed_demo.py`](./examples/observed_demo.py)。
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -109,6 +137,12 @@ records = read_progress("progress.jsonl")     # 反復ごとの "step" 行 + 末
 | `LoopResult` | `status` / `stop`(発火条件) / `reason` / `iterations` / `tokens_used` / `elapsed` / `history` |
 | `ProgressLog(path)` | 各反復を JSON Lines で追記する最小の永続状態。`on_step` を `run_loop` に渡し、`record_result(result)` で終了理由を追記 |
 | `read_progress(path)` | 進捗ファイルを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
+| `run_observed_loop(*, act, verify, conditions, sinks=…, otel=True, tracer=…, on_step=…, …)` | 観測を配線して `run_loop` を回す入口。`loop_begin/step/end` を emit し OTel span を張る |
+| `LoopObserver(sinks, *, conditions=…, otel=True, tracer=…)` | 観測オーケストレータ（context manager）。`on_step` を `run_loop` に渡し `record_result(result)` を呼ぶ |
+| `LoopEvent(kind, iteration, elapsed, payload)` | 構造化イベント。`kind` は `loop_begin`/`loop_step`/`loop_end` |
+| `ListSink` / `JsonlEventSink(path)` / `CallableSink(fn)` | event sink（in-memory / journal 風 JSONL / 任意関数アダプタ） |
+| `read_events(path)` | JSONL イベントを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
+| `LoopSpan` / `otel_available()` | OTel GenAI span の薄いラッパ（未導入なら no-op）/ OTel 利用可否 |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
@@ -132,9 +166,11 @@ python3 examples/verify_driven_demo.py
 ### テスト
 
 ```bash
-python3 -m pytest        # 55 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 /
+python3 -m pytest        # 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 /
                          # 暴走防止の証明（test_runaway_guard）/ 進捗ファイル（test_progress）/
-                         # 検証駆動デモの実走（test_verify_demo）
+                         # 検証駆動デモの実走（test_verify_demo）/
+                         # 観測: 全終了理由が event に残る・メトリクスが追える・OTel span
+                         #   （test_events / test_observe / test_otel）
 ```
 
 ## レポートの要約

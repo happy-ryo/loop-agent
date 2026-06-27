@@ -27,7 +27,20 @@ from .conditions import (
     Timeout,
     TokenBudget,
 )
+from .events import (
+    LOOP_BEGIN,
+    LOOP_END,
+    LOOP_STEP,
+    CallableSink,
+    EventSink,
+    JsonlEventSink,
+    ListSink,
+    LoopEvent,
+    read_events,
+)
 from .loop import ActOutcome, LoopResult, VerifyOutcome, run_loop
+from .observe import LoopObserver, run_observed_loop
+from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
 
@@ -46,6 +59,20 @@ __all__ = [
     "Timeout",
     "ProgressLog",
     "read_progress",
+    # observability (report.md S4.5 / S5 Phase 2)
+    "LoopEvent",
+    "EventSink",
+    "ListSink",
+    "CallableSink",
+    "JsonlEventSink",
+    "read_events",
+    "LOOP_BEGIN",
+    "LOOP_STEP",
+    "LOOP_END",
+    "LoopObserver",
+    "run_observed_loop",
+    "LoopSpan",
+    "otel_available",
 ]
 
 __version__ = "0.0.1"
