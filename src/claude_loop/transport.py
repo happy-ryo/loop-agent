@@ -35,6 +35,7 @@ claude-loop 側に依存ゼロ (stdlib のみ) で実装する。
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, runtime_checkable
 
@@ -181,11 +182,19 @@ class InMemoryWakeQueue:
     - ``release_expired`` : lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻す (再 eligible)。
     - ``mark_delivered`` : push が確定配送した wake を直接 ``DELIVERED`` (terminal) にする。
       任意の非 terminal 状態から冪等に遷移できる (push と pull の継ぎ目を吸収)。
+
+    **スレッド安全**: 同一 recipient を複数 worker (スレッド) で並行 poll しても二重 claim が
+    起きないよう、状態を変える操作 (enqueue/claim/confirm/release_expired/mark_delivered) と
+    読み出しを 1 つの再入可能ロックで直列化する (check-and-set を atomic にする)。``claim`` は
+    内部で ``release_expired`` を呼ぶため :class:`threading.RLock` (再入可) を使う。これにより
+    並行 poller の owner fencing と at-most-once claim が実際に成立する。
     """
 
     def __init__(self) -> None:
         self._entries: dict[str, _Entry] = {}
         self._seq = 0
+        # 状態遷移を直列化する再入可能ロック (claim -> release_expired の再入のため RLock)。
+        self._lock = threading.RLock()
 
     def enqueue(self, wake: Wake) -> bool:
         """wake を ``UNDELIVERED`` で登録する。同一 ``id`` が既にあれば no-op で ``False``。
@@ -195,11 +204,12 @@ class InMemoryWakeQueue:
         """
         if not wake.id:
             raise ValueError("enqueue: Wake.id must be a non-empty string")
-        if wake.id in self._entries:
-            return False
-        self._entries[wake.id] = _Entry(wake=wake, seq=self._seq)
-        self._seq += 1
-        return True
+        with self._lock:
+            if wake.id in self._entries:
+                return False
+            self._entries[wake.id] = _Entry(wake=wake, seq=self._seq)
+            self._seq += 1
+            return True
 
     def release_expired(self, *, now: float) -> int:
         """lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻し、戻した件数を返す。
@@ -209,13 +219,14 @@ class InMemoryWakeQueue:
         (at-least-once 側に倒す: idle-wake では喪失 > 重複)。``owner`` を ``None`` に戻し、
         古い owner の遅延 confirm を確実に弾く。
         """
-        released = 0
-        for e in self._entries.values():
-            if e.state == CLAIMED and e.lease_expiry <= now:
-                e.state = UNDELIVERED
-                e.owner = None
-                released += 1
-        return released
+        with self._lock:
+            released = 0
+            for e in self._entries.values():
+                if e.state == CLAIMED and e.lease_expiry <= now:
+                    e.state = UNDELIVERED
+                    e.owner = None
+                    released += 1
+            return released
 
     def claim(
         self,
@@ -235,17 +246,18 @@ class InMemoryWakeQueue:
         """
         if lease <= 0:
             raise ValueError("claim: lease must be > 0")
-        self.release_expired(now=now)
-        out: list[Wake] = []
-        for e in sorted(self._entries.values(), key=lambda x: x.seq):
-            if limit is not None and len(out) >= limit:
-                break
-            if e.state == UNDELIVERED and e.wake.recipient == recipient:
-                e.state = CLAIMED
-                e.owner = owner
-                e.lease_expiry = now + lease
-                out.append(e.wake)
-        return out
+        with self._lock:
+            self.release_expired(now=now)
+            out: list[Wake] = []
+            for e in sorted(self._entries.values(), key=lambda x: x.seq):
+                if limit is not None and len(out) >= limit:
+                    break
+                if e.state == UNDELIVERED and e.wake.recipient == recipient:
+                    e.state = CLAIMED
+                    e.owner = owner
+                    e.lease_expiry = now + lease
+                    out.append(e.wake)
+            return out
 
     def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
         """claim 済み wake を ``DELIVERED`` (terminal) に確定する。
@@ -255,20 +267,21 @@ class InMemoryWakeQueue:
         失効後に別者が再 claim / lease 失効済み / 不在) は ``False``。この owner + 失効チェックが
         fencing として効き、喪失窓で stale な claim 者が誤って DELIVERED 化するのを防ぐ。
         """
-        e = self._entries.get(wake_id)
-        if e is None:
-            return False
-        if e.state != CLAIMED:
-            return False
-        if e.owner != owner:
-            return False
-        if e.lease_expiry <= now:
-            # lease 失効: この claim はもう有効でない。release_expired で UNDELIVERED へ
-            # 戻る (まだ戻っていなくても) ので、ここで DELIVERED 化はしない。
-            return False
-        e.state = DELIVERED
-        e.owner = None
-        return True
+        with self._lock:
+            e = self._entries.get(wake_id)
+            if e is None:
+                return False
+            if e.state != CLAIMED:
+                return False
+            if e.owner != owner:
+                return False
+            if e.lease_expiry <= now:
+                # lease 失効: この claim はもう有効でない。release_expired で UNDELIVERED へ
+                # 戻る (まだ戻っていなくても) ので、ここで DELIVERED 化はしない。
+                return False
+            e.state = DELIVERED
+            e.owner = None
+            return True
 
     def mark_delivered(self, wake_id: str) -> bool:
         """wake を直接 ``DELIVERED`` (terminal) にする (push 確定配送の確定)。
@@ -277,30 +290,33 @@ class InMemoryWakeQueue:
         冪等に遷移する (既に DELIVERED なら ``False``)。push と pull の継ぎ目を吸収する:
         push が DELIVERED 化した行を pull は claim しない (UNDELIVERED でないため)。
         """
-        e = self._entries.get(wake_id)
-        if e is None:
-            return False
-        if e.state == DELIVERED:
-            return False
-        e.state = DELIVERED
-        e.owner = None
-        return True
+        with self._lock:
+            e = self._entries.get(wake_id)
+            if e is None:
+                return False
+            if e.state == DELIVERED:
+                return False
+            e.state = DELIVERED
+            e.owner = None
+            return True
 
     def pending(self, recipient: Optional[str] = None) -> list[Wake]:
         """未確定 (``UNDELIVERED`` / ``CLAIMED``) の wake を登録順に返す (任意で宛先で絞る)。"""
-        out: list[Wake] = []
-        for e in sorted(self._entries.values(), key=lambda x: x.seq):
-            if e.state == DELIVERED:
-                continue
-            if recipient is not None and e.wake.recipient != recipient:
-                continue
-            out.append(e.wake)
-        return out
+        with self._lock:
+            out: list[Wake] = []
+            for e in sorted(self._entries.values(), key=lambda x: x.seq):
+                if e.state == DELIVERED:
+                    continue
+                if recipient is not None and e.wake.recipient != recipient:
+                    continue
+                out.append(e.wake)
+            return out
 
     def state_of(self, wake_id: str) -> Optional[str]:
         """``wake_id`` の現在の配送状態を返す (無ければ ``None``)。テスト/内省用。"""
-        e = self._entries.get(wake_id)
-        return e.state if e is not None else None
+        with self._lock:
+            e = self._entries.get(wake_id)
+            return e.state if e is not None else None
 
 
 # 役割別 poll cadence (秒)。report.md S3.2 / broker pull-first 知見の非対称設計。

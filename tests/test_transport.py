@@ -6,6 +6,9 @@ push 一次 / pull fallback / at-most-once / role 別 cadence をそれぞれ実
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from claude_loop.transport import (
@@ -347,6 +350,51 @@ def test_due_to_poll_respects_cadence():
     assert due_to_poll("dispatcher", last_poll=0.0, now=180.0) is True
     # secretary は cadence 0 -> 常に due (ターン冒頭で毎回 poll)。
     assert due_to_poll("secretary", last_poll=0.0, now=0.0) is True
+
+
+# -- 並行 poll のスレッド安全 (二重 claim させない) -------------------------
+
+
+def test_concurrent_pollers_never_double_claim():
+    """同一 recipient を複数スレッドで並行 poll しても、各 wake は高々 1 スレッドが claim する。
+
+    InMemoryWakeQueue の check-and-set がロックで直列化され、並行 poller の
+    owner fencing / at-most-once claim が実際に成立することを実時計 + barrier で実証する。
+    """
+    # 実時計を使い、lease を十分長くして claim が失効しないようにする (確定のみ検証)。
+    t = Transport(InMemoryWakeQueue(), NullPushBackend(), lease=3600.0, time_fn=time.monotonic)
+    n_wakes = 200
+    for i in range(n_wakes):
+        t.deliver(_wake(i))
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    claimed_by: list[list[str]] = [[] for _ in range(n_threads)]
+
+    def worker(idx: int) -> None:
+        own = f"worker-{idx}"
+        barrier.wait()  # 全スレッドを同時にスタートさせ contention を最大化。
+        while True:
+            got = t.poll("coordinator", owner=own, limit=1)
+            if not got:
+                # 他スレッドがまだ処理中で一時的に空でも、未確定が残るうちは再試行。
+                if not t.pending("coordinator"):
+                    return
+                continue
+            wake = got[0]
+            assert t.confirm_wakes(got, owner=own) == 1
+            claimed_by[idx].append(wake.id)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=30)
+
+    all_claimed = [wid for lst in claimed_by for wid in lst]
+    # 各 wake は厳密に 1 回だけ claim+confirm された (二重 claim 無し・取りこぼし無し)。
+    assert sorted(all_claimed) == sorted(f"r1:loop_done:{i}" for i in range(n_wakes))
+    assert len(all_claimed) == len(set(all_claimed)) == n_wakes
 
 
 # -- 不正入力 ----------------------------------------------------------------
