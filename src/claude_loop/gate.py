@@ -160,26 +160,31 @@ class HumanGate:
         gate_key = self.key(context, seq) if self.key is not None else f"gate-{seq}"
 
         entry = self.store.get_decision(self.run_id, gate_key)
-        if entry is not None and entry["status"] == "executed":
-            # 既に実行済みの不可逆 action。resume 再生では再実行せず skip する。
-            # resolved 同様に action 一致を確認し、提案列がずれて *別の* 不可逆 action が
-            # 同じキーに来た場合に silent に skip (= 新しい不可逆 action を握り潰す) のを防ぐ。
+        if entry is not None:
+            # 既存行 (pending/resolved/executed): どの分岐に進む前に **必ず** 登録時の
+            # action と現在の提案 action の一致を確認する。提案列が resume 間でずれ、
+            # 別の不可逆 action が同じ gate_key に来た場合に、(a) 古い決定を現在の別 action
+            # へ誤適用する / (b) 実行済みとして新しい不可逆 action を silent に握り潰す /
+            # (c) resolver が古い pending を承認して現在の別 action を実行する、のいずれも
+            # 防ぐ (新規登録は context そのものなので下の request_decision 後は自明一致)。
             self._guard_action_matches(entry, context, gate_key)
-            return GateReview(
-                disposition=GATE_SKIP,
-                observation={
-                    "gate": "already_executed",
-                    "gate_key": gate_key,
-                    "action": context,
-                },
-                detail=f"gate {gate_key} already executed in a prior run",
-            )
-        if entry is not None and entry["status"] == "resolved":
-            # resume などで既に下されている決定を適用 (人間に二度問わない)。
-            self._guard_action_matches(entry, context, gate_key)
-            return self._apply_resolved(
-                Decision(entry["decision"], entry["payload"]), context, gate_key
-            )
+            if entry["status"] == "executed":
+                # 既に実行済みの不可逆 action。resume 再生では再実行せず skip する。
+                return GateReview(
+                    disposition=GATE_SKIP,
+                    observation={
+                        "gate": "already_executed",
+                        "gate_key": gate_key,
+                        "action": context,
+                    },
+                    detail=f"gate {gate_key} already executed in a prior run",
+                )
+            if entry["status"] == "resolved":
+                # resume などで既に下されている決定を適用 (人間に二度問わない)。
+                return self._apply_resolved(
+                    Decision(entry["decision"], entry["payload"]), context, gate_key
+                )
+            # status == "pending": 下の未解決パスへ落ちる (request_decision は冪等)。
 
         # 未解決 (未登録 or pending): まず pending を登録 (冪等)。
         pending = self.store.request_decision(self.run_id, gate_key, context)

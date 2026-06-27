@@ -516,6 +516,36 @@ def test_resume_with_diverged_action_on_executed_gate_is_rejected(tmp_path):
         )
 
 
+def test_resume_with_diverged_action_on_pending_gate_is_rejected(tmp_path):
+    # 前の run で登録済みの pending (action="deploy-A") を、提案列のずれた resume
+    # (resolver あり) で別 action "deploy-B" として拾った場合、resolver が古い pending を
+    # 承認して現在の別 action を実行する事故を防ぐため loud に弾く。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
+    store.request_decision(RUN_ID, "gate-0", "deploy-A")  # 未 resolve の pending
+
+    executed = []
+
+    def gather(state):
+        return "deploy-B"
+
+    def act(action):
+        executed.append(action)
+        return ActOutcome(observation=action, tokens=0)
+
+    gate = HumanGate(
+        on=is_deploy_prefix, store=store, run_id=RUN_ID,
+        resolver=lambda pending: Decision("approve"),
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        run_loop(
+            act=act, verify=never_done, conditions=[MaxIterations(1)],
+            gather=gather, gate=gate,
+        )
+    assert executed == []  # 別 action は実行されない
+
+
 def test_resolver_must_return_a_decision(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
