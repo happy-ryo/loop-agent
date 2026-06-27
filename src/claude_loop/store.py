@@ -324,8 +324,17 @@ class LoopStore:
         1 トランザクションで「step 行の upsert + run 集計の更新 + ``loop_step``
         event の追記」を束ねる。``UNIQUE(run_id, iteration)`` 衝突時は ``DO UPDATE``
         で上書きするので、同一反復の再実行 (resume #14) に冪等。
+
+        ``loop_step`` event は **新規 insert のときだけ** 追記する。同一反復の再永続化
+        (resume) では step 行を上書きするが event は重ねない。これにより append-only
+        な journal が step SoT と 1:1 で整合し続ける (再構成/監査する consumer が同一
+        反復の loop_step を複数見ることがない)。
         """
         with self.transaction():
+            is_new = self.conn.execute(
+                "SELECT 1 FROM step WHERE run_id = ? AND iteration = ?",
+                (run_id, record.iteration),
+            ).fetchone() is None
             self.conn.execute(
                 "INSERT INTO step "
                 "(run_id, iteration, tokens, tokens_used, elapsed, goal_met, "
@@ -350,18 +359,19 @@ class LoopStore:
                 ),
             )
             self._bump_run(run_id, state)
-            self._append_event(
-                run_id,
-                EVENT_STEP,
-                {
-                    "iteration": record.iteration,
-                    "tokens": record.tokens,
-                    "tokens_used": state.tokens_used,
-                    "elapsed": state.elapsed,
-                    "goal_met": bool(record.goal_met),
-                    "detail": record.detail,
-                },
-            )
+            if is_new:
+                self._append_event(
+                    run_id,
+                    EVENT_STEP,
+                    {
+                        "iteration": record.iteration,
+                        "tokens": record.tokens,
+                        "tokens_used": state.tokens_used,
+                        "elapsed": state.elapsed,
+                        "goal_met": bool(record.goal_met),
+                        "detail": record.detail,
+                    },
+                )
 
     def record_result(self, run_id: str, result: "LoopResult") -> None:
         """ループ終了時の最終ステータスを atomic に確定する。

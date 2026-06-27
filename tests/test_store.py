@@ -238,6 +238,9 @@ def test_record_step_is_idempotent_on_run_and_iteration(tmp_path):
     assert steps[0]["observation"] == "b"
     assert steps[0]["tokens"] == 7
     assert steps[0]["goal_met"] is True
+    # 再永続化では loop_step event を重ねない (journal が step SoT と 1:1)。
+    step_events = [e for e in store.read_events("r1") if e["kind"] == EVENT_STEP]
+    assert len(step_events) == 1
 
 
 # -- 終了状態の確定 -----------------------------------------------------------
