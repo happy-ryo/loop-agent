@@ -8,8 +8,10 @@ from claude_loop import (
     ActOutcome,
     GoalCheck,
     GoalMet,
+    LoopState,
     MaxIterations,
     NoProgress,
+    StepRecord,
     Timeout,
     TokenBudget,
     VerifyOutcome,
@@ -293,6 +295,112 @@ def test_on_step_sees_state_consistent_with_record():
     )
     assert seen[0] == (0, False, False, 1.0)
     assert seen[-1] == (1, True, True, 2.0)
+
+
+# -- resume: initial_state seeding (Issue #14) -----------------------------
+
+
+def test_initial_state_none_is_a_fresh_run():
+    # The default and an explicit None must both start empty (no behaviour drift
+    # from adding the resume seam to the signature).
+    seeded = run_loop(
+        act=acting(tokens=1),
+        verify=never_done,
+        conditions=[MaxIterations(3)],
+        initial_state=None,
+    )
+    plain = run_loop(
+        act=acting(tokens=1), verify=never_done, conditions=[MaxIterations(3)]
+    )
+    assert seeded.iterations == plain.iterations == 3
+    assert seeded.tokens_used == plain.tokens_used == 3
+
+
+def test_empty_initial_state_equals_a_fresh_run():
+    # An empty LoopState is equivalent to None, so DBProgressLog.state for a new
+    # run can be wired in unconditionally (same call path for new and resumed).
+    result = run_loop(
+        act=acting(tokens=2),
+        verify=never_done,
+        conditions=[MaxIterations(2)],
+        initial_state=LoopState(),
+    )
+    assert result.iterations == 2 and result.tokens_used == 4
+
+
+def test_initial_state_continues_iteration_tokens_and_history():
+    seed = LoopState(
+        iteration=2,
+        tokens_used=20,
+        history=[StepRecord(0, "a", 10, False), StepRecord(1, "b", 10, False)],
+    )
+    result = run_loop(
+        act=acting(tokens=10, observation="c"),
+        verify=never_done,
+        conditions=[MaxIterations(4)],
+        initial_state=seed,
+    )
+    # Continues from iteration 2: two more steps reach the cap of 4, and the
+    # reconstructed history is preserved ahead of the newly appended records.
+    assert result.iterations == 4
+    assert result.tokens_used == 40
+    assert [r.iteration for r in result.history] == [0, 1, 2, 3]
+    assert [r.observation for r in result.history] == ["a", "b", "c", "c"]
+
+
+def test_initial_state_is_copied_not_mutated():
+    # The loop must not mutate the caller's seed (e.g. DBProgressLog.state),
+    # neither its scalars nor its history list.
+    hist = [StepRecord(0, "a", 1, False)]
+    seed = LoopState(iteration=1, tokens_used=1, elapsed=0.5, history=hist)
+    run_loop(
+        act=acting(tokens=1),
+        verify=never_done,
+        conditions=[MaxIterations(3)],
+        initial_state=seed,
+    )
+    assert seed.iteration == 1
+    assert seed.tokens_used == 1
+    assert seed.elapsed == 0.5
+    assert seed.history is hist and len(seed.history) == 1
+
+
+def test_resumed_elapsed_continues_from_seed():
+    # elapsed keeps accumulating from the persisted value: the clock origin is
+    # back-dated by seed.elapsed so Timeout sees the *total* run time.
+    clock = ManualClock()
+    seed = LoopState(iteration=2, elapsed=4.0)
+    result = run_loop(
+        act=stepping_for(clock, seconds=1.0),
+        verify=never_done,
+        conditions=[Timeout(7.0)],
+        time_fn=clock,
+        initial_state=seed,
+    )
+    # Guards see elapsed 4, 5, 6, 7 -> first >= 7 after 3 new steps (2 seeded +
+    # 3 = iteration 5); the deadline counts time from before the interruption.
+    assert result.stop.name == "timeout"
+    assert result.iterations == 5
+    assert result.elapsed == 7.0
+
+
+def test_resume_already_past_a_cap_stops_before_any_new_step():
+    # A run resumed at/after a cap terminates immediately, running no new step --
+    # the same guard-before-step contract a straight run obeys.
+    seed = LoopState(iteration=5, tokens_used=50)
+    steps = []
+    result = run_loop(
+        act=acting(tokens=10),
+        verify=never_done,
+        conditions=[MaxIterations(5)],
+        initial_state=seed,
+        on_step=lambda record, state: steps.append(record),
+    )
+    assert result.status == "stopped"
+    assert result.stop.name == "max_iterations"
+    assert result.iterations == 5
+    assert result.tokens_used == 50
+    assert steps == []
 
 
 # -- validation -------------------------------------------------------------
