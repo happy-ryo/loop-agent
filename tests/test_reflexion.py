@@ -471,6 +471,34 @@ def test_memory_unwired_control_shows_no_improvement():
     assert history[1] == pytest.approx(0.2)  # 改善しない (memory 未配線)
 
 
+def test_paused_inner_episode_propagates_pause():
+    """内側 episode が人間ゲートで pause したら外側も pause を伝播する (Issue #15 契約)。"""
+    paused = LoopResult(
+        status="paused", stop=None, state=LoopState(), pending={"gate_key": "gate-0"}
+    )
+
+    def boom_reflect(history, signal, reward):
+        raise AssertionError("reflect must not run on a paused episode")
+
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=lambda ctx: paused,
+            reflect=boom_reflect,
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(5)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+        )
+    )
+    assert result.status == "paused"
+    assert result.paused is True
+    assert result.pending == {"gate_key": "gate-0"}
+    # 未完了 episode は記録せず・進めない (resume で同じ episode を再実行できる)。
+    assert result.state.episode == 0
+    assert result.state.episodes == []
+    assert "awaiting human decision" in result.reason
+
+
 def test_resume_rejects_mismatched_evaluator_version():
     """外側 resume: 復元 evaluator_version と渡された評価器が食い違えば loud に弾く。"""
     from claude_loop.reflexion import ReflexionState

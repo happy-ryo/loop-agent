@@ -144,20 +144,31 @@ class ReflexionState:
 
 @dataclass
 class ReflexiveResult:
-    """外側ループの結果。``status`` は ``"converged"`` (成功) か ``"stopped"`` (打ち切り)。
+    """外側ループの結果。``status`` は ``"converged"`` / ``"stopped"`` / ``"paused"``。
 
     ``succeeded`` は **トリガ順に依存せず** 状態から判定する: 終了時点で成功条件
     (:class:`~claude_loop.convergence.RubricThreshold`) が満たされていれば成功
     (内側ループの ``stop.name`` 依存判定が抱える順序問題を踏まない)。
+
+    ``status == "paused"`` は内側 episode が人間ゲートで中断した場合 (``stop`` は ``None``、
+    ``pending`` に内側 :class:`~claude_loop.loop.LoopResult` の pending を載せる)。この episode は
+    **未完了**として記録せず (gt/reflect も走らせず) episode を進めない。人間がゲート決定を
+    永続化した後に同じ引数で resume すれば、同じ episode が再実行され内側ゲートが決定を適用して
+    完了する (内側の pause/resume 契約をそのまま外側へ伝播する。Issue #15)。
     """
 
     status: str
-    stop: StopTrigger
+    stop: Optional[StopTrigger]
     state: ReflexionState
+    pending: Optional[Any] = None
 
     @property
     def succeeded(self) -> bool:
         return self.status == "converged"
+
+    @property
+    def paused(self) -> bool:
+        return self.status == "paused"
 
     @property
     def best_score(self) -> float:
@@ -173,6 +184,8 @@ class ReflexiveResult:
 
     @property
     def reason(self) -> str:
+        if self.paused:
+            return f"paused: awaiting human decision (episode {self.state.episode})"
         return self.stop.reason if self.stop is not None else ""
 
 
@@ -326,6 +339,16 @@ def run_reflexion(
             memory_block=state.memory.render(),
         )
         result = episode(ctx)
+
+        # 内側 episode が人間ゲートで中断したら、外側もそこで中断して pending を伝播する。
+        # この episode は未完了なので score/reflect せず episode も進めない。人間が決定を
+        # 永続化して resume すれば同じ episode が再実行され、内側ゲートが決定を適用して完了する
+        # (不可逆 action が承認前に再提案・二重実行されるのを防ぐ。Issue #15 の pause 契約)。
+        if getattr(result, "paused", False):
+            return ReflexiveResult(
+                status="paused", stop=None, state=state, pending=result.pending
+            )
+
         outcome = EpisodeOutcome(result)
 
         # (1) 一次信号: 内側 verify 由来を driver が計算 (評価器ではない)。
