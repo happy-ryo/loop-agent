@@ -248,6 +248,11 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
   されるため、**非ゲート action は冪等であること**を前提とする（あるいは #14 の状態復元を
   待つ）。`record_result` に `paused` の結果を渡しても run は `running` のまま残り、
   `stop_reason` も書かれない（resume で続行できる）。
+- **既知の制限**: resume は loop レベルの**累積集計**（`tokens_used` / `elapsed` /
+  `iteration`）を復元しない。よって**run を跨いで累積する上限**（`TokenBudget` / `Timeout`）を
+  gate の pause/resume 越しに信頼しないこと（再開後は前 run までの消費がリセットされて見える）。
+  各 step の正本は `step` 行に残るので監査・コスト集計はそこから行う。累積を引き継いだ完全な
+  resume は #14（loop-state 復元）の領分。
 
 ### API 概要
 
