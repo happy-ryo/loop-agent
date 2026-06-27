@@ -289,6 +289,36 @@ def test_redeliver_respects_inflight_claim():
     assert [w.id for w in redelivered] == ["r1:loop_done:0"]
 
 
+def test_inflight_push_does_not_steal_active_claim():
+    """push の I/O 中に別 poller が claim したら、push は claim を奪わず wake を喪失させない。
+
+    push が確定配送を返す直前に受信側が同じ wake を claim した状況を再現し、deliver の
+    mark_delivered が active CLAIMED を DELIVERED で横取りしないこと (= owner クラッシュ時も
+    lease 失効で再配送される) を実証する (codex P2 回帰防止)。
+    """
+    clock = ManualClock()
+    queue = InMemoryWakeQueue()
+    box: dict = {}
+
+    def racing_push(w: Wake) -> bool:
+        # push が "in flight" の間に受信側が同じ wake を claim する状況を再現。
+        box["claimed"] = box["transport"].poll("coordinator", owner="recv", confirm=False)
+        return True  # push 自体は成功を返す。
+
+    t = Transport(queue, CallablePushBackend(racing_push), lease=30.0, time_fn=clock)
+    box["transport"] = t
+
+    route = t.deliver(_wake(0))
+    assert route == "push"  # push は成功した。
+    # だが active claim は奪われていない (CLAIMED のまま = pull 側が配送の主体)。
+    assert [w.id for w in box["claimed"]] == ["r1:loop_done:0"]
+    assert queue.state_of("r1:loop_done:0") == CLAIMED
+
+    # poller が confirm 前にクラッシュしても、lease 失効で再配送される (喪失しない)。
+    clock.advance(31.0)
+    assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
+
+
 def test_delivered_wake_never_redelivered_even_on_redeliver_attempt():
     """DELIVERED 済み wake を再 deliver しても push を重ねず、pull でも返らない。"""
     pushes: list[str] = []

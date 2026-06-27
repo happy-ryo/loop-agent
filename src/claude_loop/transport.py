@@ -284,17 +284,26 @@ class InMemoryWakeQueue:
             return True
 
     def mark_delivered(self, wake_id: str) -> bool:
-        """wake を直接 ``DELIVERED`` (terminal) にする (push 確定配送の確定)。
+        """``UNDELIVERED`` の wake を直接 ``DELIVERED`` (terminal) にする (push 確定配送の確定)。
 
-        push backend が ``True`` (確定配送) を返したときに使う。任意の非 terminal 状態から
-        冪等に遷移する (既に DELIVERED なら ``False``)。push と pull の継ぎ目を吸収する:
-        push が DELIVERED 化した行を pull は claim しない (UNDELIVERED でないため)。
+        push backend が ``True`` (確定配送) を返したときに使う。**``UNDELIVERED`` のときだけ**
+        遷移し、遷移できたら ``True``、それ以外 (既に ``DELIVERED`` / ``CLAIMED`` / 不在) は
+        ``False`` を返す。
+
+        ``CLAIMED`` を **奪わない** のが要点: push の I/O 中 (queue ロック外) に別の poller が
+        同じ wake を claim しうる。そこで無条件に DELIVERED 化すると active claim の owner を
+        消し、その poller が confirm 前にクラッシュしても lease 失効で再 eligible に戻れず
+        **wake を喪失** する (claim-then-confirm の crash recovery 破壊)。push と pull が同じ
+        wake を競合した場合は **pull claim を配送の主体** とし、push 側は既配送の重複として
+        受信側の id de-dup に委ねる (at-least-once。喪失 > 重複の方針)。push が DELIVERED 化
+        できた行は UNDELIVERED でないため pull は claim しない (継ぎ目を吸収)。
         """
         with self._lock:
             e = self._entries.get(wake_id)
             if e is None:
                 return False
-            if e.state == DELIVERED:
+            if e.state != UNDELIVERED:
+                # 既に DELIVERED、または別 poller が claim 済み (CLAIMED)。claim は奪わない。
                 return False
             e.state = DELIVERED
             e.owner = None
