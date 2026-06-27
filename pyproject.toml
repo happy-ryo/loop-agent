@@ -19,3 +19,7 @@ packages = ["src/claude_loop"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Resolve `import claude_loop` against this checkout's src/ first, ahead of any
+# editable install that might point at a sibling worktree, so the suite always
+# tests the code in this tree regardless of the ambient environment.
+pythonpath = ["src"]
