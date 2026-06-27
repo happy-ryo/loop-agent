@@ -6,7 +6,7 @@
 
 ## 現在のステータス
 
-**調査・設計フェーズ**。本リポジトリは現時点で**設計レポートのみ**を含み、実装コードはまだない。
+**PoC 実装フェーズ（Phase 1）**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP / 本格（state.db SoT・Reflexion・人間ゲート・観測の本格化）は今後（report.md §5 Phase 2/3）。
 
 ## 成果物
 
@@ -14,8 +14,90 @@
 |---|---|
 | [`report.md`](./report.md) | 調査・設計レポート（**Single Source of Truth**, Markdown） |
 | [`report.html`](./report.html) | 同内容の閲覧用単一 HTML（CSS インライン・ブラウザで直接開ける） |
+| [`src/claude_loop/`](./src/claude_loop) | PoC ループコア（ループドライバ + 合成可能 stop 条件） |
 
 `report.html` はブラウザで直接開けます（外部 CSS/JS 依存なし）。内容の正本は `report.md` です。
+
+## ループコア（PoC）
+
+report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェント・単一プロセス**で `gather → act → verify → repeat` を回し、**合成可能なハード上限**（`MaxIterations` / `TokenBudget` / `Timeout`）を OR 評価する。上限到達は**例外ではなく理由付きの制御出力**（`LoopResult`）で返る。
+
+スコープ（欲張らない = *simpler loops win*）:
+
+- ✅ ループドライバ + 機械的な合成 stop 条件（発火した条件と理由を保持）
+- ✅ `act` / `verify` は**注入可能なフック**（PoC は in-memory スタブで駆動。LLM 実呼び出しは抽象境界のみ用意）
+- ⛔ 人間ゲート・state.db SoT・Reflexion は**非スコープ**（Phase 2/3）
+
+### インストール
+
+```bash
+python3 -m pip install -e .        # ループコア本体
+python3 -m pip install -e .[dev]   # + pytest（テスト実行用）
+```
+
+### 使い方
+
+`act`（行動）と `verify`（検証 = ground truth）を渡し、終了条件を合成して `run_loop` に渡すだけ:
+
+```python
+from claude_loop import run_loop, ActOutcome, VerifyOutcome, MaxIterations, TokenBudget, Timeout
+
+state = {"n": 0}
+
+def act(ctx):
+    """1 ステップ分の行動。observation と消費トークンを返す。"""
+    state["n"] += 1
+    return ActOutcome(observation=f"did work #{state['n']}", tokens=10)
+
+def verify(outcome):
+    """ground truth 検証。goal_met=True でループは自然終了する。"""
+    done = state["n"] >= 3
+    return VerifyOutcome(goal_met=done, detail="converged" if done else "")
+
+result = run_loop(
+    act=act,
+    verify=verify,
+    conditions=[MaxIterations(5), TokenBudget(1000), Timeout(30.0)],  # OR 評価
+)
+
+print(result.status)   # "goal_met" / "stopped"
+print(result.reason)   # "goal met" / "reached max iterations (5/5)" など
+print(result.iterations, result.tokens_used)
+```
+
+ゴール未達でも上限で必ず止まる（AutoGPT 的な暴走を防ぐ）:
+
+```python
+result = run_loop(
+    act=act,
+    verify=lambda o: VerifyOutcome(goal_met=False),  # 決して達成しない
+    conditions=[MaxIterations(2)],
+)
+assert result.status == "stopped"
+assert result.stop.name == "max_iterations"   # 発火した条件
+print(result.reason)                          # "reached max iterations (2/2)"
+```
+
+### API 概要
+
+| 要素 | 役割 |
+|---|---|
+| `run_loop(*, act, verify, conditions, gather=…, on_step=…, time_fn=…)` | ループドライバ。`LoopResult` を返す |
+| `ActOutcome(observation, tokens)` | `act` フックの返り値（行動結果 + 消費トークン） |
+| `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
+| `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
+| `LoopResult` | `status` / `stop`(発火条件) / `reason` / `iterations` / `tokens_used` / `elapsed` / `history` |
+
+- `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
+- 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
+- `gather` を省略すると `LoopState` がそのまま `act` の context になる。`on_step(record, state)` は各反復完了後に呼ばれる最小の観測フック。
+- stop 条件を 1 つも渡さないと `ValueError`（無限ループ防止 = R3）。
+
+### テスト
+
+```bash
+python3 -m pytest        # 20 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 など
+```
 
 ## レポートの要約
 
