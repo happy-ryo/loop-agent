@@ -212,6 +212,17 @@ def run_loop(
             goal_met=initial_state.goal_met,
             history=list(initial_state.history),
         )
+    # A run that already reached the goal via the `verify` hook persists
+    # goal_met=True with its final step; if the process then died *before*
+    # record_result, resume reconstructs that flag. Honor it: the run already
+    # terminated naturally, so reproduce that result (status goal_met, stop None)
+    # with zero new steps instead of running more work. A goal reached via a
+    # GoalMet *stop condition* leaves this flag False (status "stopped") and is
+    # handled below -- the condition re-fires on the first guard, also at zero
+    # new steps -- so this early return is specific to the verify-hook channel.
+    if state.goal_met:
+        return LoopResult(status="goal_met", stop=None, state=state)
+
     # Back-date the clock origin by the already-elapsed time so `elapsed`
     # continues accumulating from the persisted value across the resume seam
     # (for a fresh run state.elapsed is 0.0, so start == time_fn()).

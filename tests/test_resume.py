@@ -27,6 +27,7 @@ from claude_loop import (
     NoProgress,
     StepRecord,
     Timeout,
+    VerifyOutcome,
     connect,
     run_loop,
 )
@@ -370,6 +371,71 @@ def test_resume_noprogress_with_json_stable_key_matches_straight_through(tmp_pat
 
     assert resumed.stop.name == full_result.stop.name == "no_progress"
     assert resumed.iterations == full_result.iterations == 3
+
+
+def test_resume_of_verify_hook_completed_run_returns_goal_met_without_new_steps(tmp_path):
+    # verify フックで goal 達成した最終 step が永続化された直後 (record_result 前) に
+    # クラッシュした run を再開すると、復元 state.goal_met=True を尊重し、新規 step を
+    # 1 つも回さず自然終了 (status=goal_met) を再現する。これがないと完了済み run の
+    # 再開が余計な act を回し、通し実行と結果が乖離する (Codex review P2)。
+    path = tmp_path / "state.db"
+
+    class _Crash(RuntimeError):
+        pass
+
+    # leg1 の verify: 3 回目で goal 達成 (resume では再評価されない)。
+    calls = {"n": 0}
+
+    def verify_done_at_3(_outcome):
+        calls["n"] += 1
+        met = calls["n"] >= 3
+        return VerifyOutcome(goal_met=met, detail="done" if met else "")
+
+    db1 = DBProgressLog(path, "run")
+
+    def crashing_observer(record, state):
+        db1.on_step(record, state)
+        if state.goal_met:  # goal 達成 step を永続化した直後に落とす
+            raise _Crash()
+
+    with pytest.raises(_Crash):
+        run_loop(
+            act=acting(tokens=5, observation="w"),
+            verify=verify_done_at_3,
+            conditions=[MaxIterations(100)],
+            initial_state=db1.state,
+            on_step=crashing_observer,
+        )
+    db1.close()
+
+    probe = LoopStore(connect(path))
+    assert probe.get_run("run")["goal_met"] == 1
+    assert len(probe.read_steps("run")) == 3
+    probe.conn.close()
+
+    db2 = DBProgressLog(path, "run")
+    assert db2.state.goal_met is True
+
+    def verify_must_not_run(_outcome):
+        raise AssertionError("verify must not run when resuming a goal-met run")
+
+    new_steps = []
+    result = run_loop(
+        act=acting(tokens=5, observation="w"),
+        verify=verify_must_not_run,
+        conditions=[MaxIterations(100)],
+        initial_state=db2.state,
+        on_step=lambda record, state: new_steps.append(record),
+    )
+    db2.record_result(result)
+    db2.close()
+
+    assert new_steps == []  # 完了済み -> 新規 step なし
+    assert result.status == "goal_met"
+    assert result.goal_met is True
+    assert result.stop is None
+    assert result.iterations == 3
+    assert result.tokens_used == 15
 
 
 def _run_with_db_resumable(path, run_id):
