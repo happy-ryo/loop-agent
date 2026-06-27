@@ -430,6 +430,24 @@ def test_concurrent_pollers_never_double_claim():
 # -- 不正入力 ----------------------------------------------------------------
 
 
+def test_to_dict_canonical_fields_win_over_payload_collisions():
+    """payload に予約名 (id/kind/recipient/run_id) が紛れても正準フィールドが勝つ。"""
+    w = Wake(
+        id="r1:loop_done:0",
+        kind=WAKE_LOOP_DONE,
+        recipient="coordinator",
+        run_id="r1",
+        # 悪意/事故で de-dup/routing 鍵に衝突するキーを載せる。
+        payload={"id": "EVIL", "recipient": "attacker", "extra": "ok"},
+    )
+    d = w.to_dict()
+    assert d["id"] == "r1:loop_done:0"
+    assert d["recipient"] == "coordinator"
+    assert d["kind"] == WAKE_LOOP_DONE
+    assert d["run_id"] == "r1"
+    assert d["extra"] == "ok"  # 衝突しない payload キーは残る。
+
+
 def test_enqueue_rejects_empty_id():
     q = InMemoryWakeQueue()
     with pytest.raises(ValueError):

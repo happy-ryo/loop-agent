@@ -72,13 +72,20 @@ class Wake:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON 化しやすいフラットな dict へ畳む (sink / backend のシリアライズ用)。"""
+        """JSON 化しやすいフラットな dict へ畳む (sink / backend のシリアライズ用)。
+
+        ``payload`` を先に展開し、正準フィールド (``id`` / ``kind`` / ``recipient`` /
+        ``run_id``) を **後勝ち** で上書きする。これにより payload に同名キーが紛れ込んでも、
+        de-dup / routing の正本である正準フィールドが必ず保たれる (payload 由来の ``id`` が
+        queue の de-dup 鍵と食い違って別宛先へ送られる、といった事故を防ぐ)。同名 payload キーは
+        正準値に隠れる (予約名は正準が勝つ、という契約)。
+        """
         return {
+            **dict(self.payload),
             "id": self.id,
             "kind": self.kind,
             "recipient": self.recipient,
             "run_id": self.run_id,
-            **dict(self.payload),
         }
 
 
