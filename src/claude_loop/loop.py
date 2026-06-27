@@ -1,0 +1,172 @@
+"""The PoC loop driver: gather -> act -> verify -> repeat (report.md S4.4).
+
+A single-agent, single-process driver. ``act`` and ``verify`` are injected
+callables (hooks), so the engine carries no LLM dependency -- the PoC drives it
+with in-memory stubs and the same seam later wraps a real model call.
+
+Termination is graceful and reason-bearing:
+
+- the loop ends *naturally* when ``verify`` reports the goal is met, or
+- it is *stopped* when one of the composed mechanical caps fires first.
+
+Either way the driver returns a :class:`LoopResult` describing the outcome; it
+never raises to signal "limit reached".
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Union
+
+from .conditions import AnyOf, StopCondition, StopTrigger
+from .state import LoopState, StepRecord
+
+
+@dataclass
+class ActOutcome:
+    """What one ``act`` invocation produced.
+
+    ``tokens`` is the cost charged to :class:`~claude_loop.conditions.TokenBudget`
+    for this step; stubs may report ``0``.
+    """
+
+    observation: Any = None
+    tokens: int = 0
+
+
+@dataclass
+class VerifyOutcome:
+    """Ground-truth check on an :class:`ActOutcome` (report.md R1).
+
+    ``goal_met=True`` ends the loop naturally; ``detail`` is recorded for logs.
+    """
+
+    goal_met: bool
+    detail: str = ""
+
+
+@dataclass
+class LoopResult:
+    """Outcome of a loop run. ``stop`` is ``None`` when the goal was met."""
+
+    status: str  # "goal_met" | "stopped"
+    stop: Optional[StopTrigger]
+    state: LoopState
+
+    @property
+    def goal_met(self) -> bool:
+        return self.status == "goal_met"
+
+    @property
+    def iterations(self) -> int:
+        return self.state.iteration
+
+    @property
+    def tokens_used(self) -> int:
+        return self.state.tokens_used
+
+    @property
+    def elapsed(self) -> float:
+        return self.state.elapsed
+
+    @property
+    def history(self) -> list[StepRecord]:
+        return self.state.history
+
+    @property
+    def reason(self) -> str:
+        """Human-readable reason the loop ended."""
+        if self.goal_met:
+            return "goal met"
+        return self.stop.reason if self.stop is not None else ""
+
+
+GatherHook = Callable[[LoopState], Any]
+ActHook = Callable[[Any], ActOutcome]
+VerifyHook = Callable[[ActOutcome], VerifyOutcome]
+StepHook = Callable[[StepRecord, LoopState], None]
+Conditions = Union[AnyOf, list[StopCondition], tuple[StopCondition, ...]]
+
+
+def _default_gather(state: LoopState) -> LoopState:
+    """Pass the state through as context when no gather hook is supplied."""
+    return state
+
+
+def run_loop(
+    *,
+    act: ActHook,
+    verify: VerifyHook,
+    conditions: Conditions,
+    gather: GatherHook = _default_gather,
+    on_step: Optional[StepHook] = None,
+    time_fn: Callable[[], float] = time.monotonic,
+) -> LoopResult:
+    """Drive gather -> act -> verify -> repeat until the goal or a cap.
+
+    Args:
+        act: Hook producing an :class:`ActOutcome` from the gathered context.
+        verify: Hook turning an :class:`ActOutcome` into a :class:`VerifyOutcome`;
+            ``goal_met=True`` terminates the loop naturally.
+        conditions: An :class:`~claude_loop.conditions.AnyOf`, or any non-empty
+            sequence of stop conditions (wrapped in ``AnyOf`` automatically).
+        gather: Hook building the context handed to ``act``. Defaults to passing
+            the :class:`LoopState` through.
+        on_step: Optional observer invoked with ``(record, state)`` after each
+            completed iteration (a minimal observability seam; report.md R7).
+        time_fn: Monotonic clock, injectable for deterministic timeout tests.
+
+    Returns:
+        A :class:`LoopResult`. ``status`` is ``"goal_met"`` (``stop is None``) or
+        ``"stopped"`` (``stop`` names the fired condition).
+
+    Stop conditions are evaluated at the top of each cycle (the while-guard),
+    *before* a new step starts -- including before the very first one, so e.g.
+    ``MaxIterations(0)`` returns immediately with zero iterations.
+    """
+    if isinstance(conditions, AnyOf):
+        stop = conditions
+    elif isinstance(conditions, (list, tuple)):
+        stop = AnyOf(conditions)
+    else:
+        raise TypeError(
+            "conditions must be an AnyOf or a sequence of stop conditions, "
+            f"got {type(conditions).__name__}"
+        )
+
+    start = time_fn()
+    state = LoopState()
+
+    while True:
+        state.elapsed = time_fn() - start
+        triggered = stop.first_triggered(state)
+        if triggered is not None:
+            return LoopResult(status="stopped", stop=triggered, state=state)
+
+        context = gather(state)
+        outcome = act(context)
+        state.tokens_used += outcome.tokens
+
+        verdict = verify(outcome)
+        record = StepRecord(
+            iteration=state.iteration,
+            observation=outcome.observation,
+            tokens=outcome.tokens,
+            goal_met=verdict.goal_met,
+            detail=verdict.detail,
+        )
+        state.history.append(record)
+        state.iteration += 1
+        # Refresh post-step fields *before* on_step so the observer (and the
+        # returned result) see state consistent with this iteration's record:
+        # elapsed includes the step just run, and goal_met reflects its verdict.
+        state.elapsed = time_fn() - start
+        if verdict.goal_met:
+            state.goal_met = True
+
+        if on_step is not None:
+            on_step(record, state)
+
+        if verdict.goal_met:
+            return LoopResult(status="goal_met", stop=None, state=state)
