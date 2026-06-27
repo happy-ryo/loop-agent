@@ -146,6 +146,17 @@ def test_duplicate_lesson_text_not_stored_twice():
     assert len(mem) == 1
 
 
+def test_dedup_applies_after_truncation():
+    """切り詰め後に同一になる lesson は二重保存しない (dedup は格納テキストで判定)。"""
+    mem = EpisodicMemory(cap=5, per_lesson_chars=8)
+    # 先頭 8 文字 "COMMON: " が同一、以降だけ違う 2 つ。
+    assert mem.admit(Lesson("COMMON: alpha", 0, "p0", 1.0), LessonVerdict(admit=True)) is True
+    assert mem.admit(Lesson("COMMON: beta", 1, "p1", 1.0), LessonVerdict(admit=True)) is False
+    assert len(mem) == 1
+    (stored,) = mem.lessons()
+    assert stored.text == "COMMON: "
+
+
 def test_rejected_verdict_not_stored():
     mem = EpisodicMemory(cap=5)
     assert mem.admit(Lesson("t", 0, "p", 1.0), LessonVerdict(admit=False)) is False

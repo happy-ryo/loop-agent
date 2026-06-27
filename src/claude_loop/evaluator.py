@@ -85,15 +85,24 @@ def _scorer_identity(score: ScoreFn) -> str:
 
     ``__qualname__`` だけだと別ソース位置の lambda が同名 (``<lambda>``) で衝突し、振る舞いの
     違う評価器が同じ version になって epoch-freeze の監査証跡を壊す。``__code__`` があれば
-    **定義ソース位置** (filename:firstlineno) を足して、別位置で定義された関数/lambda を
-    区別する (同一プロセス内でも・プロセスを跨いでも再現する)。同じ code object を共有する
-    closure (同位置・別 capture) はなお衝突しうるので、その場合は呼び出し側が明示 ``version``
-    を渡すこと (docstring 参照)。
+    **定義ソース位置** (filename:firstlineno) に加え、**実装そのもの** ― バイトコード
+    ``co_code`` + 定数 ``co_consts`` + 参照名 ``co_names`` ― のハッシュを足す。これにより
+    定義位置を動かさず本体を書き換えた (例: ``0.5`` を ``1.0`` に変えた) 評価器も別 version に
+    なり、resume/audit が in-place な振る舞い変更を silently 受理しない。同一ソースなら同じ
+    version になる (プロセスを跨いで再現)。free 変数を capture した closure (同一 code object・
+    別 capture) はなお衝突しうるので、振る舞いが違うなら明示 ``version`` を渡すこと。
     """
     qual = getattr(score, "__qualname__", repr(score))
     code = getattr(score, "__code__", None)
     if code is not None:
-        return f"{qual}@{code.co_filename}:{code.co_firstlineno}"
+        import hashlib
+
+        body = hashlib.sha256(
+            code.co_code
+            + repr(code.co_consts).encode("utf-8", "surrogatepass")
+            + repr(code.co_names).encode("utf-8", "surrogatepass")
+        ).hexdigest()[:16]
+        return f"{qual}@{code.co_filename}:{code.co_firstlineno}#{body}"
     return qual
 
 

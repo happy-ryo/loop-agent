@@ -162,11 +162,14 @@ class EpisodicMemory:
         """
         if not verdict.admit:
             return False
+        # 切り詰めを **重複判定より先** に行う: per_lesson_chars が小さいと、切り詰め後に同一に
+        # なる 2 つの lesson (切り詰め点より後ろだけ違う) が dedup をすり抜けて同一テキストで
+        # 二重保存され、重複抑止が効かない。実際に格納されるテキストで重複判定する。
+        if len(lesson.text) > self.per_lesson_chars:
+            lesson = replace(lesson, text=lesson.text[: self.per_lesson_chars])
         norm = self._normalized(lesson.text)
         if any(self._normalized(existing.text) == norm for existing in self._lessons):
             return False
-        if len(lesson.text) > self.per_lesson_chars:
-            lesson = replace(lesson, text=lesson.text[: self.per_lesson_chars])
         self._lessons.append(lesson)
         if len(self._lessons) > self.cap:
             self._evict_one()

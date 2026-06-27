@@ -220,6 +220,29 @@ def test_lambda_evaluators_distinguished_by_source_location():
     assert e1.version != e2.version
 
 
+def test_version_detects_in_place_body_change():
+    """定義位置を動かさず本体 (定数) を変えた scorer は別 version になる。"""
+    src_a = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=0.5)\n"
+    src_b = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=1.0)\n"
+    ns_a: dict = {}
+    ns_b: dict = {}
+    # 同一 filename/firstlineno を持つ別本体の関数を作る (in-place 書き換えを模す)。
+    exec(compile(src_a, "scorer.py", "exec"), ns_a)
+    exec(compile(src_b, "scorer.py", "exec"), ns_b)
+    e_a = Evaluator(score=ns_a["s"], name="s")
+    e_b = Evaluator(score=ns_b["s"], name="s")
+    assert e_a.version != e_b.version
+
+
+def test_version_reproducible_for_identical_source():
+    src = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=0.5)\n"
+    ns1: dict = {}
+    ns2: dict = {}
+    exec(compile(src, "scorer.py", "exec"), ns1)
+    exec(compile(src, "scorer.py", "exec"), ns2)
+    assert Evaluator(score=ns1["s"], name="s").version == Evaluator(score=ns2["s"], name="s").version
+
+
 def test_explicit_version_is_preserved():
     e = Evaluator(score=lambda o: Score(ground_truth=0.0), name="x", version="v-pinned")
     assert e.version == "v-pinned"
