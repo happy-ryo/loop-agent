@@ -381,15 +381,27 @@ class Transport:
         ``"push"`` を返す。backend 不在 / push 失敗 / push 例外なら ``UNDELIVERED`` のまま残し
         ``"queued"`` を返す — 受信側の :meth:`poll` が pull で拾う (= fallback)。
 
-        同一 ``id`` の再 deliver は enqueue が no-op なので、既に DELIVERED な wake を push で
-        二度送らない (push を試みるのは「今回新規に積まれた、または未だ未配送の」wake のみ)。
+        同一 ``id`` の再 deliver は enqueue が no-op になり、**進行中の配送を乱さない**。
+        push を (再) 試行するのは「今回新規に積まれた」か「まだ ``UNDELIVERED`` (誰も claim
+        していない)」wake に限る:
+
+        - 既に ``DELIVERED``: 配送確定済み。push も pull も重ねない (``"push"`` を返す)。
+        - 既に ``CLAIMED``: 受信側が pull で claim 済み (confirm 待ち)。ここで push を重ねて
+          :meth:`~WakeQueue.mark_delivered` すると、owner の lease を奪って claim-then-confirm の
+          **失効再配送保護を壊す** (owner が confirm 前にクラッシュした wake が再 eligible に
+          戻らなくなる)。active claim はそのまま尊重し、配送は pull に委ねる (``"queued"``)。
+        - ``UNDELIVERED`` / 内省不可 queue の ``None``: active claim が無いので push 再試行は
+          安全 (backend 復旧後に ``queued`` から ``push`` へ昇格できる)。
         """
         newly = self.queue.enqueue(wake)
-        # 既存 wake が既に DELIVERED 済みなら push を重ねない (二重配送を避ける)。
         if not newly:
             state = _state_of(self.queue, wake.id)
             if state == DELIVERED:
                 return "push"  # 既に配送確定。再送しない。
+            if state == CLAIMED:
+                # 進行中の pull claim を尊重する (push で横取り確定しない)。
+                return "queued"
+            # state は UNDELIVERED か None: active claim 無し。push 再試行は安全。
         if self.backend is not None and self._try_push(wake):
             self.queue.mark_delivered(wake.id)
             return "push"

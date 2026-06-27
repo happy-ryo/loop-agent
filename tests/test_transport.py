@@ -187,6 +187,35 @@ def test_owner_fencing_blocks_stale_confirm():
     assert queue.state_of("r1:loop_done:0") == DELIVERED
 
 
+def test_redeliver_respects_inflight_claim():
+    """CLAIMED 中の wake を再 deliver しても、active claim を push で横取り確定しない。
+
+    backend 復旧後の retry/resume が deliver を再呼びしても、受信側が confirm=False で
+    claim 中の wake は CLAIMED のまま残し、owner の lease 失効再配送保護を壊さない
+    (codex P2 回帰防止)。
+    """
+    up = {"ok": False}
+    backend = CallablePushBackend(lambda w: up["ok"])
+    clock = ManualClock()
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, backend, lease=30.0, time_fn=clock)
+
+    assert t.deliver(_wake(0)) == "queued"  # backend down -> queued
+    claimed = t.poll("coordinator", confirm=False)  # 受信側が claim (処理中)
+    assert [w.id for w in claimed] == ["r1:loop_done:0"]
+    assert queue.state_of("r1:loop_done:0") == CLAIMED
+
+    # backend 復旧後の再 deliver: active claim を尊重して横取りしない。
+    up["ok"] = True
+    assert t.deliver(_wake(0)) == "queued"
+    assert queue.state_of("r1:loop_done:0") == CLAIMED  # まだ CLAIMED のまま
+
+    # owner が confirm 前にクラッシュ -> lease 失効で再配送される (保護が生きている)。
+    clock.advance(31.0)
+    redelivered = t.poll("coordinator")
+    assert [w.id for w in redelivered] == ["r1:loop_done:0"]
+
+
 def test_delivered_wake_never_redelivered_even_on_redeliver_attempt():
     """DELIVERED 済み wake を再 deliver しても push を重ねず、pull でも返らない。"""
     pushes: list[str] = []
