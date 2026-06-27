@@ -55,7 +55,7 @@ def _run_with_db(conn, run_id, *, act, verify, conditions, on_step=None):
 # -- スキーマ独立性 (org 本体非依存の最小スキーマ) ----------------------------
 
 
-def test_schema_has_only_the_four_minimal_loop_tables(tmp_path):
+def test_schema_has_only_the_minimal_loop_tables(tmp_path):
     conn = connect(tmp_path / "state.db")
     names = {
         r["name"]
@@ -65,7 +65,9 @@ def test_schema_has_only_the_four_minimal_loop_tables(tmp_path):
     }
     # sqlite_sequence は AUTOINCREMENT の副産物なので除外して比較する。
     names.discard("sqlite_sequence")
-    assert names == {"run", "step", "event", "stop_reason"}
+    # run / step / event / stop_reason の 4 表 + 限定人間ゲート (Issue #15) の
+    # pending_decision。いずれも org 本体非依存の自己完結スキーマ。
+    assert names == {"run", "step", "event", "stop_reason", "pending_decision"}
 
 
 def test_schema_carries_no_claude_org_tables(tmp_path):

@@ -47,12 +47,24 @@ SCHEMA_VERSION = 1
 
 # loop 用最小スキーマ。org 本体非依存・自己完結。``IF NOT EXISTS`` で冪等。
 #
-# - run         : 1 走 1 行。最終ステータスと集計 (反復数 / トークン / 経過) の正本。
-# - step        : 完了した各反復 1 行。UNIQUE(run_id, iteration) で再実行に冪等
-#                 (resume #14 の土台)。observation は JSON 文字列で保存。
-# - event       : append-only の journal (report.md R7 観測)。loop_begin /
-#                 loop_step / loop_end を記録し、全終了理由を事後解析できるようにする。
-# - stop_reason : run と 1:1。発火した停止条件 (name) と理由、または goal 達成。
+# - run             : 1 走 1 行。最終ステータスと集計 (反復数 / トークン / 経過) の正本。
+# - step            : 完了した各反復 1 行。UNIQUE(run_id, iteration) で再実行に冪等
+#                     (resume #14 の土台)。observation は JSON 文字列で保存。
+# - event           : append-only の journal (report.md R7 観測)。loop_begin /
+#                     loop_step / loop_end / loop_gate を記録し、全終了理由・人間ゲート
+#                     の発火/決定を事後解析できるようにする。
+# - stop_reason     : run と 1:1。発火した停止条件 (name) と理由、または goal 達成。
+# - pending_decision: 限定人間ゲート (Issue #15, report.md S4.5 / R6) の決定レジスタ。
+#                     不可逆操作で発火した 1 件 1 行。UNIQUE(run_id, gate_key) で冪等。
+#                     pending -> resolved(approve|edit|reject|respond) -> executed を
+#                     永続化し、pause/resume をまたいで決定を保持する。claude-org の
+#                     pending_decisions(state machine) を role 読み替えで reuse:
+#                     「secretary が worker の判断要求を register し user 応答で resolve」
+#                     を「loop が不可逆 action を register し human が resolve」に対応付け、
+#                     直接応答ゆえ中間状態 escalated は resolved に畳む。さらに executed を
+#                     足し、approve/edit で実行した不可逆 action を resume 再生時に
+#                     **二度実行しない** (at-most-once。loop は #14 未配線のため iteration 0
+#                     から再生されるので、実行済みゲートを skip して再発火を防ぐ)。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
   run_id       TEXT PRIMARY KEY,
@@ -99,12 +111,38 @@ CREATE TABLE IF NOT EXISTS stop_reason (
   reason       TEXT NOT NULL DEFAULT '',
   recorded_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE TABLE IF NOT EXISTS pending_decision (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id       TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
+  gate_key     TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending','resolved','executed')),
+  decision     TEXT CHECK (decision IS NULL OR
+                 decision IN ('approve','edit','reject','respond')),
+  action       TEXT CHECK (action IS NULL OR json_valid(action)),
+  payload      TEXT CHECK (payload IS NULL OR json_valid(payload)),
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at  TEXT,
+  executed_at  TEXT,
+  -- pending 以外 (resolved/executed) は必ず decision を持つ (整合不変条件)。
+  CHECK (status = 'pending' OR decision IS NOT NULL),
+  UNIQUE (run_id, gate_key)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_run ON pending_decision(run_id);
 """
 
 # event.kind の値。読み手が文字列リテラルを直書きせず filter できるよう定数化。
 EVENT_BEGIN = "loop_begin"
 EVENT_STEP = "loop_step"
 EVENT_END = "loop_end"
+# 人間ゲートの発火 (pending) / 決定 (resolved) を journal に残す (report.md R6/R7)。
+EVENT_GATE = "loop_gate"
+
+# 限定人間ゲートで人間が下せる 4 種の決定 (LangGraph interrupt パリティ:
+# report.md S4.5 / S2.6)。approve=そのまま実行 / edit=修正して実行 /
+# reject=実行せず却下を記録 / respond=実行せず応答を返す。
+DECISION_KINDS = ("approve", "edit", "reject", "respond")
 
 DbSource = Union[str, "os.PathLike[str]", sqlite3.Connection]
 
@@ -408,7 +446,25 @@ class LoopStore:
         1 トランザクションで「``stop_reason`` 行の upsert + run 行の終了状態更新
         (status / ended_at と最終集計) + ``loop_end`` event の追記」を束ねる。
         ``stop_reason`` は run と 1:1 で、再実行に冪等 (``DO UPDATE``)。
+
+        ``status == "paused"`` (人間ゲートでの中断) は **終端ではない**: run は
+        ``running`` のまま残し、``stop_reason`` も書かない (resume で続行できる)。
+        集計だけ更新し、pause を ``loop_gate`` event として journal に残す。これにより
+        ``DBProgressLog.record_result`` を pause した結果にそのまま渡してもよい
+        (CHECK 制約違反でクラッシュさせない)。
         """
+        if result.status == "paused":
+            gate_key = (
+                result.pending.get("gate_key")
+                if isinstance(result.pending, dict)
+                else None
+            )
+            with self.transaction():
+                self._bump_run(run_id, result.state)
+                self._append_event(
+                    run_id, EVENT_GATE, {"status": "paused", "gate_key": gate_key}
+                )
+            return
         stop_name = result.stop.name if result.stop is not None else None
         with self.transaction():
             self.conn.execute(
@@ -498,6 +554,160 @@ class LoopStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    # -- 限定人間ゲート (pending_decision) -----------------------------------
+
+    @staticmethod
+    def _decode_decision(row: sqlite3.Row) -> dict[str, Any]:
+        """pending_decision 行を dict に復号する (action / payload を JSON から戻す)。"""
+        d = dict(row)
+        d["action"] = json.loads(d["action"]) if d["action"] is not None else None
+        d["payload"] = json.loads(d["payload"]) if d["payload"] is not None else None
+        return d
+
+    def request_decision(
+        self, run_id: str, gate_key: str, action: Any
+    ) -> dict[str, Any]:
+        """不可逆 action の人間ゲートを ``pending`` で登録する (冪等)。
+
+        org の ``pending_decisions.append`` に対応 (role 読み替え)。同一
+        ``(run_id, gate_key)`` に既存行があれば **上書きせず** そのまま返す。これにより
+        pause 後の resume で同じ action を再評価しても、既に下した決定 (resolved) や
+        登録済みの pending を壊さない (= 人間に二重に問わない)。新規登録時のみ
+        ``loop_gate`` event を 1 件追記する。
+        """
+        if not gate_key:
+            raise ValueError("request_decision: gate_key must be a non-empty string")
+        action_json = _encode_observation(action)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            if existing is not None:
+                return self._decode_decision(existing)
+            self.conn.execute(
+                "INSERT INTO pending_decision (run_id, gate_key, status, action) "
+                "VALUES (?, ?, 'pending', ?)",
+                (run_id, gate_key, action_json),
+            )
+            self._append_event(
+                run_id,
+                EVENT_GATE,
+                {"gate_key": gate_key, "status": "pending"},
+            )
+            row = self.conn.execute(
+                "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            return self._decode_decision(row)
+
+    def resolve_decision(
+        self,
+        run_id: str,
+        gate_key: str,
+        decision: str,
+        payload: Any = None,
+    ) -> dict[str, Any]:
+        """``pending`` の決定を人間の選択で ``resolved`` に確定する。
+
+        org の ``pending_decisions.resolve`` に対応。``decision`` は
+        :data:`DECISION_KINDS` の 4 種。``payload`` は ``edit`` の置換 action や
+        ``respond`` の応答メッセージを載せる (JSON 符号化)。``pending`` 行のみ遷移可能で、
+        既に ``resolved`` 済みなら ``ValueError`` (terminal: 一度下した決定は再決定しない)。
+        確定時に ``loop_gate`` event を 1 件追記する。
+        """
+        if decision not in DECISION_KINDS:
+            raise ValueError(
+                f"unknown decision {decision!r}; expected one of {DECISION_KINDS}"
+            )
+        payload_json = _encode_observation(payload) if payload is not None else None
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            if existing is None:
+                raise ValueError(
+                    f"no pending decision for gate_key {gate_key!r} (run {run_id!r})"
+                )
+            if existing["status"] != "pending":
+                raise ValueError(
+                    f"decision {gate_key!r} already resolved; cannot re-decide"
+                )
+            self.conn.execute(
+                "UPDATE pending_decision SET status = 'resolved', decision = ?, "
+                "payload = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE run_id = ? AND gate_key = ?",
+                (decision, payload_json, run_id, gate_key),
+            )
+            self._append_event(
+                run_id,
+                EVENT_GATE,
+                {"gate_key": gate_key, "status": "resolved", "decision": decision},
+            )
+            row = self.conn.execute(
+                "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            return self._decode_decision(row)
+
+    def mark_executed(self, run_id: str, gate_key: str) -> dict[str, Any]:
+        """approve/edit で実行した不可逆 action を ``executed`` に確定する (at-most-once)。
+
+        ``resolved`` -> ``executed`` の遷移。loop は resume 時に iteration 0 から
+        再生される (#14 未配線) ため、一度実行した不可逆 action を再生で **二度実行
+        しない** よう、実行に踏み切る *前* にこのマークを立てる (at-most-once: 途中
+        失敗時も再実行しない方が不可逆操作には安全)。既に ``executed`` なら冪等 no-op。
+        ``pending`` (未解決) からの実行はあり得ないので ``ValueError``。
+        """
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            if existing is None:
+                raise ValueError(
+                    f"no decision for gate_key {gate_key!r} (run {run_id!r})"
+                )
+            if existing["status"] == "pending":
+                raise ValueError(
+                    f"cannot mark unresolved gate {gate_key!r} executed"
+                )
+            if existing["status"] != "executed":
+                self.conn.execute(
+                    "UPDATE pending_decision SET status = 'executed', "
+                    "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE run_id = ? AND gate_key = ?",
+                    (run_id, gate_key),
+                )
+                self._append_event(
+                    run_id,
+                    EVENT_GATE,
+                    {"gate_key": gate_key, "status": "executed"},
+                )
+            row = self.conn.execute(
+                "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                (run_id, gate_key),
+            ).fetchone()
+            return self._decode_decision(row)
+
+    def get_decision(self, run_id: str, gate_key: str) -> Optional[dict[str, Any]]:
+        """``(run_id, gate_key)`` の決定行を dict で返す (無ければ ``None``)。"""
+        row = self.conn.execute(
+            "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+            (run_id, gate_key),
+        ).fetchone()
+        return self._decode_decision(row) if row is not None else None
+
+    def list_pending_decisions(self, run_id: str) -> list[dict[str, Any]]:
+        """``run_id`` の未解決 (``pending``) 決定を登録順に返す。"""
+        rows = self.conn.execute(
+            "SELECT * FROM pending_decision WHERE run_id = ? AND status = 'pending' "
+            "ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        return [self._decode_decision(r) for r in rows]
+
 
 class DBProgressLog:
     """DB-backed の進捗記録。:class:`~claude_loop.progress.ProgressLog` の drop-in。
@@ -551,4 +761,6 @@ __all__ = [
     "EVENT_BEGIN",
     "EVENT_STEP",
     "EVENT_END",
+    "EVENT_GATE",
+    "DECISION_KINDS",
 ]
