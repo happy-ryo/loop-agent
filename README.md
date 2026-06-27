@@ -34,7 +34,8 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
 - ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤）
 - ✅ **中断 → 再開（resume）**: 永続化済み step から `LoopState` を復元し、`run_loop(initial_state=…)` で状態欠落なく途中から継続（iteration・コスト累積・`elapsed`・history を引き継ぐ）。中断して再開した結果が通し実行と一致することを回帰テストで実証（`tests/test_resume.py` / Issue #14）
-- ⛔ 人間ゲート・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
+- ✅ **複数プロセス同時 resume の協調（in-progress リース）**: 同一 `run_id` を複数プロセスで同時に resume しても、不可逆 action は **exactly-once + 順序整合**（`pending → resolved → executing → executed` 多段化 + リース single-winner）。敗者は `executed` まで pause、勝者クラッシュ時はリース失効で別プロセスが取り直し step も欠落しない。並行プロセス模擬で実証（`tests/test_concurrent_resume.py` / Issue #21）
+- ⛔ Reflexion・サーキットブレーカは**非スコープ**（Phase 3）
 
 ### インストール
 
@@ -281,6 +282,23 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
     既実行ゲートの skip placeholder で `history` 依存の `gather` が乖離しうるため、**非ゲート
     action は冪等・提案列は iteration に対し決定的**を前提とする。run を跨ぐ累積上限や history 依存の
     再開が要るなら `initial_state` resume を使う。
+- **複数プロセス同時 resume の協調（in-progress リース, #21）**: 同一 `run_id` を複数プロセスで
+  *同時に* resume してもよい。approve/edit の不可逆 action は `pending → resolved → executing →
+  executed` の多段化と **in-progress リース**（`acquire_lease` の `resolved → executing` single-winner
+  遷移 + `lease_owner` / `lease_expires_at`）で 1 者だけが実行権を得る。
+  - **exactly-once + 順序整合**: `resolved → executing` に成功するのは 1 プロセスだけ。実行中
+    （`executing` かつ未失効）に同一ゲートを審査した敗者は **`executed` まで pause** して待つので、
+    勝者の不可逆 action 完了前に後続 iteration を走らせない。勝者は `act` 完了後（step 永続化後）に
+    `complete_execution` で `executed` を確定する。
+  - **勝者クラッシュ復旧**: 勝者が `act` 途中でクラッシュしリースが失効（`lease_expires_at ≤ now`）すると、
+    待っていた別プロセスが resume 時にリースを取り直して（`took_over`）実行を完遂する。step 行は完了確定の
+    *前* に永続化されるため（driver が `GateReview.on_complete` を `on_step` の後に呼ぶ）、勝者クラッシュでも
+    step が欠落しない。
+  - **トレードオフ**: 失効取り直しは `act` を再実行するので、勝者が *副作用を起こした後・`executed` 確定の前* に
+    クラッシュした稀なケースでは副作用が重複する（**at-least-once**）。完全な exactly-once は副作用側の冪等鍵が
+    要る（本モジュール範囲外）。`lease_ttl` を不可逆 action の最大所要より十分長くすれば失効取り直し自体を避けられる。
+  リース owner は既定でプロセス毎に一意なトークンを自動生成する（`HumanGate(owner=…)` で明示注入も可）。
+  並行 resume の exactly-once / 順序整合 / クラッシュ復旧は `tests/test_concurrent_resume.py`（並行プロセス模擬）で実証。
 - `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も
   書かれない（resume で続行できる）。各 step の正本は `step` 行に残るので監査はそこから行う。
 
@@ -304,11 +322,11 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 | `read_events(path)` | JSONL イベントを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 | `LoopSpan` / `otel_available()` | OTel GenAI span の薄いラッパ（未導入なら no-op）/ OTel 利用可否 |
 | `connect(path)` | loop 用 state DB を開き（無ければ作り）最小スキーマを適用した接続を返す（`":memory:"` 可） |
-| `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（新規は空・既存は復元 = resume seed）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` / `request_decision` / `resolve_decision` / `get_decision` / `list_pending_decisions` / `claim_execution`（人間ゲート） |
+| `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（新規は空・既存は復元 = resume seed）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` / `request_decision` / `resolve_decision` / `get_decision` / `list_pending_decisions` / `claim_execution`（単一プロセス at-most-once）/ `acquire_lease` / `complete_execution`（複数プロセス同時 resume の in-progress リース, #21） |
 | `DBProgressLog(db, run_id)` | DB-backed の進捗記録。`ProgressLog` 互換の `on_step` / `record_result` を持つ drop-in（path か既存接続を受ける context manager）。`.state` が復元した `LoopState`（resume の seed） |
-| `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す |
+| `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す。`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume の in-progress リース調整用（#21） |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
-| `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True)` | `HumanGate` を組んで `run_loop` を回す入口 |
+| `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | `HumanGate` を組んで `run_loop` を回す入口（`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume 用, #21） |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
