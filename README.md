@@ -6,7 +6,7 @@
 
 ## 現在のステータス
 
-**PoC → MVP 移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**を導入した（report.md §5 Phase 2）。残りの MVP / 本格（resume の完成・二重終了条件・人間ゲート・Reflexion・観測の本格化）は今後（report.md §5 Phase 2/3）。
+**PoC → MVP 移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**と、それに載る**中断 → 再開（resume）**を導入した（report.md §5 Phase 2）。残りの MVP / 本格（人間ゲート・Reflexion・観測の本格化）は今後（report.md §5 Phase 2/3）。
 
 ## 成果物
 
@@ -32,7 +32,8 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ **二重終了条件（意味的 stop）**: 機械的上限に加え、`GoalMet`（検証可能ゴールの達成＝成功終了）と `NoProgress`（無進捗・反復アクションの検出＝打ち切り）を同じ `AnyOf` 合成に載せる
 - ✅ **最小状態（進捗ファイル）**: 各反復の記録を JSON Lines で外部ファイルに追記し、プロセスをまたいで進捗が残る（`ProgressLog` / state.db SoT の最小の前身）
 - ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
-- ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤。resume の完成は #14）
+- ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤）
+- ✅ **中断 → 再開（resume）**: 永続化済み step から `LoopState` を復元し、`run_loop(initial_state=…)` で状態欠落なく途中から継続（iteration・コスト累積・`elapsed`・history を引き継ぐ）。中断して再開した結果が通し実行と一致することを回帰テストで実証（`tests/test_resume.py` / Issue #14）
 - ⛔ 人間ゲート・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
 
 ### インストール
@@ -178,7 +179,7 @@ with DBProgressLog("state.db", run_id="my-run") as db:   # run 行 + loop_begin 
     db.record_result(result)                             # 終了状態 + stop_reason を確定
 ```
 
-低レベル API（resume #14 の土台）:
+低レベル API:
 
 ```python
 from claude_loop import connect, LoopStore
@@ -190,12 +191,38 @@ store.read_events("my-run")              # journal（loop_begin / loop_step / lo
 store.get_stop_reason("my-run")          # 発火した停止条件 or goal 達成
 ```
 
+**中断 → 再開（resume, #14）**。永続化済み step から復元した `LoopState` を
+`run_loop(initial_state=…)` に渡すと、中断したループを状態欠落なく途中から継続できる
+（iteration カウンタ・コスト累積・`elapsed`・history が引き継がれ、`elapsed` は永続化値から
+継続加算される）。`DBProgressLog.state` がその復元結果（新規 run なら空 = fresh start と同義）
+なので、新規・再開で同じ配線にできる:
+
+```python
+db = DBProgressLog("state.db", "my-run")   # 既存 run なら state を step から復元
+result = run_loop(act=act, verify=verify, conditions=[GoalMet(verifier), MaxIterations(100)],
+                  initial_state=db.state,   # 中断地点から継続（新規 run は空 state）
+                  on_step=db.on_step)
+db.record_result(result)
+```
+
+resume は**状態ベースの停止条件**（`GoalMet` など state から判定するフック）と組み合わせて
+意味を持つ。プロセスをまたぐと act/verify フックは作り直されるが、その内部のコール回数
+カウンタは復元されない — 判定を（gather された）state から導けば、新プロセスでも同じ判断を
+再現でき、再開結果が通し実行と一致する。
+
+> **observation の型忠実度（resume の限界）**。state.db から復元した `history` の
+> `observation` は保存時の JSON を round-trip した値になる（`tuple→list` / dict の
+> int キー→str / set・カスタム型・NaN→repr 文字列）。raw な `observation` を直接
+> *キー*にする条件（特に `NoProgress` の既定 key）は再開境界で値が変わりうる
+> （`tuple` は unhashable な `list` になる）。完全一致で再開したい場合は JSON 安定な
+> observation を使うか、`NoProgress(key=…)` に JSON 安定な signature への射影を渡す。
+
 **JSONL と DB は併存**する。`ProgressLog`（JSONL）は依存ゼロで読める PoC アーティファクトとして残し、
 `DBProgressLog`（state.db）が MVP 以降の状態 SoT になる。両者は同じ観測フック規約を共有する。
 
 各 step の永続化は「`step` 行 + `run` 集計 + `loop_step` event」を**1 トランザクションに束ねる**ので、
 commit 前にプロセスが死んでも半端な行は残らない（クラッシュ耐性）。`UNIQUE(run_id, iteration)` により
-同一反復の再永続化は冪等（resume の土台）。
+同一反復の再永続化は冪等（再開時の replay 安全性）。
 
 ### 限定人間ゲート（不可逆操作のみ approve/edit/reject/respond）
 
@@ -241,27 +268,27 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
   構成を `run_loop` に組む薄い入口。`active=False` でゲートを全停止できる。
 - 決定レジスタは state.db の `pending_decision` 表（`UNIQUE(run_id, gate_key)` で冪等）に
   載り、発火/決定/実行は journal の `loop_gate` event に残る。
-- **resume の契約（不可逆は exactly-once）**: `run_loop` は resume 時に iteration 0 から
-  再生する（完全な loop-state 復元は #14）。approve/edit で**実行した不可逆 action は
-  `executed` に確定**され、後続 resume の再生では skip して**二度実行しない**（二重 deploy
-  等の暴発防止）。一方ゲート対象でない reversible な action は再生のたび `act` が再実行
-  されるため、**非ゲート action は冪等であること**を前提とする（あるいは #14 の状態復元を
-  待つ）。`record_result` に `paused` の結果を渡しても run は `running` のまま残り、
-  `stop_reason` も書かれない（resume で続行できる）。
-- **既知の制限**: resume は loop レベルの状態を復元しない。(1) **累積集計**（`tokens_used` /
-  `elapsed` / `iteration`）は復元されないので、**run を跨いで累積する上限**（`TokenBudget` /
-  `Timeout`）を gate の pause/resume 越しに信頼しないこと（再開後は前 run までの消費がリセット
-  されて見える）。(2) 既実行ゲートの skip は合成 placeholder を `history` に積むため、`gather` が
-  **過去の observation 内容に依存**して提案を変えるループでは resume 後の提案列が初回と乖離しうる
-  （本 MVP は「提案列は resume 間で決定的かつ履歴内容に非依存」を前提）。各 step の正本は `step`
-  行に残るので監査はそこから行う。累積集計・観測履歴を引き継いだ完全な（history-dependent な）
-  resume は #14（loop-state 復元）の領分。
+- **resume の契約（不可逆は exactly-once）**: gate key は審査時点の `state.iteration` で決まり、
+  resume の 2 モデルのどちらでも安定する。
+  - **`initial_state` resume（#14, 推奨）**: 中断時の `LoopState`（`store.load_or_init(run_id)` /
+    `DBProgressLog.state`）を `run_loop(initial_state=…)` に渡すと、`iteration` / `tokens_used` /
+    `elapsed` / `history` が復元され中断地点から**継続**する。`TokenBudget` / `Timeout` が run を
+    跨いで正しく効き、`history` 依存の `gather` も初回と整合する。再開で最初に当たる「中断した
+    ゲート」へ iteration ベースのキーが正しく振られ、永続化済み決定が再対応する。
+  - **replay resume（`initial_state` なし）**: fresh state で iteration 0 から再生する後方互換
+    モード。approve/edit で**実行した不可逆 action は `executed` に確定**され、再生では skip して
+    **二度実行しない**（二重 deploy 等の暴発防止）。ただし累積集計は前 run 分リセットされて見え、
+    既実行ゲートの skip placeholder で `history` 依存の `gather` が乖離しうるため、**非ゲート
+    action は冪等・提案列は iteration に対し決定的**を前提とする。run を跨ぐ累積上限や history 依存の
+    再開が要るなら `initial_state` resume を使う。
+- `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も
+  書かれない（resume で続行できる）。各 step の正本は `step` 行に残るので監査はそこから行う。
 
 ### API 概要
 
 | 要素 | 役割 |
 |---|---|
-| `run_loop(*, act, verify, conditions, gather=…, on_step=…, gate=…, time_fn=…)` | ループドライバ。`LoopResult` を返す。`gate` を渡すと不可逆操作を interrupt する |
+| `run_loop(*, act, verify, conditions, gather=…, on_step=…, gate=…, time_fn=…, initial_state=…)` | ループドライバ。`LoopResult` を返す。`gate` を渡すと不可逆操作を interrupt、`initial_state` に復元 `LoopState` を渡すと中断地点から**再開**（resume #14） |
 | `ActOutcome(observation, tokens)` | `act` フックの返り値（行動結果 + 消費トークン） |
 | `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
 | `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
@@ -277,8 +304,8 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 | `read_events(path)` | JSONL イベントを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 | `LoopSpan` / `otel_available()` | OTel GenAI span の薄いラッパ（未導入なら no-op）/ OTel 利用可否 |
 | `connect(path)` | loop 用 state DB を開き（無ければ作り）最小スキーマを適用した接続を返す（`":memory:"` 可） |
-| `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（resume 土台）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` / `request_decision` / `resolve_decision` / `get_decision` / `list_pending_decisions`（人間ゲート） |
-| `DBProgressLog(db, run_id)` | DB-backed の進捗記録。`ProgressLog` 互換の `on_step` / `record_result` を持つ drop-in（path か既存接続を受ける context manager） |
+| `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（新規は空・既存は復元 = resume seed）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` / `request_decision` / `resolve_decision` / `get_decision` / `list_pending_decisions` / `claim_execution`（人間ゲート） |
+| `DBProgressLog(db, run_id)` | DB-backed の進捗記録。`ProgressLog` 互換の `on_step` / `record_result` を持つ drop-in（path か既存接続を受ける context manager）。`.state` が復元した `LoopState`（resume の seed） |
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True)` | `HumanGate` を組んで `run_loop` を回す入口 |

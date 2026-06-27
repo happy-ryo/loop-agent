@@ -22,6 +22,7 @@ from claude_loop import (
     JsonlEventSink,
     ListSink,
     LoopObserver,
+    LoopState,
     MaxIterations,
     Timeout,
     TokenBudget,
@@ -365,6 +366,56 @@ def test_manual_wiring_matches_run_observed_loop():
         observer.record_result(result)
     assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
     assert _only(sink, LOOP_END).payload["tokens_used"] == 6
+
+
+def test_run_observed_loop_forwards_initial_state_for_resume():
+    # 観測入口でも initial_state を素通しして resume できる: 復元 seed から step/end の
+    # iteration・累積メトリクスが継続する (新規 run の begin は iteration 0 から)。
+    sink = ListSink()
+    seed = LoopState(iteration=2, tokens_used=20)
+    result = run_observed_loop(
+        act=acting(tokens=10),
+        verify=never_done,
+        conditions=[MaxIterations(4)],
+        sinks=[sink],
+        otel=False,
+        initial_state=seed,
+    )
+    # seed の iteration 2 から継続 -> 2 step 回して cap 4 で停止。
+    assert result.iterations == 4
+    assert result.tokens_used == 40
+    assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
+    # step event の iteration は復元 state から継続 (2, 3)。
+    assert [e.iteration for e in sink.of_kind(LOOP_STEP)] == [2, 3]
+    assert _only(sink, LOOP_END).payload["iterations"] == 4
+    assert _only(sink, LOOP_END).payload["tokens_used"] == 40
+    # seed は mutate されない (run_loop が copy する)。
+    assert seed.iteration == 2 and seed.tokens_used == 20
+
+
+def test_resumed_observed_loop_error_carries_seeded_metrics():
+    # resume 中に最初の新規 on_step より前 (act 等) で例外が出ても、error の loop_end は
+    # 復元 state の累積値を載せる (中断前に完了済みの反復ぶんを 0 に潰さない)。
+    sink = ListSink()
+    seed = LoopState(iteration=3, tokens_used=30, elapsed=1.5)
+
+    def boom(_ctx):
+        raise RuntimeError("act blew up on resume before any new step")
+
+    with pytest.raises(RuntimeError):
+        run_observed_loop(
+            act=boom,
+            verify=never_done,
+            conditions=[MaxIterations(100)],
+            sinks=[sink],
+            otel=False,
+            initial_state=seed,
+        )
+    end = _only(sink, LOOP_END)
+    assert end.payload["status"] == "error"
+    assert end.payload["iterations"] == 3  # 0 に潰れない
+    assert end.payload["tokens_used"] == 30
+    assert _kinds(sink) == [LOOP_BEGIN, LOOP_END]  # 新規 step は無い
 
 
 def test_record_result_is_idempotent():
