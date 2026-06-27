@@ -6,7 +6,7 @@
 
 ## 現在のステータス
 
-**PoC 実装フェーズ（Phase 1）**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP / 本格（state.db SoT・Reflexion・人間ゲート・観測の本格化）は今後（report.md §5 Phase 2/3）。
+**PoC → MVP 移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/claude_loop/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**を導入した（report.md §5 Phase 2）。残りの MVP / 本格（resume の完成・二重終了条件・人間ゲート・Reflexion・観測の本格化）は今後（report.md §5 Phase 2/3）。
 
 ## 成果物
 
@@ -31,7 +31,9 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ **暴走防止の保証**: ゴール未達・無進捗・反復アクションでも、上限で必ず停止することを sandbox test で証明（`tests/test_runaway_guard.py`）
 - ✅ **二重終了条件（意味的 stop）**: 機械的上限に加え、`GoalMet`（検証可能ゴールの達成＝成功終了）と `NoProgress`（無進捗・反復アクションの検出＝打ち切り）を同じ `AnyOf` 合成に載せる
 - ✅ **最小状態（進捗ファイル）**: 各反復の記録を JSON Lines で外部ファイルに追記し、プロセスをまたいで進捗が残る（`ProgressLog` / state.db SoT の最小の前身）
-- ⛔ 人間ゲート・state.db SoT・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
+- ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
+- ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤。resume の完成は #14）
+- ⛔ 人間ゲート・Reflexion・サーキットブレーカは**非スコープ**（Phase 2/3）
 
 ### インストール
 
@@ -155,6 +157,46 @@ print(end.payload["status"], end.payload["stop"], end.payload["reason"])
 
 実走デモは [`examples/observed_demo.py`](./examples/observed_demo.py)。
 
+### ループ状態の SoT（state.db）
+
+MVP（report.md §3.4 / §4.6 / §5 Phase 2）では、ループ状態を **SQLite の単一 SoT** に外出しする。
+loop 用の**最小スキーマ**（`run` / `step` / `event` / `stop_reason` の 4 テーブルだけ）を `connect`
+で生成し、各 step を **`transaction` で atomic に永続化**する。claude-org-ja の `tools/state_db` を
+adapt 元にしたが、org 本体（projects / workstreams / snapshotter 等）には**一切依存しない自己完結
+スキーマ**として切り出している（疎結合 = report.md §6）。
+
+`DBProgressLog` は JSONL の `ProgressLog` と**同じ `on_step` / `record_result` シグネチャ**を持つ
+drop-in なので、観測フックの差し替えだけで SoT を DB に移せる（`run_loop` のシグネチャは不変）。
+
+```python
+from claude_loop import run_loop, DBProgressLog, MaxIterations
+
+with DBProgressLog("state.db", run_id="my-run") as db:   # run 行 + loop_begin を確保
+    result = run_loop(act=act, verify=verify,
+                      conditions=[MaxIterations(5)],
+                      on_step=db.on_step)                 # 各反復を atomic 永続化
+    db.record_result(result)                             # 終了状態 + stop_reason を確定
+```
+
+低レベル API（resume #14 の土台）:
+
+```python
+from claude_loop import connect, LoopStore
+
+store = LoopStore(connect("state.db"))
+state = store.load_or_init("my-run")     # 新規は空 LoopState、既存は step から復元
+store.read_steps("my-run")               # 反復ごとの step 行（observation 復号済み）
+store.read_events("my-run")              # journal（loop_begin / loop_step / loop_end）
+store.get_stop_reason("my-run")          # 発火した停止条件 or goal 達成
+```
+
+**JSONL と DB は併存**する。`ProgressLog`（JSONL）は依存ゼロで読める PoC アーティファクトとして残し、
+`DBProgressLog`（state.db）が MVP 以降の状態 SoT になる。両者は同じ観測フック規約を共有する。
+
+各 step の永続化は「`step` 行 + `run` 集計 + `loop_step` event」を**1 トランザクションに束ねる**ので、
+commit 前にプロセスが死んでも半端な行は残らない（クラッシュ耐性）。`UNIQUE(run_id, iteration)` により
+同一反復の再永続化は冪等（resume の土台）。
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -174,6 +216,9 @@ print(end.payload["status"], end.payload["stop"], end.payload["reason"])
 | `ListSink` / `JsonlEventSink(path)` / `CallableSink(fn)` | event sink（in-memory / journal 風 JSONL / 任意関数アダプタ） |
 | `read_events(path)` | JSONL イベントを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 | `LoopSpan` / `otel_available()` | OTel GenAI span の薄いラッパ（未導入なら no-op）/ OTel 利用可否 |
+| `connect(path)` | loop 用 state DB を開き（無ければ作り）最小スキーマを適用した接続を返す（`":memory:"` 可） |
+| `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（resume 土台）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` |
+| `DBProgressLog(db, run_id)` | DB-backed の進捗記録。`ProgressLog` 互換の `on_step` / `record_result` を持つ drop-in（path か既存接続を受ける context manager） |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
@@ -201,7 +246,9 @@ python3 -m pytest        # 各上限の発火 / goal 達成での自然終了 / 
                          # 暴走防止の証明（test_runaway_guard）/ 進捗ファイル（test_progress）/
                          # 検証駆動デモの実走（test_verify_demo）/
                          # 観測: 全終了理由が event に残る・メトリクスが追える・OTel span
-                         #   （test_events / test_observe / test_otel）
+                         #   （test_events / test_observe / test_otel）/
+                         # 状態 SoT: 永続化・transaction・クラッシュ耐性・スキーマ独立性
+                         #   （test_store）
 ```
 
 ## レポートの要約

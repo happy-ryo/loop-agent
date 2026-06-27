@@ -46,6 +46,7 @@ from .observe import LoopObserver, run_observed_loop
 from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
+from .store import DBProgressLog, LoopStore, connect
 
 __all__ = [
     "run_loop",
@@ -79,6 +80,10 @@ __all__ = [
     "run_observed_loop",
     "LoopSpan",
     "otel_available",
+    # state SoT (report.md S3.4 / S4.6 / S5 Phase 2)
+    "connect",
+    "LoopStore",
+    "DBProgressLog",
 ]
 
 __version__ = "0.0.1"
