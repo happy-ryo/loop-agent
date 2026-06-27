@@ -101,6 +101,11 @@ class GateReview:
     # 前 run が永続化済みの本来の step 行を上書き (UNIQUE(run_id, iteration) upsert) で
     # 壊さないようにする。
     persist: bool = True
+    # GATE_PROCEED のとき、step を記録 (on_step) した *後* に driver が呼ぶ任意の完了通知。
+    # gate が in-progress リース (report.md S5 Phase3 / Issue #21) を張った場合、ここで
+    # executing -> executed を確定する (step 永続化後に呼ぶので「executed なら step 行は
+    # 必ず存在」が保たれ、勝者クラッシュ時の step 欠落を防ぐ)。driver は中身を解さず呼ぶだけ。
+    on_complete: Optional[Callable[[], None]] = None
 
 
 @runtime_checkable
@@ -340,6 +345,9 @@ def run_loop(
 
         context = gather(state)
 
+        # gated PROCEED が張ったリースの完了通知 (executing->executed)。act 実行後・
+        # step 永続化後に呼ぶため、ここで掴んでおく (非ゲート step では None のまま)。
+        gate_on_complete: Optional[Callable[[], None]] = None
         if gate is not None:
             review = gate.review(context, state)
             if review.disposition == GATE_PAUSE:
@@ -383,6 +391,7 @@ def run_loop(
             # edit) replaces it -- so a bare proceed never passes None to act.
             if review.context is not KEEP_CONTEXT:
                 context = review.context
+            gate_on_complete = review.on_complete
 
         outcome = act(context)
         state.tokens_used += outcome.tokens
@@ -406,6 +415,14 @@ def run_loop(
 
         if on_step is not None:
             on_step(record, state)
+
+        # step を永続化した *後* にリース完了を確定する (executing->executed)。順序が肝:
+        # 「executed なら step 行は必ず存在」を満たし、勝者クラッシュ時の step 欠落を防ぐ。
+        # ここで例外が出たら (DB エラー等) あえて握り潰さず伝播させる: status は executing の
+        # まま残り、別プロセスがリース失効で取り直して完遂する (= クラッシュと同じ復旧経路)。
+        # 握り潰して継続すると未確定のまま後続へ進み順序整合を壊すため、fail-loud が安全。
+        if gate_on_complete is not None:
+            gate_on_complete()
 
         if verdict.goal_met:
             return LoopResult(status="goal_met", stop=None, state=state)

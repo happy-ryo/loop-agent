@@ -537,6 +537,69 @@ def test_paused_inner_episode_propagates_pause():
     assert "awaiting human decision" in result.reason
 
 
+def test_real_humangate_pause_propagates_through_reflexion():
+    """統合: 内側 episode が実 HumanGate(#21) で pause したら外側も pause を伝播する。
+
+    #21 の lease/executing セマンティクスは PROCEED 経路の内側で完結し、未解決ゲートは
+    従来どおり status="paused" + pending を返す。外側はそれを score/reflect せず伝播する
+    (二信号駆動と lease exactly-once が episode 境界で両立することの実証)。
+    """
+    from claude_loop import (
+        ActOutcome,
+        HumanGate,
+        LoopStore,
+        VerifyOutcome,
+        connect,
+        run_loop,
+    )
+    from claude_loop import MaxIterations as InnerMaxIterations
+
+    store = LoopStore(connect(":memory:"))
+    run_id = "episode-with-gate"
+
+    def is_irreversible(action):
+        return action == "deploy"
+
+    def gather(_state):
+        return "deploy"  # 常に不可逆 action を提案
+
+    def inner_act(_ctx):
+        return ActOutcome(observation="deployed", tokens=1)
+
+    def never(_o):
+        return VerifyOutcome(goal_met=False)
+
+    # resolver 無し -> 未解決ゲートで pause する実 HumanGate。
+    gate = HumanGate(on=is_irreversible, store=store, run_id=run_id)
+
+    def episode(ctx):
+        return run_loop(
+            act=inner_act,
+            verify=never,
+            conditions=[InnerMaxIterations(3)],
+            gather=gather,
+            gate=gate,
+        )
+
+    def boom_reflect(history, signal, reward):
+        raise AssertionError("reflect must not run on a paused episode")
+
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=episode,
+            reflect=boom_reflect,
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(3)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+        )
+    )
+    assert result.status == "paused"
+    assert result.paused is True
+    assert result.pending is not None  # 内側ゲートの pending を伝播
+    assert result.state.episode == 0  # 未完了 episode は進めない
+
+
 def test_resume_rejects_mismatched_evaluator_version():
     """外側 resume: 復元 evaluator_version と渡された評価器が食い違えば loud に弾く。"""
     from claude_loop.reflexion import ReflexionState
