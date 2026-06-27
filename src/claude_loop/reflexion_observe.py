@@ -501,6 +501,7 @@ def run_observed_reflexion(
     memory: Optional[EpisodicMemory] = None,
     task_id: Any = str,
     on_episode: Optional[Any] = None,
+    persist: Optional[Any] = None,
     initial_state: Optional[ReflexionState] = None,
     sinks: Sequence[EventSink] = (),
     otel: bool = True,
@@ -514,6 +515,13 @@ def run_observed_reflexion(
     観測ラッパで包んで ``episode_begin`` を出し、``on_episode`` / ``on_epoch`` には観測フックを
     配線する (利用者の ``on_episode`` があれば合成して両方呼ぶ)。返り値は ``run_reflexion`` の
     :class:`~claude_loop.reflexion.ReflexiveResult` をそのまま返す (判断ロジックは不変)。
+
+    ``persist`` / ``initial_state`` はそのまま ``run_reflexion`` へ素通しするので、外側 Reflexion の
+    **永続化/resume** (Issue #29: :class:`~claude_loop.reflexion_store.DBReflexionLog`) と観測を
+    1 回の呼び出しで両立できる。resume seed (``initial_state``) で再開した run でも、抑止された末尾
+    境界は recovery で取り戻され ``on_epoch`` が emit されるので、観測の epoch 数が DB の settled
+    ``epoch`` と整合する (``persist`` が書く SoT と観測 event が食い違わない)。観測は side-channel
+    なので ``persist`` の永続化順序・内容には一切介入しない。
 
     ``reflexion_begin`` (最初の episode 前) → ``episode_begin`` / ``episode_end`` /
     ``lesson_decision`` / ``epoch_boundary`` × N → ``reflexion_end`` (復帰後) の順で必ず emit
@@ -569,6 +577,7 @@ def run_observed_reflexion(
             task_id=task_id,
             on_episode=episode_hook,
             on_epoch=observer.on_epoch,
+            persist=persist,
             initial_state=initial_state,
         )
         observer.record_result(result)

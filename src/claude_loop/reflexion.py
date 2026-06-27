@@ -265,6 +265,66 @@ def _is_success(stop: AnyOf, state: OuterState) -> bool:
     return False
 
 
+def _advance_epoch_boundary(
+    state: ReflexionState,
+    incumbent: Evaluator,
+    *,
+    propose_evaluator: Optional[ProposeEvaluatorFn],
+    held_out: HeldOut,
+    epsilon: float,
+    delta: float,
+    on_epoch: Optional[EpochHook] = None,
+) -> Evaluator:
+    """epoch 境界処理: epoch を 1 つ進め、incumbent を入れ替えてよい **唯一** の場所。
+
+    本体は ``run_reflexion`` のメインループから切り出した **挙動不変** のヘルパ (安全核の昇格
+    ゲート :func:`~claude_loop.evaluator.admit_evaluator` / 二信号モデル / 採択基準には一切踏み
+    込まない。呼び出し点を増やすだけ)。メインループの境界と、resume 時に「中断地点で *終端扱い*
+    として抑止された末尾境界」を取り戻す recovery の **両方** から呼ぶ。これにより、ある境界を
+    跨いで継続する resume が通し実行と同じ epoch 進行・評価器昇格・**観測 (on_epoch) emit** を
+    再現する (Issue #29: 中断→resume が通し実行と一致 / Issue #30: epoch 観測の整合)。
+
+    集約ゲートは回転 fold で測る (anti-overfit) が、fold/critical 後退チェックは held-out 全体で
+    行う (選ばれなかった fold の犠牲を弾く)。``state.epoch`` を先に進めてから ``held_out.fold``
+    を引くので、fold 回転は **進めた後** の epoch で決まる (元のメインループと同一)。
+
+    ``on_epoch`` (側チャネル観測) は判定が完全に確定した後に呼ぶので帰結ある制御に介入しない。
+    両呼び出し点から渡すことで、suppressed 末尾境界を resume の recovery で取り戻したときも
+    ``epoch_boundary`` event が 1 度 emit され、観測の epoch 数が最終 ``state.epoch`` と整合する
+    (recovery で event を出さないと、通し実行に比べ epoch_boundary が 1 件欠ける)。
+    """
+    state.epoch += 1
+    # 観測用に判定前 version と昇格結果を控える (判断ロジックは不変。admission は候補が提案された
+    # ときだけ埋まり、未提案なら None = 評価器不変を表す)。
+    previous_version = incumbent.version
+    admission: Optional[AdmissionResult] = None
+    if propose_evaluator is not None:
+        candidate = propose_evaluator(state.outer_state(), incumbent)
+        if candidate is not None:
+            admission = admit_evaluator(
+                incumbent,
+                candidate,
+                held_out,
+                epsilon=epsilon,
+                delta=delta,
+                measure_fold=held_out.fold(state.epoch),
+            )
+            incumbent = admission.chosen
+            state.evaluator_version = incumbent.version
+            state.evaluator_updates += 1
+    if on_epoch is not None:
+        on_epoch(
+            EpochRecord(
+                epoch=state.epoch,
+                boundary_episode=state.episode,
+                previous_version=previous_version,
+                evaluator_version=state.evaluator_version,
+                admission=admission,
+            )
+        )
+    return incumbent
+
+
 def run_reflexion(
     *,
     episode: EpisodeFn,
@@ -284,6 +344,7 @@ def run_reflexion(
     task_id: Callable[[Any], str] = str,
     on_episode: Optional[EpisodeHook] = None,
     on_epoch: Optional[EpochHook] = None,
+    persist: Optional[EpisodeHook] = None,
     initial_state: Optional[ReflexionState] = None,
 ) -> ReflexiveResult:
     """外側 Reflexion ループを回す入口 (二信号モデル + RQGM epoch ゲート)。
@@ -311,10 +372,19 @@ def run_reflexion(
             効かない。意味的/効果ベースの検証はここを差し替える。
         memory: 既存の :class:`EpisodicMemory` (resume 等)。``None`` なら新規。
         task_id: production タスク -> 識別子。held-out との素性検証に使う (既定 ``str``)。
-        on_episode: 各 episode 確定後に呼ぶ観測フック。
+        on_episode: 各 episode 確定後・**epoch 境界処理の前**に呼ぶ観測フック (record 監査用)。
         on_epoch: 各 epoch 境界で評価器交代の判定が確定した後に呼ぶ観測フック
             (:class:`EpochRecord` を受け取る純粋な側チャネル。制御には載らない)。
+        persist: 各 episode が **完全に確定した後** (epoch 昇格・評価器入れ替えを含む境界処理の
+            *後*) に呼ぶ永続化フック。``on_episode`` が境界処理 *前* の状態を見るのに対し、
+            ``persist`` は **settled な** :class:`ReflexionState` (post-boundary の epoch /
+            evaluator_version / evaluator_updates) を見るので、これを state.db に書けば中断
+            地点から resume したとき通し実行と一致する (epoch 進行・採用 lesson・評価器 version・
+            best ground-truth)。例外は **非致命にしない** (永続化に失敗したら resume できない
+            ので loud に倒す。:class:`~claude_loop.reflexion_store.DBReflexionLog` が配線例)。
         initial_state: 外側 resume の seed (内側 ``run_loop`` の ``initial_state`` に対応)。
+            :meth:`~claude_loop.reflexion_store.ReflexionStore.load_or_init` が state.db から
+            復元した :class:`ReflexionState` を渡すと、永続化済みの続きから再開できる。
 
     Raises:
         ValueError: ``epoch_len < 2`` / ``epsilon <= 0`` / ``declared_keys`` 空 /
@@ -396,6 +466,32 @@ def run_reflexion(
     state.declared_keys = declared_keys
     incumbent = evaluator
     state.evaluator_version = incumbent.version
+
+    # resume の末尾境界 recovery: 前 run が **epoch 境界ちょうど** (episode % epoch_len == 0) で
+    # 中断していると、その境界処理は「終端扱い」として抑止され epoch/評価器昇格が未処理のまま
+    # 永続化される (メインループの境界は現在の stop が発火していると抑止するため。これは単発 run
+    # では正しいが、より緩い budget で継続する resume では「跨ぐべき境界」を取りこぼす)。継続する
+    # resume はこの **唯一抑止されうる末尾境界** をここで取り戻し、通し実行と同じ epoch 進行・
+    # 評価器昇格を再現する。判定: episode が境界の倍数なのに epoch がその含意する境界数に 1 足り
+    # ない (= 末尾境界が未処理) かつ、渡された convergence で今まさに終端でない (終端なら単発 run
+    # と同じく抑止のままにし、直後の while ガードで即終了させる)。抑止されうる末尾境界は高々 1 つ
+    # (それ以前の境界はすべて非終端で処理済み) なので recovery も最大 1 回。
+    if (
+        initial_state is not None
+        and state.episode > 0
+        and state.episode % epoch_len == 0
+        and state.epoch < state.episode // epoch_len
+        and stop.first_triggered(state.outer_state()) is None
+    ):
+        incumbent = _advance_epoch_boundary(
+            state,
+            incumbent,
+            propose_evaluator=propose_evaluator,
+            held_out=held_out,
+            epsilon=epsilon,
+            delta=delta,
+            on_epoch=on_epoch,
+        )
 
     while True:
         triggered = stop.first_triggered(state.outer_state())
@@ -497,39 +593,23 @@ def run_reflexion(
             state.episode % epoch_len == 0
             and stop.first_triggered(state.outer_state()) is None
         ):
-            state.epoch += 1
-            # 観測用に判定前 version と昇格結果を控える (判断ロジックは不変。admission は
-            # 候補が提案されたときだけ埋まり、未提案なら None = 評価器不変を表す)。
-            previous_version = incumbent.version
-            admission: Optional[AdmissionResult] = None
-            if propose_evaluator is not None:
-                candidate = propose_evaluator(state.outer_state(), incumbent)
-                if candidate is not None:
-                    # 集約ゲートは回転 fold で測る (anti-overfit) が、fold/critical 後退
-                    # チェックは held-out 全体で行う (選ばれなかった fold の犠牲を弾く)。
-                    admission = admit_evaluator(
-                        incumbent,
-                        candidate,
-                        held_out,
-                        epsilon=epsilon,
-                        delta=delta,
-                        measure_fold=held_out.fold(state.epoch),
-                    )
-                    incumbent = admission.chosen
-                    state.evaluator_version = incumbent.version
-                    state.evaluator_updates += 1
-            # epoch 境界の観測 (側チャネル)。判定が完全に確定した後に呼ぶので、観測は
-            # 帰結ある制御に一切介入しない。on_epoch の例外は実装側が握る契約。
-            if on_epoch is not None:
-                on_epoch(
-                    EpochRecord(
-                        epoch=state.epoch,
-                        boundary_episode=state.episode,
-                        previous_version=previous_version,
-                        evaluator_version=state.evaluator_version,
-                        admission=admission,
-                    )
-                )
+            incumbent = _advance_epoch_boundary(
+                state,
+                incumbent,
+                propose_evaluator=propose_evaluator,
+                held_out=held_out,
+                epsilon=epsilon,
+                delta=delta,
+                on_epoch=on_epoch,
+            )
+
+        # (5) 永続化の継ぎ目: episode が **完全に確定** した (epoch 境界処理まで終えた) 後に
+        # settled な state を書き出す。on_episode (境界 *前*) と違い、ここで見える epoch /
+        # evaluator_version / evaluator_updates は post-boundary なので、これを state.db の SoT
+        # にすれば「中断地点から resume = 通し実行と一致」を満たす (paused episode はこの行に
+        # 到達せず persist されない = 未確定 episode を書かない)。
+        if persist is not None:
+            persist(record, state)
 
 
 __all__ = [

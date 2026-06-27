@@ -89,6 +89,7 @@ from .reflexion import (
     ReflexiveResult,
     run_reflexion,
 )
+from .reflexion_store import DBReflexionLog, ReflexionStore
 from .reflexion_observe import (
     EPISODE_BEGIN,
     EPISODE_END,
@@ -173,6 +174,9 @@ __all__ = [
     "EpisodeRecord",
     "EpochRecord",
     "EpisodeOutcome",
+    # 外側 Reflexion ループの永続化/resume (Issue #29)
+    "ReflexionStore",
+    "DBReflexionLog",
     # 外側 Reflexion 観測 (report.md S4.5 を外側へ延伸; Issue #30)
     "ReflexionObserver",
     "run_observed_reflexion",
