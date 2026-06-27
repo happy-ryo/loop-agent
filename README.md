@@ -427,8 +427,72 @@ result2 = run_reflexion(
 
 **スコープ境界**: 単一プロセスの self-improving に集中する（分散協調は Issue #21）。外側
 ループの**永続化/resume**（epoch・lesson テーブル + 評価器 version registry）は **state.db へ
-実装済み（Issue #29。`ReflexionStore` / `DBReflexionLog`）**。残る追跡 follow-up は OTel 観測の
-dashboard 化（安全核 = 二信号モデル / epoch 昇格ゲート / 取込前検証には踏み込まない）。
+実装済み（Issue #29。`ReflexionStore` / `DBReflexionLog`）**。外側ループの **OTel 観測** も次節
+（Issue #30）で接続済み。残る追跡 follow-up は観測の dashboard 化（安全核 = 二信号モデル /
+epoch 昇格ゲート / 取込前検証には踏み込まない）。
+
+### 外側 Reflexion 観測（episode/epoch/lesson/評価器/収束 + OTel span）
+
+Phase 3 follow-up（report.md §4.5 の観測性を**外側ループへ延伸** / Issue #30）では、内側ループの
+観測層（`run_observed_loop` / `LoopObserver` / `LoopSpan`）と**同じ作法**で外側
+`run_reflexion` の試行間ライフサイクルを観測する。`run_observed_reflexion(...)` にループを通すと、
+試行間の遷移が **構造化イベント**（`loop_*` と同じ sink へ流れる）として残り、同じ run は OTel が
+入っていれば 1 本の **GenAI span**（`gen_ai.*` + epoch 番号 + 評価器 version = 採点係 id +
+lesson 由来 provenance）にもなる。**観測は側チャネルであり、二信号モデル / RQGM epoch ゲートの
+判断ロジックは一切変えない**（既存安全核はそのまま、観測フックを足すだけ）。
+
+emit される構造化イベント:
+
+- `reflexion_begin` … run 開始（収束条件名・宣言軸・初期評価器 version・epoch 構成）
+- `episode_begin` / `episode_end` … 1 episode の開始 / 確定（一次集約・reward・成否・lesson 採否）
+- `lesson_decision` … lesson が出た episode のみ。**採用 / 拒否**を独立に残す（filter 容易化）
+- `epoch_boundary` … epoch 境界（= 新 epoch 開始）+ **評価器の昇格 / 却下 / 不変**の判定
+- `reflexion_end` … run 終了（**収束理由**・status・集計。`result.state` から導出して整合）
+
+```python
+from claude_loop import (
+    run_observed_reflexion, JsonlEventSink, ListSink, read_events,
+    Evaluator, Score, GroundTruthSignal, HeldOut, Probe, Lesson,
+    MaxEpisodes, RubricThreshold, run_loop, ActOutcome, VerifyOutcome, MaxIterations,
+)
+from claude_loop.memory import step_signature
+
+mem = ListSink()
+result = run_observed_reflexion(
+    episode=episode, ground_truth=ground_truth, reflect=reflect,   # ↑ 前節と同じフック
+    evaluator=Evaluator(score=lambda o: Score(ground_truth=1.0 if o.succeeded else 0.0),
+                        name="rubric"),
+    convergence=[RubricThreshold(0.8, sustain=1), MaxEpisodes(5)],
+    declared_keys=("correctness",), production_tasks=["fix-off-by-one"],
+    held_out=HeldOut((Probe("h0", {"truth": 0.0}, 0.0), Probe("h1", {"truth": 1.0}, 1.0))),
+    epoch_len=2,
+    sinks=[JsonlEventSink("reflexion.jsonl"), mem],  # journal 風 JSONL + in-memory（複数 sink 可）
+)
+
+events = read_events("reflexion.jsonl")              # reflexion_begin / episode_* / … / reflexion_end
+end = mem.of_kind("reflexion_end")[0]
+print(end.payload["status"], end.payload["stop"], end.payload["reason"])
+# "converged" "rubric_threshold" "rubric threshold reached: last 1 ground-truth aggregates all >= 0.8"
+```
+
+- **全遷移が残る**: episode 開始/終了・epoch 開始/境界・lesson 採用/拒否・**採点係（評価器）
+  昇格/拒否**・収束理由が event と span event に残り、外側ループの一生を事後解析できる。
+- **metric 一貫性**: emit したイベント個数（`episode_end`×N）と最終集計（`reflexion_end` /
+  span 終了属性）は権威ある `result.state` から導出するので常に整合する。
+- **OTel は optional 依存**: 未導入環境でも `ReflexionSpan` が **no-op に degrade** し、JSONL /
+  event sink はそのまま機能する（MVP #13 / 内側 `LoopSpan` と同方針）。SDK を入れて span を実検査
+  するなら `pip install -e .[dev]`（or `.[otel]`）。
+- **best-effort**: sink / tracer / 観測フックが例外を投げても外側 driver を殺さない（sink 例外は
+  警告に倒し、span 例外は握って no-op、フック本体も握る）。例外で抜けた run は `status="error"`、
+  内側 episode が人間ゲートで pause した run は `status="paused"` の `reflexion_end` を残す。
+- **手で配線も可**: `ReflexionObserver` を context manager として使い、`run_reflexion` の
+  `on_episode` / `on_epoch` と `episode` 直前の `on_episode_begin` に配線する（`run_observed_loop`
+  に対する `LoopObserver` と同じ関係）。
+
+**スコープ境界**: 本 follow-up は **観測の追加**（events + OTel GenAI span への接続）に絞る。
+**dashboard 化**（Grafana 等への可視化パイプライン）と **3x スパイク自動スロットル**（観測値を
+使った自動制御＝外側ループへのフィードバック）は本タスクのスコープ**外**で、追跡 follow-up とする
+（本 PR は emit 層に徹し、判断ロジック＝安全核には一切載せない）。
 
 ### wake 配送 transport（push 一次 / pull fallback / at-most-once）
 
@@ -545,7 +609,7 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す。`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume の in-progress リース調整用（#21） |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | `HumanGate` を組んで `run_loop` を回す入口（`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume 用, #21） |
-| `run_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, epoch_len=4, epsilon=0.02, delta=0.0, propose_evaluator=…, admit_lesson=…, memory=…, on_episode=…, persist=…, initial_state=…)` | 外側 Reflexion ループ駆動。内側 `run_loop` を 1 episode として呼び、`reflect` の言語的指針を memory へ取り込み次 context へ配線。`ReflexiveResult` を返す。`persist` は各 episode の **settled state**（epoch 境界処理後）を受ける永続化フック、`initial_state` に復元 `ReflexionState` を渡すと中断地点から**再開**（resume #29） |
+| `run_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, epoch_len=4, epsilon=0.02, delta=0.0, propose_evaluator=…, admit_lesson=…, memory=…, on_episode=…, on_epoch=…, persist=…, initial_state=…)` | 外側 Reflexion ループ駆動。内側 `run_loop` を 1 episode として呼び、`reflect` の言語的指針を memory へ取り込み次 context へ配線。`ReflexiveResult` を返す。`on_epoch` は epoch 境界の観測フック（`EpochRecord`）、`persist` は各 episode の **settled state**（epoch 境界処理後）を受ける永続化フック、`initial_state` に復元 `ReflexionState` を渡すと中断地点から**再開**（resume #29） |
 | `ReflexionStore(conn)` | 外側 Reflexion 状態の writer/reader（内側 `LoopStore` の対）。生成時に `reflexion_run`/`reflexion_episode`/`reflexion_lesson`/`reflexion_evaluator` の 4 表を **additive・非破壊**に適用。`load_or_init(run_id, memory=…)`（新規は空・既存は復元 = resume seed）/ `persist_episode(run_id, record, state)`（episode+memory+スカラ+version を 1 tx で atomic 永続化）/ `record_result(run_id, result)`（終端メタデータ）/ `get_run` / `read_episodes` / `read_evaluator_versions`（評価器 version registry） |
 | `DBReflexionLog(db, run_id, *, memory=…)` | DB-backed の外側進捗記録（内側 `DBProgressLog` の対・drop-in）。`.state`（復元した `ReflexionState` = resume seed）/ `.memory`（live memory）/ `on_episode`（`run_reflexion(persist=…)` に渡す）/ `record_result(result)` / context manager。`memory` は fresh run の容量ポリシー指定（resume では DB 保存値が優先） |
 | `ReflexionContext(episode, epoch, task, evaluator, memory_block)` | `episode` フックに渡る文脈。`memory_block`（前試行の学び）を内側 gather に折り込む |
@@ -559,6 +623,11 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 | `EpisodicMemory(*, cap=8, per_lesson_chars=512, render_byte_cap=4096)` | 有界な episodic memory（`admit` / `render` / 決定的・価値考慮 eviction） |
 | `default_admit(lesson, outcome)` | LLM 非依存の構造的取込前検証（grounding + support + 上限。注入 lesson を弾く） |
 | `MaxEpisodes(n)` / `RubricThreshold(target, sustain=1)` / `ScorePlateau(window, min_delta)` / `ReflectionBudget(n)` / `EvaluatorUpdateBudget(n)` | 外側収束条件（`AnyOf` 互換。`RubricThreshold` は成功条件） |
+| `run_observed_reflexion(*, episode, ground_truth, reflect, evaluator, convergence, declared_keys, production_tasks, held_out, …, sinks=…, otel=True, tracer=…, span_name=…, on_episode=…, on_sink_error=…)` | 観測を配線して `run_reflexion` を回す入口（Issue #30）。`reflexion_begin/episode_*/lesson_decision/epoch_boundary/reflexion_end` を emit し外側 OTel span を張る。判断ロジックは不変（`ReflexiveResult` をそのまま返す） |
+| `ReflexionObserver(sinks, *, convergence=…, declared_keys=…, evaluator_version=…, epoch_len=…, epsilon=…, otel=True, tracer=…)` | 外側観測オーケストレータ（context manager）。`on_episode_begin(ctx)` / `on_episode(record, state)` / `on_epoch(record)` を `run_reflexion` の各観測点へ配線し `record_result(result)` を呼ぶ（best-effort・観測フック本体も握る） |
+| `EpochRecord(epoch, boundary_episode, previous_version, evaluator_version, admission=…)` | epoch 境界の観測単位。`decision`（`promoted`/`rejected`/`unchanged`）/ `proposed` / `promoted` を導出（`run_reflexion(on_epoch=…)` が渡す純粋な側チャネル記録） |
+| `ReflexionSpan` | 外側 Reflexion run の OTel GenAI span 薄ラッパ（未導入なら no-op）。`gen_ai.*` + `claude_loop.reflexion.*`（epoch/version/lesson 由来）を載せ、遷移を span event に刻む |
+| event kind: `reflexion_begin` / `episode_begin` / `episode_end` / `lesson_decision` / `epoch_boundary` / `reflexion_end` | 外側観測の構造化イベント種別（内側の `loop_*` と同じ `LoopEvent` / sink / `read_events` を再利用） |
 | `Wake(id, kind, recipient, run_id=…, payload=…)` | 配送する 1 wake。`id` が at-most-once / de-dup の鍵。`kind` ∈ `loop_done`/`next_iteration`/`decision_request` |
 | `Transport(queue=…, backend=…, *, lease=30.0, time_fn=…)` | push 一次 / pull fallback のオーケストレータ。`deliver(wake)`（→ `"push"`/`"queued"`）/ `poll(recipient, *, owner=…, limit=…, confirm=False)`（claim のみ）/ `poll_and_handle(recipient, handler, …)`（handler 成功後に確定 = crash-safe・推奨）/ `confirm_wakes(wakes, *, owner)` / `pending(recipient=…)` |
 | `InMemoryWakeQueue()` | 配送の正本（三状態 claim-then-confirm）。`WakeQueue` Protocol 実装。`enqueue`（冪等）/ `claim` / `confirm` / `release_expired` / `mark_delivered` / `pending` |

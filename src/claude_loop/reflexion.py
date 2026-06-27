@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 from .conditions import AnyOf, StopCondition, StopTrigger
 from .convergence import OuterState, is_success_condition
 from .evaluator import (
+    AdmissionResult,
     Evaluator,
     GroundTruthFn,
     GroundTruthSignal,
@@ -111,6 +112,40 @@ class EpisodeRecord:
     admitted: bool = False
     succeeded: bool = False
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class EpochRecord:
+    """1 epoch 境界の確定記録 (監査・観測単位)。評価器交代の判定結果を運ぶ。
+
+    epoch 境界は incumbent 評価器を入れ替えてよい **唯一** の地点 (RQGM 安全ゲート)。本記録は
+    その境界で何が起きたか ― 候補が提案されたか / 昇格したか却下されたか / version がどう動いたか
+    ― を観測する **読み取り専用** ビューで、:func:`run_reflexion` の判断ロジックには一切載らない
+    (観測の側チャネル)。``admission`` が ``None`` なら候補は提案されなかった (評価器不変)。
+    """
+
+    epoch: int  # 境界で進んだ後の新 epoch 番号
+    boundary_episode: int  # 境界が発生した時点の完了 episode 数
+    previous_version: str  # 判定前の incumbent version
+    evaluator_version: str  # 判定後の incumbent version
+    admission: Optional[AdmissionResult] = None  # 候補提案時のみ昇格判定結果が載る
+
+    @property
+    def proposed(self) -> bool:
+        """この境界で候補評価器が提案されたか。"""
+        return self.admission is not None
+
+    @property
+    def promoted(self) -> bool:
+        """候補が実際に昇格したか (提案され、かつ採用された)。"""
+        return self.admission is not None and self.admission.promoted
+
+    @property
+    def decision(self) -> str:
+        """境界の評価器決定: ``"unchanged"`` (未提案) / ``"promoted"`` / ``"rejected"``。"""
+        if self.admission is None:
+            return "unchanged"
+        return "promoted" if self.admission.promoted else "rejected"
 
 
 @dataclass
@@ -198,6 +233,10 @@ ReflectHook = Callable[
     [tuple[StepRecord, ...], GroundTruthSignal, float], Optional[Lesson]
 ]
 EpisodeHook = Callable[[EpisodeRecord, ReflexionState], None]
+# epoch 境界の観測フック。境界で評価器交代の判定が確定した後に呼ばれる純粋な側チャネル
+# (制御に載らない)。例外で run を倒さないよう、実装側が best-effort に握る責務を負う
+# (既存 on_episode と同契約。観測の degrade は :class:`~claude_loop.reflexion_observe.ReflexionObserver`)。
+EpochHook = Callable[[EpochRecord], None]
 ProposeEvaluatorFn = Callable[[OuterState, Evaluator], Optional[Evaluator]]
 OuterConditions = Union[AnyOf, Sequence[StopCondition]]
 
@@ -234,6 +273,7 @@ def _advance_epoch_boundary(
     held_out: HeldOut,
     epsilon: float,
     delta: float,
+    on_epoch: Optional[EpochHook] = None,
 ) -> Evaluator:
     """epoch 境界処理: epoch を 1 つ進め、incumbent を入れ替えてよい **唯一** の場所。
 
@@ -241,14 +281,23 @@ def _advance_epoch_boundary(
     ゲート :func:`~claude_loop.evaluator.admit_evaluator` / 二信号モデル / 採択基準には一切踏み
     込まない。呼び出し点を増やすだけ)。メインループの境界と、resume 時に「中断地点で *終端扱い*
     として抑止された末尾境界」を取り戻す recovery の **両方** から呼ぶ。これにより、ある境界を
-    跨いで継続する resume が通し実行と同じ epoch 進行・評価器昇格を再現する (Issue #29: 中断→
-    resume が通し実行と一致)。
+    跨いで継続する resume が通し実行と同じ epoch 進行・評価器昇格・**観測 (on_epoch) emit** を
+    再現する (Issue #29: 中断→resume が通し実行と一致 / Issue #30: epoch 観測の整合)。
 
     集約ゲートは回転 fold で測る (anti-overfit) が、fold/critical 後退チェックは held-out 全体で
     行う (選ばれなかった fold の犠牲を弾く)。``state.epoch`` を先に進めてから ``held_out.fold``
     を引くので、fold 回転は **進めた後** の epoch で決まる (元のメインループと同一)。
+
+    ``on_epoch`` (側チャネル観測) は判定が完全に確定した後に呼ぶので帰結ある制御に介入しない。
+    両呼び出し点から渡すことで、suppressed 末尾境界を resume の recovery で取り戻したときも
+    ``epoch_boundary`` event が 1 度 emit され、観測の epoch 数が最終 ``state.epoch`` と整合する
+    (recovery で event を出さないと、通し実行に比べ epoch_boundary が 1 件欠ける)。
     """
     state.epoch += 1
+    # 観測用に判定前 version と昇格結果を控える (判断ロジックは不変。admission は候補が提案された
+    # ときだけ埋まり、未提案なら None = 評価器不変を表す)。
+    previous_version = incumbent.version
+    admission: Optional[AdmissionResult] = None
     if propose_evaluator is not None:
         candidate = propose_evaluator(state.outer_state(), incumbent)
         if candidate is not None:
@@ -263,6 +312,16 @@ def _advance_epoch_boundary(
             incumbent = admission.chosen
             state.evaluator_version = incumbent.version
             state.evaluator_updates += 1
+    if on_epoch is not None:
+        on_epoch(
+            EpochRecord(
+                epoch=state.epoch,
+                boundary_episode=state.episode,
+                previous_version=previous_version,
+                evaluator_version=state.evaluator_version,
+                admission=admission,
+            )
+        )
     return incumbent
 
 
@@ -284,6 +343,7 @@ def run_reflexion(
     memory: Optional[EpisodicMemory] = None,
     task_id: Callable[[Any], str] = str,
     on_episode: Optional[EpisodeHook] = None,
+    on_epoch: Optional[EpochHook] = None,
     persist: Optional[EpisodeHook] = None,
     initial_state: Optional[ReflexionState] = None,
 ) -> ReflexiveResult:
@@ -313,6 +373,8 @@ def run_reflexion(
         memory: 既存の :class:`EpisodicMemory` (resume 等)。``None`` なら新規。
         task_id: production タスク -> 識別子。held-out との素性検証に使う (既定 ``str``)。
         on_episode: 各 episode 確定後・**epoch 境界処理の前**に呼ぶ観測フック (record 監査用)。
+        on_epoch: 各 epoch 境界で評価器交代の判定が確定した後に呼ぶ観測フック
+            (:class:`EpochRecord` を受け取る純粋な側チャネル。制御には載らない)。
         persist: 各 episode が **完全に確定した後** (epoch 昇格・評価器入れ替えを含む境界処理の
             *後*) に呼ぶ永続化フック。``on_episode`` が境界処理 *前* の状態を見るのに対し、
             ``persist`` は **settled な** :class:`ReflexionState` (post-boundary の epoch /
@@ -428,6 +490,7 @@ def run_reflexion(
             held_out=held_out,
             epsilon=epsilon,
             delta=delta,
+            on_epoch=on_epoch,
         )
 
     while True:
@@ -537,6 +600,7 @@ def run_reflexion(
                 held_out=held_out,
                 epsilon=epsilon,
                 delta=delta,
+                on_epoch=on_epoch,
             )
 
         # (5) 永続化の継ぎ目: episode が **完全に確定** した (epoch 境界処理まで終えた) 後に
@@ -552,11 +616,13 @@ __all__ = [
     "EpisodeOutcome",
     "ReflexionContext",
     "EpisodeRecord",
+    "EpochRecord",
     "ReflexionState",
     "ReflexiveResult",
     "run_reflexion",
     "EpisodeFn",
     "ReflectHook",
     "EpisodeHook",
+    "EpochHook",
     "ProposeEvaluatorFn",
 ]

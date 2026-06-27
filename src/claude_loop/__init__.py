@@ -83,13 +83,24 @@ from .observe import LoopObserver, run_observed_loop
 from .reflexion import (
     EpisodeOutcome,
     EpisodeRecord,
+    EpochRecord,
     ReflexionContext,
     ReflexionState,
     ReflexiveResult,
     run_reflexion,
 )
 from .reflexion_store import DBReflexionLog, ReflexionStore
-from .otel import LoopSpan, otel_available
+from .reflexion_observe import (
+    EPISODE_BEGIN,
+    EPISODE_END,
+    EPOCH_BOUNDARY,
+    LESSON_DECISION,
+    REFLEXION_BEGIN,
+    REFLEXION_END,
+    ReflexionObserver,
+    run_observed_reflexion,
+)
+from .otel import LoopSpan, ReflexionSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
 from .store import DBProgressLog, DECISION_KINDS, LoopStore, connect
@@ -161,10 +172,21 @@ __all__ = [
     "ReflexionState",
     "ReflexiveResult",
     "EpisodeRecord",
+    "EpochRecord",
     "EpisodeOutcome",
     # 外側 Reflexion ループの永続化/resume (Issue #29)
     "ReflexionStore",
     "DBReflexionLog",
+    # 外側 Reflexion 観測 (report.md S4.5 を外側へ延伸; Issue #30)
+    "ReflexionObserver",
+    "run_observed_reflexion",
+    "ReflexionSpan",
+    "REFLEXION_BEGIN",
+    "EPISODE_BEGIN",
+    "EPISODE_END",
+    "LESSON_DECISION",
+    "EPOCH_BOUNDARY",
+    "REFLEXION_END",
     "Score",
     "GroundTruthSignal",
     "Evaluator",

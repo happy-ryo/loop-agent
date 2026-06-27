@@ -322,6 +322,54 @@ def test_resume_clears_stale_terminal_status(tmp_path):
     log2.close()
 
 
+def test_observed_resume_epoch_events_consistent_with_db(tmp_path):
+    """統合 (#29×#30): 観測 (on_epoch) と永続化 (persist) + resume を 1 経路で両立し、emit した
+    epoch_boundary event が DB の settled epoch / 評価器 version と整合する。
+
+    境界ちょうどで中断すると末尾境界は抑止され epoch_boundary は出ない (DB も昇格前)。resume の
+    recovery がその境界を取り戻すと on_epoch が 1 度 emit され、DB の epoch/version もそれと一致
+    する (観測の epoch 数が DB の SoT と食い違わない)。
+    """
+    from claude_loop import EPOCH_BOUNDARY, ListSink, run_observed_reflexion
+
+    db = tmp_path / "obs.db"
+    common = dict(
+        ground_truth=gt_fail(), reflect=reflect_per_episode,
+        declared_keys=DECLARED, production_tasks=["task-a"],
+        held_out=held_out_matching(0.0, 0.5, 1.0), epoch_len=2,
+        propose_evaluator=lambda o, i: HONEST, otel=False,
+    )
+
+    # 中断 (observed + persisted): ep2 = 境界ちょうど → 末尾境界は抑止される。
+    sink1 = ListSink()
+    log1 = DBReflexionLog(str(db), "ref")
+    run_observed_reflexion(
+        episode=_ok_episode, evaluator=FLAT, convergence=[MaxEpisodes(2)],
+        persist=log1.on_episode, initial_state=log1.state, sinks=[sink1], **common,
+    )
+    assert len(sink1.of_kind(EPOCH_BOUNDARY)) == 0          # 抑止 → 観測も出ない
+    assert ReflexionStore(log1.conn).get_run("ref")["evaluator_version"] == FLAT.version
+    log1.close()
+
+    # resume (observed + persisted): recovery が抑止境界を取り戻し on_epoch を 1 度 emit する。
+    sink2 = ListSink()
+    log2 = DBReflexionLog(str(db), "ref")
+    result2 = run_observed_reflexion(
+        episode=_ok_episode, evaluator=FLAT, convergence=[MaxEpisodes(4)],
+        persist=log2.on_episode, initial_state=log2.state, sinks=[sink2], **common,
+    )
+    boundaries = sink2.of_kind(EPOCH_BOUNDARY)
+    assert len(boundaries) == 1                              # recovery が末尾境界を観測
+    assert boundaries[0].payload["promoted"] is True
+    assert boundaries[0].payload["evaluator_version"] == HONEST.version
+    # 観測 event が DB の settled SoT と整合する。
+    run = ReflexionStore(log2.conn).get_run("ref")
+    assert run["epoch"] == boundaries[0].payload["epoch"] == 1
+    assert run["evaluator_version"] == boundaries[0].payload["evaluator_version"]
+    assert result2.state.epoch == 1
+    log2.close()
+
+
 def test_raw_borrowed_connection_resume_works(tmp_path):
     """回帰: 素の sqlite3.connect() を借用しても、生成時に正規化されるので resume の read が壊れない。"""
     db = str(tmp_path / "raw.db")
