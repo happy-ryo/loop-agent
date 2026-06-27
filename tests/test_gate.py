@@ -29,6 +29,7 @@ from claude_loop import (
     run_gated_loop,
     run_loop,
 )
+from claude_loop.loop import GATE_PROCEED, GateReview
 from claude_loop.store import EVENT_GATE
 from conftest import never_done
 
@@ -247,6 +248,29 @@ def test_inactive_gate_proceeds_without_interrupting(tmp_path):
 
 
 # -- 同期 resolver モード (pause せず inline 解決) ---------------------------
+
+
+def test_custom_gate_bare_proceed_keeps_gathered_context(tmp_path):
+    # 任意の ActionGate 実装が context を省いた bare proceed を返しても、gather した
+    # 提案 action が act に渡る (None に化けない)。公開拡張点の堅牢性。
+    seen = []
+
+    class EchoGate:
+        def review(self, context, state):
+            return GateReview(disposition=GATE_PROCEED)  # context 未設定
+
+    def gather(state):
+        return f"ctx@{state.iteration}"
+
+    def act(action):
+        seen.append(action)
+        return ActOutcome(observation=action, tokens=0)
+
+    run_loop(
+        act=act, verify=never_done, conditions=[MaxIterations(2)],
+        gather=gather, gate=EchoGate(),
+    )
+    assert seen == ["ctx@0", "ctx@1"]  # None ではなく gather した context
 
 
 def test_synchronous_resolver_resolves_inline(tmp_path):

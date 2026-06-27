@@ -28,6 +28,29 @@ GATE_SKIP = "skip"
 GATE_PAUSE = "pause"
 
 
+class _KeepContext:
+    """Sentinel for :attr:`GateReview.context` left unset on a PROCEED.
+
+    Distinguishes "proceed with the gathered context unchanged" (the default)
+    from "proceed with an explicitly *edited* context" -- including an edit to a
+    literal ``None``. A bare ``GateReview(disposition=GATE_PROCEED)`` therefore
+    runs ``act`` on the originally gathered action, never on ``None``.
+    """
+
+    _singleton: "Optional[_KeepContext]" = None
+
+    def __new__(cls) -> "_KeepContext":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cls._singleton
+
+    def __repr__(self) -> str:
+        return "<keep-gathered-context>"
+
+
+KEEP_CONTEXT = _KeepContext()
+
+
 @dataclass
 class ActOutcome:
     """What one ``act`` invocation produced.
@@ -56,7 +79,8 @@ class GateReview:
     """A human gate's verdict on a proposed action, consumed by the driver.
 
     ``disposition`` is one of :data:`GATE_PROCEED` (run ``act`` on
-    :attr:`context`, which may be an *edited* action), :data:`GATE_SKIP`
+    :attr:`context`; left at :data:`KEEP_CONTEXT` the gathered action runs
+    unchanged, set it to supply an *edited* action), :data:`GATE_SKIP`
     (do *not* execute -- record :attr:`observation` / :attr:`detail` as a step
     and continue, e.g. a reject/respond), or :data:`GATE_PAUSE` (stop the loop
     now and return a ``"paused"`` result carrying :attr:`pending`, to be
@@ -68,7 +92,7 @@ class GateReview:
     """
 
     disposition: str
-    context: Any = None
+    context: Any = KEEP_CONTEXT
     observation: Any = None
     detail: str = ""
     pending: Optional[Any] = None
@@ -279,8 +303,11 @@ def run_loop(
                 if on_step is not None:
                     on_step(record, state)
                 continue
-            # GATE_PROCEED: execute the (possibly edited) action.
-            context = review.context
+            # GATE_PROCEED: execute the (possibly edited) action. An unset
+            # context keeps the gathered action; only an explicit value (an
+            # edit) replaces it -- so a bare proceed never passes None to act.
+            if review.context is not KEEP_CONTEXT:
+                context = review.context
 
         outcome = act(context)
         state.tokens_used += outcome.tokens

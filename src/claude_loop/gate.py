@@ -253,7 +253,8 @@ class HumanGate:
         """
         if decision.kind == "approve":
             self.store.mark_executed(self.run_id, gate_key)
-            return GateReview(disposition=GATE_PROCEED, context=context)
+            # context は据え置き (gather した提案 action をそのまま実行)。
+            return GateReview(disposition=GATE_PROCEED)
         if decision.kind == "edit":
             # 人間が差し替えた action を実行する。
             self.store.mark_executed(self.run_id, gate_key)
