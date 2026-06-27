@@ -179,6 +179,8 @@ class ReflexiveResult:
 # フック型。
 EpisodeFn = Callable[[ReflexionContext], LoopResult]
 # reflect: (軌跡, 一次信号, 固定評価器の reward) -> 言語的 lesson (or None)。
+# 返した Lesson の ``episode`` / ``support`` は driver が正本で上書きする (hook は正しい
+# episode 番号や権威 support を知らないため。``text`` / ``provenance`` のみ hook 由来)。
 ReflectHook = Callable[
     [tuple[StepRecord, ...], GroundTruthSignal, float], Optional[Lesson]
 ]
@@ -339,9 +341,16 @@ def run_reflexion(
             record.detail = f"reflect failed: {type(exc).__name__}: {exc}"
             lesson = None
         if lesson is not None:
-            # support を **権威ある grounding から再計算して上書き** (自己申告を信用しない)。
+            # support は **権威ある grounding から再計算して上書き** (自己申告を信用しない)。
+            # episode も driver が正本で打ち直す: reflect は (軌跡, 信号, reward) しか受け取らず
+            # 正しい episode 番号を知らないため、hook の placeholder を残すと memory の
+            # episode ベース eviction/監査が誤る (例: 後続 episode の lesson が ep0 扱い)。
             grounded = lesson.provenance in trajectory_signatures(outcome.history)
-            lesson = replace(lesson, support=1.0 if grounded else 0.0)
+            lesson = replace(
+                lesson,
+                support=1.0 if grounded else 0.0,
+                episode=state.episode,
+            )
             try:
                 verdict: LessonVerdict = admit_lesson(lesson, outcome)
             except Exception as exc:  # noqa: BLE001

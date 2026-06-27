@@ -321,6 +321,35 @@ def test_reflection_budget_stops_outer_loop():
     assert result.state.reflections == 2
 
 
+def test_admitted_lesson_stamped_with_actual_episode():
+    """reflect の placeholder episode=0 を driver が実 episode 番号で上書きする。"""
+
+    def reflect_each(history, signal, reward):
+        # hook は常に placeholder episode=0 を返す (正しい番号を知らない)。
+        return Lesson(text=f"lesson at {history[0].detail}", episode=0,
+                      provenance=step_signature(history[0]), support=1.0)
+
+    counter = {"n": 0}
+
+    def episode(ctx):
+        counter["n"] += 1
+        return make_result(False, observation=f"ep{counter['n']}")
+
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=episode,
+            reflect=reflect_each,
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(3)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+        )
+    )
+    # 3 episode 分の lesson がそれぞれ正しい episode 番号でスタンプされている。
+    episodes = sorted(l.episode for l in result.state.memory.lessons())
+    assert episodes == [0, 1, 2]
+
+
 def test_memory_size_bounded_under_many_reflections():
     counter = {"n": 0}
 
