@@ -184,9 +184,10 @@ class EpisodicMemory:
     def render(self) -> str:
         """next-context へ配線する lesson ブロックを返す (``render_byte_cap`` で有界)。
 
-        support 降順 (効いた学びを優先) → episode 昇順で並べ、1 行ずつ積む。総文字数が
-        ``render_byte_cap`` を超える行は積まずに打ち切る (肥大化の最終ガード)。lesson が
-        無ければ空文字列を返す。
+        support 降順 (効いた学びを優先) → episode 昇順で並べ、1 行ずつ積む。**UTF-8 エンコード
+        後のバイト数**が ``render_byte_cap`` を超える行は積まずに打ち切る (肥大化の最終ガード)。
+        非 ASCII (日本語・絵文字等) でも文字数ではなく実バイト数で有界にする。lesson が無ければ
+        空文字列を返す。
         """
         if not self._lessons:
             return ""
@@ -195,12 +196,13 @@ class EpisodicMemory:
         for lesson in ordered:
             line = f"- {lesson.text}"
             candidate = "\n".join(lines + [line])
-            if len(candidate) > self.render_byte_cap:
+            if len(candidate.encode("utf-8")) > self.render_byte_cap:
                 break
             lines.append(line)
         if len(lines) == 1:
-            # ヘッダだけで上限超過する病的ケース: ヘッダごと上限に丸める。
-            return lines[0][: self.render_byte_cap]
+            # ヘッダだけで上限超過する病的ケース: バイト境界で安全に丸める (壊れた multibyte を
+            # 残さないよう errors='ignore' で復号)。
+            return lines[0].encode("utf-8")[: self.render_byte_cap].decode("utf-8", "ignore")
         return "\n".join(lines)
 
 

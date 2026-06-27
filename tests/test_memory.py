@@ -119,6 +119,21 @@ def test_render_is_bounded_by_byte_cap():
     assert len(rendered) <= 120
 
 
+def test_render_byte_cap_bounds_utf8_bytes_for_non_ascii():
+    """非 ASCII (日本語) でも文字数でなく実 UTF-8 バイト数で有界 (P3 fix)。"""
+    mem = EpisodicMemory(cap=50, per_lesson_chars=200, render_byte_cap=120)
+    for i in range(50):
+        mem.admit(
+            Lesson(text=f"日本語の教訓 {i} " + "あ" * 80, episode=i,
+                   provenance=f"p{i}", support=1.0),
+            LessonVerdict(admit=True),
+        )
+    rendered = mem.render()
+    assert len(rendered.encode("utf-8")) <= 120
+    # 丸めた結果も妥当な UTF-8 (壊れた multibyte が残らない)。
+    rendered.encode("utf-8").decode("utf-8")
+
+
 def test_render_empty_when_no_lessons():
     assert EpisodicMemory().render() == ""
 

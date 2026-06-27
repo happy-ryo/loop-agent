@@ -368,9 +368,15 @@ def run_reflexion(
             if propose_evaluator is not None:
                 candidate = propose_evaluator(state.outer_state(), incumbent)
                 if candidate is not None:
-                    fold = held_out.fold(state.epoch)
+                    # 集約ゲートは回転 fold で測る (anti-overfit) が、fold/critical 後退
+                    # チェックは held-out 全体で行う (選ばれなかった fold の犠牲を弾く)。
                     admission = admit_evaluator(
-                        incumbent, candidate, fold, epsilon=epsilon, delta=delta
+                        incumbent,
+                        candidate,
+                        held_out,
+                        epsilon=epsilon,
+                        delta=delta,
+                        measure_fold=held_out.fold(state.epoch),
                     )
                     incumbent = admission.chosen
                     state.evaluator_version = incumbent.version

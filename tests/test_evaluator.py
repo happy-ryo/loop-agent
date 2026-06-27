@@ -181,3 +181,45 @@ def test_heldout_requires_probes_and_unique_ids():
         HeldOut(())
     with pytest.raises(ValueError):
         HeldOut((Probe("dup", {}, 0.1), Probe("dup", {}, 0.2)))
+
+
+# -- 後退チェックは measure_fold ではなく held-out 全体を見る (P1 fix) -----------
+
+
+def test_promotion_checks_all_folds_not_just_measured_fold():
+    """集約は回転 fold で測っても、別 fold の critical 後退は弾く (選ばれない fold も守る)。"""
+    held = _held(
+        ("f0", 1.0, {"inc": 0.0, "cand": 1.0}, 0, False),     # 測定 fold: 候補が改善
+        ("f1crit", 1.0, {"inc": 1.0, "cand": 0.0}, 1, True),  # 別 fold: critical で後退
+    )
+    inc = _ev("inc", "inc")
+    cand = _ev("cand", "cand")
+    # 集約ゲートは fold 0 のみで測る (anti-overfit) が、後退チェックは全 held-out を見る。
+    res = admit_evaluator(inc, cand, held, epsilon=0.02, measure_fold=held.fold(0))
+    assert res.chosen is inc  # 別 fold の critical 後退で却下
+
+
+def test_promotion_succeeds_when_better_on_all_folds():
+    held = _held(
+        ("f0", 1.0, {"inc": 0.0, "cand": 1.0}, 0, False),
+        ("f1", 1.0, {"inc": 0.0, "cand": 1.0}, 1, True),
+    )
+    inc = _ev("inc", "inc")
+    cand = _ev("cand", "cand")
+    res = admit_evaluator(inc, cand, held, epsilon=0.02, measure_fold=held.fold(0))
+    assert res.chosen is cand
+
+
+# -- 評価器 version の同一性 (P2 fix) ------------------------------------------
+
+
+def test_lambda_evaluators_distinguished_by_source_location():
+    """別ソース位置の同名 lambda は別 version になる (audit 証跡が壊れない)。"""
+    e1 = Evaluator(score=lambda o: Score(ground_truth=0.0), name="dup")
+    e2 = Evaluator(score=lambda o: Score(ground_truth=1.0), name="dup")
+    assert e1.version != e2.version
+
+
+def test_explicit_version_is_preserved():
+    e = Evaluator(score=lambda o: Score(ground_truth=0.0), name="x", version="v-pinned")
+    assert e.version == "v-pinned"

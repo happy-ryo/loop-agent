@@ -80,12 +80,28 @@ ScoreFn = Callable[[Any], Score]
 GroundTruthFn = Callable[[Any], GroundTruthSignal]
 
 
+def _scorer_identity(score: ScoreFn) -> str:
+    """採点関数の **再現可能な** 同一性キー (audit/version 用)。
+
+    ``__qualname__`` だけだと別ソース位置の lambda が同名 (``<lambda>``) で衝突し、振る舞いの
+    違う評価器が同じ version になって epoch-freeze の監査証跡を壊す。``__code__`` があれば
+    **定義ソース位置** (filename:firstlineno) を足して、別位置で定義された関数/lambda を
+    区別する (同一プロセス内でも・プロセスを跨いでも再現する)。同じ code object を共有する
+    closure (同位置・別 capture) はなお衝突しうるので、その場合は呼び出し側が明示 ``version``
+    を渡すこと (docstring 参照)。
+    """
+    qual = getattr(score, "__qualname__", repr(score))
+    code = getattr(score, "__code__", None)
+    if code is not None:
+        return f"{qual}@{code.co_filename}:{code.co_firstlineno}"
+    return qual
+
+
 def _content_version(score: ScoreFn, rubric: tuple[str, ...], name: str) -> str:
-    """評価器の固定基準キー (content-hash)。同じ署名なら同じ version になる。"""
+    """評価器の固定基準キー (content-hash)。同じ署名/ソース位置なら同じ version になる。"""
     import hashlib
 
-    fn_id = getattr(score, "__qualname__", repr(score))
-    payload = f"{name}|{fn_id}|{'/'.join(rubric)}"
+    payload = f"{name}|{_scorer_identity(score)}|{'/'.join(rubric)}"
     return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
@@ -93,9 +109,11 @@ def _content_version(score: ScoreFn, rubric: tuple[str, ...], name: str) -> str:
 class Evaluator:
     """epoch 内で **固定** される rubric 評価器。``score`` は注入された純関数。
 
-    ``version`` は固定基準の同一性キー (content-hash)。明示しなければ ``score`` / ``rubric``
-    / ``name`` から導出する。epoch をまたぐ昇格 (:func:`admit_evaluator`) のときだけ別 version の
-    評価器に置き換わる。``score`` の出力 (reward 信号) は Reflexion の verbal reinforcement
+    ``version`` は固定基準の同一性キー (content-hash)。明示しなければ ``score`` の同一性
+    (qualname + 定義ソース位置) / ``rubric`` / ``name`` から導出する (:func:`_scorer_identity`)。
+    **同じ code object を共有する closure** (同一ソース位置で capture 変数だけ違う) は version が
+    衝突しうるので、振る舞いが違うなら ``version`` を明示すること (audit 証跡の忠実性のため)。
+    epoch をまたぐ昇格 (:func:`admit_evaluator`) のときだけ別 version の評価器に置き換わる。``score`` の出力 (reward 信号) は Reflexion の verbal reinforcement
     としてのみ使い、収束/採用判定には載せない (それは :class:`GroundTruthSignal` の役目)。
     """
 
@@ -204,25 +222,36 @@ def admit_evaluator(
     *,
     epsilon: float,
     delta: float = 0.0,
+    measure_fold: Optional[HeldOut] = None,
 ) -> AdmissionResult:
     """epsilon-best-belief + dominance で評価器昇格を判定する (RQGM 安全ゲート)。
 
     候補を採用する条件 (すべて満たすときのみ。さもなくば incumbent 据え置き):
 
     1. **集約一致度の厳格な改善**: ``agreement(candidate) > agreement(incumbent) + epsilon``。
-       ``epsilon`` は churn 防止の安全余白で **正** を要求する (``<= 0`` は拒否)。
-    2. **fold 単位で後退しない**: 各 fold で候補の一致度が incumbent から ``delta`` 超で
-       下がらない (集約だけ上げて特定 fold を犠牲にする gaming を弾く)。
-    3. **critical probe で後退しない**: ``critical=True`` の probe で候補の二乗誤差が
-       incumbent を超えない (危険ケースを犠牲にする昇格を弾く)。
+       ``epsilon`` は churn 防止の安全余白で **正** を要求する (``<= 0`` は拒否)。この集約ゲート
+       のみ ``measure_fold`` (= 回転選択した held-out 部分集合) で測ってよい (anti adaptive-overfit:
+       毎境界で同じ固定集合を hill-climb させない)。``None`` なら ``held_out`` 全体で測る。
+    2. **fold 単位で後退しない**: **``held_out`` 全 fold** で候補の一致度が incumbent から
+       ``delta`` 超で下がらない (集約だけ上げて特定 fold を犠牲にする gaming を弾く)。回転選択
+       した fold だけでなく **全 fold** を見る (選ばれなかった fold での後退も弾く)。
+    3. **critical probe で後退しない**: ``held_out`` 全体の ``critical=True`` probe で候補の
+       二乗誤差が incumbent を超えない (危険ケースを犠牲にする昇格を弾く)。回転で選ばれなかった
+       fold にある critical probe も必ずチェックする。
 
     gold ラベルは評価器と独立なので、候補が自分を高く採点しても一致度は上がらない。
+
+    安全上の要点: 集約ゲート (1) は anti-overfit のため部分集合で測ってよいが、後退チェック
+    (2)(3) は **常に held-out 全体** を見る。これにより「選ばれた fold だけ改善し、別 fold の
+    critical probe を犠牲にする」昇格を構造的に弾く。
     """
     if epsilon <= 0:
         raise ValueError("admit_evaluator epsilon must be > 0 (anti-churn margin)")
 
-    inc_agree = agreement(incumbent, held_out)
-    cand_agree = agreement(candidate, held_out)
+    # 集約ゲートの測定対象 (回転 fold があればそれ、無ければ全体)。後退チェックは常に全体。
+    measure = measure_fold if measure_fold is not None else held_out
+    inc_agree = agreement(incumbent, measure)
+    cand_agree = agreement(candidate, measure)
 
     def keep() -> AdmissionResult:
         return AdmissionResult(
@@ -232,17 +261,17 @@ def admit_evaluator(
             _candidate_version=candidate.version,
         )
 
-    # (1) 集約一致度の厳格改善。
+    # (1) 集約一致度の厳格改善 (anti-overfit のため measure 上で評価)。
     if not (cand_agree > inc_agree + epsilon):
         return keep()
 
-    # (2) fold 単位の後退チェック。
+    # (2) fold 単位の後退チェック (held-out 全 fold を見る)。
     for f in held_out.folds:
         sub = HeldOut(tuple(p for p in held_out.probes if p.fold == f))
         if agreement(candidate, sub) < agreement(incumbent, sub) - delta:
             return keep()
 
-    # (3) critical probe の後退チェック (二乗誤差が増えていないこと)。
+    # (3) critical probe の後退チェック (held-out 全体。二乗誤差が増えていないこと)。
     for p in held_out.probes:
         if p.critical and _probe_squared_error(candidate, p) > _probe_squared_error(
             incumbent, p
