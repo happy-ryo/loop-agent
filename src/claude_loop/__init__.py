@@ -41,12 +41,13 @@ from .events import (
     LoopEvent,
     read_events,
 )
-from .loop import ActOutcome, LoopResult, VerifyOutcome, run_loop
+from .gate import Decision, HumanGate, run_gated_loop
+from .loop import ActionGate, ActOutcome, GateReview, LoopResult, VerifyOutcome, run_loop
 from .observe import LoopObserver, run_observed_loop
 from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
-from .store import DBProgressLog, LoopStore, connect
+from .store import DBProgressLog, DECISION_KINDS, LoopStore, connect
 
 __all__ = [
     "run_loop",
@@ -84,6 +85,13 @@ __all__ = [
     "connect",
     "LoopStore",
     "DBProgressLog",
+    "DECISION_KINDS",
+    # 限定人間ゲート (report.md S4.5 / R6 / S5 Phase 2; Issue #15)
+    "ActionGate",
+    "GateReview",
+    "HumanGate",
+    "Decision",
+    "run_gated_loop",
 ]
 
 __version__ = "0.0.1"

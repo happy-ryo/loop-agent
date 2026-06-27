@@ -17,10 +17,38 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Protocol, Union, runtime_checkable
 
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
 from .state import LoopState, StepRecord
+
+# 人間ゲートの disposition: 提案 action をそのまま実行 / 実行せず記録だけ / 中断。
+GATE_PROCEED = "proceed"
+GATE_SKIP = "skip"
+GATE_PAUSE = "pause"
+
+
+class _KeepContext:
+    """Sentinel for :attr:`GateReview.context` left unset on a PROCEED.
+
+    Distinguishes "proceed with the gathered context unchanged" (the default)
+    from "proceed with an explicitly *edited* context" -- including an edit to a
+    literal ``None``. A bare ``GateReview(disposition=GATE_PROCEED)`` therefore
+    runs ``act`` on the originally gathered action, never on ``None``.
+    """
+
+    _singleton: "Optional[_KeepContext]" = None
+
+    def __new__(cls) -> "_KeepContext":
+        if cls._singleton is None:
+            cls._singleton = super().__new__(cls)
+        return cls._singleton
+
+    def __repr__(self) -> str:
+        return "<keep-gathered-context>"
+
+
+KEEP_CONTEXT = _KeepContext()
 
 
 @dataclass
@@ -47,19 +75,67 @@ class VerifyOutcome:
 
 
 @dataclass
+class GateReview:
+    """A human gate's verdict on a proposed action, consumed by the driver.
+
+    ``disposition`` is one of :data:`GATE_PROCEED` (run ``act`` on
+    :attr:`context`; left at :data:`KEEP_CONTEXT` the gathered action runs
+    unchanged, set it to supply an *edited* action), :data:`GATE_SKIP`
+    (do *not* execute -- record :attr:`observation` / :attr:`detail` as a step
+    and continue, e.g. a reject/respond), or :data:`GATE_PAUSE` (stop the loop
+    now and return a ``"paused"`` result carrying :attr:`pending`, to be
+    resumed once a human records a decision).
+
+    The driver stays gate-agnostic: it only understands these three
+    dispositions. The store/human lifecycle lives behind the gate object
+    (:class:`claude_loop.gate.HumanGate`).
+    """
+
+    disposition: str
+    context: Any = KEEP_CONTEXT
+    observation: Any = None
+    detail: str = ""
+    pending: Optional[Any] = None
+    # GATE_SKIP のとき、この skip を観測フック (on_step) に流すか。既定 True。
+    # resume 再生で既実行ゲートを読み飛ばすだけの "replay no-op" な skip は False にして、
+    # 前 run が永続化済みの本来の step 行を上書き (UNIQUE(run_id, iteration) upsert) で
+    # 壊さないようにする。
+    persist: bool = True
+
+
+@runtime_checkable
+class ActionGate(Protocol):
+    """A pre-act interception point for limited human gating (report.md R6).
+
+    Evaluated *before* ``act`` executes the gathered context, so an irreversible
+    action can be intercepted before its side effect. Returns a
+    :class:`GateReview` telling the driver to proceed, skip, or pause.
+    """
+
+    def review(self, context: Any, state: LoopState) -> GateReview:
+        ...
+
+
+@dataclass
 class LoopResult:
     """Outcome of a loop run.
 
-    ``stop`` is ``None`` only on *natural* termination (the ``verify`` hook met
-    the goal). Otherwise it names the fired condition -- which may itself be a
-    success (a ``GoalMet`` stop, ``stop.name == "goal_met"``) or a halt
-    (``no_progress`` / a mechanical cap). Prefer :attr:`succeeded` over
+    ``stop`` is ``None`` on *natural* termination (the ``verify`` hook met the
+    goal) and on a ``"paused"`` result (the loop was interrupted by a human gate
+    before any cap fired). Otherwise it names the fired condition -- which may
+    itself be a success (a ``GoalMet`` stop, ``stop.name == "goal_met"``) or a
+    halt (``no_progress`` / a mechanical cap). Prefer :attr:`succeeded` over
     :attr:`goal_met` to test for success regardless of channel.
+
+    ``pending`` is set only when ``status == "paused"``: it describes the gated
+    action awaiting a human decision (the decision itself is persisted in the
+    store, so resuming the run honours it).
     """
 
-    status: str  # "goal_met" | "stopped"
+    status: str  # "goal_met" | "stopped" | "paused"
     stop: Optional[StopTrigger]
     state: LoopState
+    pending: Optional[Any] = None
 
     @property
     def goal_met(self) -> bool:
@@ -104,10 +180,21 @@ class LoopResult:
         return self.state.history
 
     @property
+    def paused(self) -> bool:
+        """True when the run was interrupted by a human gate (awaiting a decision)."""
+        return self.status == "paused"
+
+    @property
     def reason(self) -> str:
-        """Human-readable reason the loop ended."""
+        """Human-readable reason the loop ended (or paused)."""
         if self.goal_met:
             return "goal met"
+        if self.paused:
+            key = ""
+            if isinstance(self.pending, dict):
+                key = self.pending.get("gate_key", "")
+            suffix = f" ({key})" if key else ""
+            return f"paused: awaiting human decision{suffix}"
         return self.stop.reason if self.stop is not None else ""
 
 
@@ -130,6 +217,7 @@ def run_loop(
     conditions: Conditions,
     gather: GatherHook = _default_gather,
     on_step: Optional[StepHook] = None,
+    gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
@@ -145,6 +233,14 @@ def run_loop(
             the :class:`LoopState` through.
         on_step: Optional observer invoked with ``(record, state)`` after each
             completed iteration (a minimal observability seam; report.md R7).
+        gate: Optional limited human gate (report.md R6). When supplied, its
+            ``review(context, state)`` runs *between* ``gather`` and ``act`` --
+            i.e. after the action is proposed but before it executes -- so an
+            irreversible action can be intercepted before its side effect. The
+            gate may let the step proceed (optionally with an *edited* context),
+            skip it (record a non-executing step and continue, e.g. a reject /
+            respond), or pause the run (return a ``"paused"`` result). Reversible
+            actions and a ``None`` gate add no overhead and never interrupt.
         time_fn: Monotonic clock, injectable for deterministic timeout tests.
         initial_state: Seed the loop with already-accumulated state to **resume**
             an interrupted run (report.md S4.4 / S5 Phase 2, Issue #14). Pass the
@@ -160,8 +256,10 @@ def run_loop(
             seed is copied, so the caller's object is not mutated.
 
     Returns:
-        A :class:`LoopResult`. ``status`` is ``"goal_met"`` (``stop is None``) or
-        ``"stopped"`` (``stop`` names the fired condition).
+        A :class:`LoopResult`. ``status`` is ``"goal_met"`` (``stop is None``),
+        ``"stopped"`` (``stop`` names the fired condition), or ``"paused"``
+        (``stop is None``, ``pending`` describes the gated action awaiting a
+        human decision).
 
     Stop conditions are evaluated at the top of each cycle (the while-guard),
     *before* a new step starts -- including before the very first one, so e.g.
@@ -226,6 +324,12 @@ def run_loop(
     # Back-date the clock origin by the already-elapsed time so `elapsed`
     # continues accumulating from the persisted value across the resume seam
     # (for a fresh run state.elapsed is 0.0, so start == time_fn()).
+    #
+    # The human gate (if any) keys each decision by `state.iteration` (see
+    # HumanGate), so no per-run gate setup is needed here: that key is stable
+    # across both resume models -- a replay (fresh state) re-reaches the same
+    # iteration, and an `initial_state` resume restores it -- so a persisted
+    # decision realigns to its action either way.
     start = time_fn() - state.elapsed
 
     while True:
@@ -235,6 +339,51 @@ def run_loop(
             return LoopResult(status="stopped", stop=triggered, state=state)
 
         context = gather(state)
+
+        if gate is not None:
+            review = gate.review(context, state)
+            if review.disposition == GATE_PAUSE:
+                # Interrupt before the irreversible side effect. No step is
+                # recorded for the un-executed action; the decision is persisted
+                # behind the gate so a resumed run honours it (report.md R6).
+                state.elapsed = time_fn() - start
+                return LoopResult(
+                    status="paused", stop=None, state=state, pending=review.pending
+                )
+            if review.disposition == GATE_SKIP:
+                # The human declined to execute (reject/respond): record the
+                # decision as a zero-cost step and re-enter the guard, so caps
+                # and NoProgress still see and bound the gated cycle.
+                record = StepRecord(
+                    iteration=state.iteration,
+                    observation=review.observation,
+                    tokens=0,
+                    goal_met=False,
+                    detail=review.detail,
+                )
+                state.history.append(record)
+                state.iteration += 1
+                state.elapsed = time_fn() - start
+                # replay no-op な skip (review.persist=False) は on_step を呼ばない:
+                # 前 run が永続化した本来の step 行を上書きで壊さないため。
+                if on_step is not None and review.persist:
+                    on_step(record, state)
+                continue
+            if review.disposition != GATE_PROCEED:
+                # Fail closed: an unrecognised disposition (e.g. a typo'd
+                # "paused") must NOT silently fall through to executing the
+                # action -- for a safety gate that could run an irreversible
+                # side effect instead of pausing. Reject loudly instead.
+                raise ValueError(
+                    f"gate returned unknown disposition {review.disposition!r}; "
+                    f"expected one of {GATE_PROCEED!r}/{GATE_SKIP!r}/{GATE_PAUSE!r}"
+                )
+            # GATE_PROCEED: execute the (possibly edited) action. An unset
+            # context keeps the gathered action; only an explicit value (an
+            # edit) replaces it -- so a bare proceed never passes None to act.
+            if review.context is not KEEP_CONTEXT:
+                context = review.context
+
         outcome = act(context)
         state.tokens_used += outcome.tokens
 
