@@ -696,7 +696,8 @@ class LoopStore:
         条件付き UPDATE で行い、**この呼び出しが遷移させられたときだけ** ``True`` を返す。
         既に ``executed`` (= 別プロセス / 別 resume が先に実行を主張済み) なら ``False``
         を返す — 敗者は実行してはならない (呼び出し側は skip する)。``pending`` (未解決) /
-        不在は ``ValueError``。
+        不在 / 非実行系の決定 (``reject`` / ``respond``) は ``ValueError`` (これらは
+        action を実行しないので executed へ遷移させない)。
 
         loop は resume 時に iteration 0 から再生される (#14 未配線) ため、実行に踏み切る
         *前* に実行権を主張する (at-most-once: 途中失敗時も再実行しない方が不可逆操作には
@@ -705,10 +706,14 @@ class LoopStore:
         (= 不可逆 action の exactly-once 実行を担保)。
         """
         with self.transaction():
+            # 実行を伴うのは approve/edit のみ。reject/respond は「実行しない」決定なので
+            # executed へ遷移させない (誤って遷移させると後続 resume が却下/応答の記録を
+            # skip して gate 状態・監査証跡を壊す)。
             cur = self.conn.execute(
                 "UPDATE pending_decision SET status = 'executed', "
                 "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE run_id = ? AND gate_key = ? AND status = 'resolved'",
+                "WHERE run_id = ? AND gate_key = ? AND status = 'resolved' "
+                "AND decision IN ('approve','edit')",
                 (run_id, gate_key),
             )
             if cur.rowcount == 1:
@@ -717,9 +722,10 @@ class LoopStore:
                     run_id, EVENT_GATE, {"gate_key": gate_key, "status": "executed"}
                 )
                 return True
-            # 0 行: 既に executed / 未解決 / 不在 のいずれか。
+            # 0 行: 既に executed / 未解決 / 不在 / 非実行系(reject/respond) のいずれか。
             row = self.conn.execute(
-                "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",
+                "SELECT status, decision FROM pending_decision "
+                "WHERE run_id = ? AND gate_key = ?",
                 (run_id, gate_key),
             ).fetchone()
             if row is None:
@@ -728,7 +734,13 @@ class LoopStore:
                 )
             if row["status"] == "executed":
                 return False  # 敗者: 別の resume が先に実行済み。
-            raise ValueError(f"cannot mark unresolved gate {gate_key!r} executed")
+            if row["status"] == "pending":
+                raise ValueError(f"cannot mark unresolved gate {gate_key!r} executed")
+            # status == 'resolved' だが decision が reject/respond (= 実行しない決定)。
+            raise ValueError(
+                f"gate {gate_key!r} decision {row['decision']!r} is not executable "
+                "(only approve/edit run an action)"
+            )
 
     def get_decision(self, run_id: str, gate_key: str) -> Optional[dict[str, Any]]:
         """``(run_id, gate_key)`` の決定行を dict で返す (無ければ ``None``)。"""

@@ -248,10 +248,13 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
   されるため、**非ゲート action は冪等であること**を前提とする（あるいは #14 の状態復元を
   待つ）。`record_result` に `paused` の結果を渡しても run は `running` のまま残り、
   `stop_reason` も書かれない（resume で続行できる）。
-- **既知の制限**: resume は loop レベルの**累積集計**（`tokens_used` / `elapsed` /
-  `iteration`）を復元しない。よって**run を跨いで累積する上限**（`TokenBudget` / `Timeout`）を
-  gate の pause/resume 越しに信頼しないこと（再開後は前 run までの消費がリセットされて見える）。
-  各 step の正本は `step` 行に残るので監査・コスト集計はそこから行う。累積を引き継いだ完全な
+- **既知の制限**: resume は loop レベルの状態を復元しない。(1) **累積集計**（`tokens_used` /
+  `elapsed` / `iteration`）は復元されないので、**run を跨いで累積する上限**（`TokenBudget` /
+  `Timeout`）を gate の pause/resume 越しに信頼しないこと（再開後は前 run までの消費がリセット
+  されて見える）。(2) 既実行ゲートの skip は合成 placeholder を `history` に積むため、`gather` が
+  **過去の observation 内容に依存**して提案を変えるループでは resume 後の提案列が初回と乖離しうる
+  （本 MVP は「提案列は resume 間で決定的かつ履歴内容に非依存」を前提）。各 step の正本は `step`
+  行に残るので監査はそこから行う。累積集計・観測履歴を引き継いだ完全な（history-dependent な）
   resume は #14（loop-state 復元）の領分。
 
 ### API 概要

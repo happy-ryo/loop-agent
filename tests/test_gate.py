@@ -796,6 +796,21 @@ def test_claim_execution_is_single_winner(tmp_path):
     assert store.claim_execution(RUN_ID, "g1") is False
 
 
+def test_claim_execution_rejects_non_executable_decisions(tmp_path):
+    # reject/respond は action を実行しないので、store API を直接叩いても executed へ
+    # 遷移させない (誤遷移すると後続 resume が却下/応答の記録を skip して状態を壊す)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    store.load_or_init(RUN_ID)
+    for key, kind in (("gr", "reject"), ("gp", "respond")):
+        store.request_decision(RUN_ID, key, "deploy")
+        store.resolve_decision(RUN_ID, key, kind, payload=("msg" if kind == "respond" else None))
+        with pytest.raises(ValueError, match="not executable"):
+            store.claim_execution(RUN_ID, key)
+        # status は resolved のまま (executed に化けていない)。
+        assert store.get_decision(RUN_ID, key)["status"] == "resolved"
+
+
 def test_claim_execution_single_winner_across_connections(tmp_path):
     # 別接続 (= 並行 resume を模擬) からの主張でも、勝者は 1 者だけ。
     db_path = tmp_path / "s.db"
