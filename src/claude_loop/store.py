@@ -651,45 +651,46 @@ class LoopStore:
             ).fetchone()
             return self._decode_decision(row)
 
-    def mark_executed(self, run_id: str, gate_key: str) -> dict[str, Any]:
-        """approve/edit で実行した不可逆 action を ``executed`` に確定する (at-most-once)。
+    def claim_execution(self, run_id: str, gate_key: str) -> bool:
+        """approve/edit の不可逆 action の実行権を **single-winner** で主張する。
 
-        ``resolved`` -> ``executed`` の遷移。loop は resume 時に iteration 0 から
-        再生される (#14 未配線) ため、一度実行した不可逆 action を再生で **二度実行
-        しない** よう、実行に踏み切る *前* にこのマークを立てる (at-most-once: 途中
-        失敗時も再実行しない方が不可逆操作には安全)。既に ``executed`` なら冪等 no-op。
-        ``pending`` (未解決) からの実行はあり得ないので ``ValueError``。
+        ``resolved`` -> ``executed`` への遷移を ``status = 'resolved'`` を条件にした
+        条件付き UPDATE で行い、**この呼び出しが遷移させられたときだけ** ``True`` を返す。
+        既に ``executed`` (= 別プロセス / 別 resume が先に実行を主張済み) なら ``False``
+        を返す — 敗者は実行してはならない (呼び出し側は skip する)。``pending`` (未解決) /
+        不在は ``ValueError``。
+
+        loop は resume 時に iteration 0 から再生される (#14 未配線) ため、実行に踏み切る
+        *前* に実行権を主張する (at-most-once: 途中失敗時も再実行しない方が不可逆操作には
+        安全)。``transaction()`` = ``BEGIN IMMEDIATE`` で writer を直列化するので、同一
+        ゲートを並行 resume しても resolved->executed の遷移に成功するのは 1 者だけ
+        (= 不可逆 action の exactly-once 実行を担保)。
         """
         with self.transaction():
-            existing = self.conn.execute(
+            cur = self.conn.execute(
+                "UPDATE pending_decision SET status = 'executed', "
+                "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE run_id = ? AND gate_key = ? AND status = 'resolved'",
+                (run_id, gate_key),
+            )
+            if cur.rowcount == 1:
+                # この呼び出しが resolved->executed を勝ち取った (実行してよい)。
+                self._append_event(
+                    run_id, EVENT_GATE, {"gate_key": gate_key, "status": "executed"}
+                )
+                return True
+            # 0 行: 既に executed / 未解決 / 不在 のいずれか。
+            row = self.conn.execute(
                 "SELECT status FROM pending_decision WHERE run_id = ? AND gate_key = ?",
                 (run_id, gate_key),
             ).fetchone()
-            if existing is None:
+            if row is None:
                 raise ValueError(
                     f"no decision for gate_key {gate_key!r} (run {run_id!r})"
                 )
-            if existing["status"] == "pending":
-                raise ValueError(
-                    f"cannot mark unresolved gate {gate_key!r} executed"
-                )
-            if existing["status"] != "executed":
-                self.conn.execute(
-                    "UPDATE pending_decision SET status = 'executed', "
-                    "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                    "WHERE run_id = ? AND gate_key = ?",
-                    (run_id, gate_key),
-                )
-                self._append_event(
-                    run_id,
-                    EVENT_GATE,
-                    {"gate_key": gate_key, "status": "executed"},
-                )
-            row = self.conn.execute(
-                "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
-                (run_id, gate_key),
-            ).fetchone()
-            return self._decode_decision(row)
+            if row["status"] == "executed":
+                return False  # 敗者: 別の resume が先に実行済み。
+            raise ValueError(f"cannot mark unresolved gate {gate_key!r} executed")
 
     def get_decision(self, run_id: str, gate_key: str) -> Optional[dict[str, Any]]:
         """``(run_id, gate_key)`` の決定行を dict で返す (無ければ ``None``)。"""

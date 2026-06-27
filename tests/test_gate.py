@@ -579,7 +579,7 @@ def test_resume_with_diverged_action_on_executed_gate_is_rejected(tmp_path):
     HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
     store.request_decision(RUN_ID, "gate-0", "deploy-A")
     store.resolve_decision(RUN_ID, "gate-0", "approve")
-    store.mark_executed(RUN_ID, "gate-0")  # 既に実行済みにする
+    store.claim_execution(RUN_ID, "gate-0")  # 既に実行済みにする
 
     gather, act, _ = make_world(["deploy-B"])
     gate = HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
@@ -642,16 +642,32 @@ def test_get_decision_unknown_returns_none(tmp_path):
     assert store.get_decision(RUN_ID, "missing") is None
 
 
-def test_mark_executed_requires_resolved(tmp_path):
+def test_claim_execution_is_single_winner(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     store.load_or_init(RUN_ID)
     store.request_decision(RUN_ID, "g1", "deploy")
+    # 未解決は実行権を主張できない。
     with pytest.raises(ValueError, match="cannot mark unresolved"):
-        store.mark_executed(RUN_ID, "g1")
+        store.claim_execution(RUN_ID, "g1")
     store.resolve_decision(RUN_ID, "g1", "approve")
-    once = store.mark_executed(RUN_ID, "g1")
-    assert once["status"] == "executed" and once["executed_at"] is not None
-    # 冪等: 二度目の mark_executed は no-op で同じ行を返す。
-    twice = store.mark_executed(RUN_ID, "g1")
-    assert twice["status"] == "executed"
+    # 最初の主張は勝者 (True) で executed へ遷移。
+    assert store.claim_execution(RUN_ID, "g1") is True
+    row = store.get_decision(RUN_ID, "g1")
+    assert row["status"] == "executed" and row["executed_at"] is not None
+    # 二度目以降は敗者 (False): 二重実行を許さない。
+    assert store.claim_execution(RUN_ID, "g1") is False
+    assert store.claim_execution(RUN_ID, "g1") is False
+
+
+def test_claim_execution_single_winner_across_connections(tmp_path):
+    # 別接続 (= 並行 resume を模擬) からの主張でも、勝者は 1 者だけ。
+    db_path = tmp_path / "s.db"
+    store_a = LoopStore(connect(db_path))
+    store_a.load_or_init(RUN_ID)
+    store_a.request_decision(RUN_ID, "g1", "deploy")
+    store_a.resolve_decision(RUN_ID, "g1", "approve")
+
+    store_b = LoopStore(connect(db_path))
+    assert store_a.claim_execution(RUN_ID, "g1") is True
+    assert store_b.claim_execution(RUN_ID, "g1") is False  # 敗者は実行しない
