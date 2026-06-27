@@ -181,13 +181,10 @@ class HumanGate:
             self._guard_action_matches(entry, context, gate_key)
             if entry["status"] == "executed":
                 # 既に実行済みの不可逆 action。resume 再生では再実行せず skip する。
+                # observation は hashable に保つ (NoProgress 既定 key 対策。下記 _apply_resolved 参照)。
                 return GateReview(
                     disposition=GATE_SKIP,
-                    observation={
-                        "gate": "already_executed",
-                        "gate_key": gate_key,
-                        "action": context,
-                    },
+                    observation=f"gate-skipped:already-executed:{gate_key}",
                     detail=f"gate {gate_key} already executed in a prior run",
                 )
             if entry["status"] == "resolved":
@@ -246,6 +243,13 @@ class HumanGate:
         approve/edit は実行に踏み切る *前* に ``executed`` を立て、resume 再生での
         二度実行を防ぐ (at-most-once)。reject/respond は実行しないので executed には
         遷移させない (再生でも一貫して skip)。
+
+        skip 系 (reject/respond と executed 再生) が記録する step の ``observation`` は
+        **必ず hashable** にする。observation は ``state.history`` に積まれ、次の guard で
+        :class:`~claude_loop.conditions.NoProgress` の既定 key (= observation) が
+        ``Counter`` でハッシュするため。構造的な注記は文字列の ``detail`` 側に載せ、
+        respond の応答本文は observation として次の ``gather`` へ渡す (応答が非 hashable
+        ならそれは act 由来 observation と同じく利用者責務 = NoProgress の既定契約)。
         """
         if decision.kind == "approve":
             self.store.mark_executed(self.run_id, gate_key)
@@ -257,21 +261,13 @@ class HumanGate:
         if decision.kind == "reject":
             return GateReview(
                 disposition=GATE_SKIP,
-                observation={
-                    "gate": "rejected",
-                    "gate_key": gate_key,
-                    "action": context,
-                },
+                observation=f"gate-skipped:rejected:{gate_key}",
                 detail=f"human rejected gate {gate_key}",
             )
-        # respond: 実行せず人間の応答を記録する。
+        # respond: 実行せず人間の応答を記録する (応答本文を observation として次へ渡す)。
         return GateReview(
             disposition=GATE_SKIP,
-            observation={
-                "gate": "respond",
-                "gate_key": gate_key,
-                "response": decision.payload,
-            },
+            observation=decision.payload,
             detail=f"human responded at gate {gate_key}",
         )
 

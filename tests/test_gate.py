@@ -23,6 +23,7 @@ from claude_loop import (
     HumanGate,
     LoopStore,
     MaxIterations,
+    NoProgress,
     VerifyOutcome,
     connect,
     run_gated_loop,
@@ -158,10 +159,10 @@ def test_reject_skips_action_on_resume(tmp_path):
     # reject: "deploy" は実行されず、却下が 1 step として記録され継続する。
     assert res.status == "stopped"
     assert executed == ["work", "work2"]
-    rejected = [s for s in steps if isinstance(s.observation, dict)
-                and s.observation.get("gate") == "rejected"]
+    rejected = [s for s in steps if s.detail.startswith("human rejected")]
     assert len(rejected) == 1
-    assert rejected[0].observation["action"] == "deploy"
+    # skip step の observation は hashable (NoProgress 既定 key 互換)。
+    assert rejected[0].observation == "gate-skipped:rejected:gate-0"
 
 
 def test_edit_executes_replacement_action_on_resume(tmp_path):
@@ -173,13 +174,12 @@ def test_edit_executes_replacement_action_on_resume(tmp_path):
 
 def test_respond_records_response_without_executing(tmp_path):
     executed, res, steps = _resume_after(tmp_path, "respond", payload="use staging")
-    # respond: 実行せず人間の応答を記録して継続する。
+    # respond: 実行せず人間の応答を記録して継続する。応答本文が observation に載る。
     assert res.status == "stopped"
     assert executed == ["work", "work2"]
-    responded = [s for s in steps if isinstance(s.observation, dict)
-                 and s.observation.get("gate") == "respond"]
+    responded = [s for s in steps if s.detail.startswith("human responded")]
     assert len(responded) == 1
-    assert responded[0].observation["response"] == "use staging"
+    assert responded[0].observation == "use staging"
 
 
 def test_decision_is_not_re_asked_and_irreversible_runs_at_most_once(tmp_path):
@@ -210,6 +210,26 @@ def test_decision_is_not_re_asked_and_irreversible_runs_at_most_once(tmp_path):
 
 
 # -- 全停止スイッチ ----------------------------------------------------------
+
+
+def test_skip_observation_is_hashable_for_noprogress(tmp_path):
+    # skip step の observation を既定 NoProgress (observation を Counter でハッシュ) と
+    # 併用してもクラッシュしないこと (unhashable dict だと次 guard で TypeError)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
+    store.request_decision(RUN_ID, "gate-0", "deploy")
+    store.resolve_decision(RUN_ID, "gate-0", "reject")
+
+    gather, act, executed = make_world(ACTIONS)
+    gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
+    res = run_loop(
+        act=act, verify=never_done,
+        conditions=[NoProgress(window=3, repeat=3), MaxIterations(3)],
+        gather=gather, gate=gate,
+    )
+    assert res.status == "stopped"
+    assert executed == ["work", "work2"]
 
 
 def test_inactive_gate_proceeds_without_interrupting(tmp_path):
@@ -461,10 +481,11 @@ def test_respond_response_reaches_next_gather(tmp_path):
 
     def gather(state):
         if state.history:
-            last = state.history[-1].observation
-            if isinstance(last, dict) and last.get("gate") == "respond":
-                seen_followup.append(last["response"])
-                return f"follow-up:{last['response']}"
+            last = state.history[-1]
+            # respond の step は detail で識別し、応答本文は observation から読む。
+            if last.detail.startswith("human responded"):
+                seen_followup.append(last.observation)
+                return f"follow-up:{last.observation}"
         return ACTIONS[state.iteration]
 
     def act(action):
