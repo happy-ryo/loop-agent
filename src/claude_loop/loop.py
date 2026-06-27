@@ -131,6 +131,7 @@ def run_loop(
     gather: GatherHook = _default_gather,
     on_step: Optional[StepHook] = None,
     time_fn: Callable[[], float] = time.monotonic,
+    initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
     """Drive gather -> act -> verify -> repeat until the goal or a cap.
 
@@ -145,6 +146,18 @@ def run_loop(
         on_step: Optional observer invoked with ``(record, state)`` after each
             completed iteration (a minimal observability seam; report.md R7).
         time_fn: Monotonic clock, injectable for deterministic timeout tests.
+        initial_state: Seed the loop with already-accumulated state to **resume**
+            an interrupted run (report.md S4.4 / S5 Phase 2, Issue #14). Pass the
+            :class:`LoopState` reconstructed by
+            :meth:`~claude_loop.store.LoopStore.load_or_init` (or
+            :attr:`~claude_loop.store.DBProgressLog.state`): the loop continues
+            from its ``iteration`` / ``tokens_used`` / ``goal_met`` / ``history``
+            instead of starting empty, and ``elapsed`` keeps accumulating from
+            the persisted value (the wall-clock origin is back-dated by it so
+            stop conditions like :class:`~claude_loop.conditions.Timeout` see the
+            *total* run time, not just this leg). ``None`` (the default) starts a
+            fresh run; an empty :class:`LoopState` is equivalent to ``None``. The
+            seed is copied, so the caller's object is not mutated.
 
     Returns:
         A :class:`LoopResult`. ``status`` is ``"goal_met"`` (``stop is None``) or
@@ -152,7 +165,27 @@ def run_loop(
 
     Stop conditions are evaluated at the top of each cycle (the while-guard),
     *before* a new step starts -- including before the very first one, so e.g.
-    ``MaxIterations(0)`` returns immediately with zero iterations.
+    ``MaxIterations(0)`` returns immediately with zero iterations. On resume this
+    means a run already at or past a cap (e.g. resumed ``elapsed`` >= a
+    ``Timeout``) stops immediately with no further step, exactly as a straight
+    run would have. Resume is only meaningful for hooks that derive their verdict
+    from the (gathered) state rather than from in-process call counters, since a
+    fresh process rebuilds the hooks but not their private counters; pair resume
+    with state-based stop conditions (e.g. :class:`~claude_loop.conditions.GoalMet`)
+    for a run that reproduces a straight-through result exactly.
+
+    One fidelity caveat when the seed was reconstructed from the state.db SoT
+    (:meth:`~claude_loop.store.LoopStore.load_or_init`): ``history`` observations
+    survive a JSON round-trip, so non-JSON-native types drift (``tuple`` ->
+    ``list``, ``dict`` int-keys -> ``str``, sets/custom objects/NaN -> ``repr``
+    string). A condition that *keys* directly on the raw ``observation`` --
+    notably :class:`~claude_loop.conditions.NoProgress`'s default key -- can then
+    diverge across the seam (a ``tuple`` becomes an unhashable ``list``; other
+    types re-key), so its window straddling the resume point may fire at a
+    different iteration or raise. Use JSON-stable observations, or give such a
+    condition a ``key`` projecting onto a JSON-stable signature (e.g.
+    ``NoProgress(key=lambda r: json.dumps(r.observation, sort_keys=True, default=repr))``),
+    when the run must resume identically.
     """
     if isinstance(conditions, AnyOf):
         stop = conditions
@@ -164,8 +197,25 @@ def run_loop(
             f"got {type(conditions).__name__}"
         )
 
-    start = time_fn()
-    state = LoopState()
+    # Copy the seed rather than mutate the caller's object: the loop mutates
+    # `state` in place throughout, and aliasing the reconstructed state (e.g.
+    # DBProgressLog.state) to the live loop would surprise a caller inspecting
+    # it. history is shallow-copied -- StepRecords are only appended, never
+    # mutated, so the records themselves can be shared.
+    if initial_state is None:
+        state = LoopState()
+    else:
+        state = LoopState(
+            iteration=initial_state.iteration,
+            tokens_used=initial_state.tokens_used,
+            elapsed=initial_state.elapsed,
+            goal_met=initial_state.goal_met,
+            history=list(initial_state.history),
+        )
+    # Back-date the clock origin by the already-elapsed time so `elapsed`
+    # continues accumulating from the persisted value across the resume seam
+    # (for a fresh run state.elapsed is 0.0, so start == time_fn()).
+    start = time_fn() - state.elapsed
 
     while True:
         state.elapsed = time_fn() - start
