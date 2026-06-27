@@ -380,7 +380,16 @@ def run_reflexion(
             # episode も driver が正本で打ち直す: reflect は (軌跡, 信号, reward) しか受け取らず
             # 正しい episode 番号を知らないため、hook の placeholder を残すと memory の
             # episode ベース eviction/監査が誤る (例: 後続 episode の lesson が ep0 扱い)。
-            grounded = lesson.provenance in trajectory_signatures(outcome.history)
+            #
+            # grounding には **ground_truth_backed も要求** する: 実信号 (test/lint 等) の無い
+            # episode は収束履歴に算入しない (RubricThreshold/Plateau)。同じ理由で、その episode
+            # 由来の lesson も support 0 にして memory に入れない。さもないと「収束には算入しないが
+            # 次 context は書き換える」未検証 episode が production 挙動に影響してしまい、
+            # ground-truth 一次の不変条件と矛盾する。
+            grounded = (
+                signal.ground_truth_backed
+                and lesson.provenance in trajectory_signatures(outcome.history)
+            )
             lesson = replace(
                 lesson,
                 support=1.0 if grounded else 0.0,

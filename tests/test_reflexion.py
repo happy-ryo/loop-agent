@@ -251,6 +251,22 @@ def test_unbacked_episodes_do_not_count_toward_convergence():
     assert result.state.gt_aggregate_history == []
 
 
+def test_unbacked_episode_lesson_not_admitted():
+    """実信号の無い episode 由来の lesson は memory に入れない (次 context を汚さない)。"""
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=lambda ctx: make_result(False, observation="real-step"),
+            ground_truth=gt_from_success(lo=0.2, backed=False),  # 実信号なし
+            reflect=true_reflect,  # grounded な lesson を返す
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(2)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+        )
+    )
+    assert len(result.state.memory) == 0  # backed=False なので取り込まれない
+
+
 # ==============================================================================
 # INV4b: memory 取込前検証 (false lesson 注入 / 自己申告 support を弾く)
 # ==============================================================================
