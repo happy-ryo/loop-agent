@@ -319,6 +319,39 @@ def test_synchronous_resolver_resolves_inline(tmp_path):
     assert store.get_decision(RUN_ID, "gate-1")["decision"] == "approve"
 
 
+def test_run_gated_loop_forwards_initial_state(tmp_path):
+    # run_gated_loop に initial_state を渡すと #14 の中断地点継続 resume になる
+    # (iteration 0 からの replay でなく、既実行 reversible を再実行しない)。
+    db_path = tmp_path / "s.db"
+    actions = ["work", "deploy", "work2"]
+
+    conn1 = connect(db_path)
+    db1 = DBProgressLog(conn1, RUN_ID)
+    g1, a1, ex1 = make_world(actions)
+    res1 = run_gated_loop(
+        act=a1, verify=never_done, conditions=[MaxIterations(3)],
+        on=is_deploy, store=db1.store, run_id=RUN_ID, gather=g1,
+        on_step=db1.on_step,
+    )
+    db1.record_result(res1)
+    assert res1.paused and ex1 == ["work"]
+    conn1.close()
+
+    conn2 = connect(db_path)
+    store2 = LoopStore(conn2)
+    store2.resolve_decision(RUN_ID, "gate-1", "approve")
+    db2 = DBProgressLog(conn2, RUN_ID)
+    g2, a2, ex2 = make_world(actions)
+    res2 = run_gated_loop(
+        act=a2, verify=never_done, conditions=[MaxIterations(3)],
+        on=is_deploy, store=db2.store, run_id=RUN_ID, gather=g2,
+        on_step=db2.on_step, initial_state=db2.state,
+    )
+    assert res2.status == "stopped"
+    assert ex2 == ["deploy", "work2"]  # "work" を再実行しない (中断地点から継続)
+    conn2.close()
+
+
 def test_run_gated_loop_helper_wires_the_gate(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)

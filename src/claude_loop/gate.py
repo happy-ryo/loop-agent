@@ -321,13 +321,18 @@ def run_gated_loop(
     key: Optional[GateKeyFn] = None,
     active: bool = True,
     time_fn: Optional[Callable[[], float]] = None,
+    initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
     """:class:`HumanGate` を組んで :func:`~claude_loop.loop.run_loop` を回す入口。
 
     ``run_loop`` と同じ ``act`` / ``verify`` / ``conditions`` / ``gather`` /
-    ``on_step`` を取り、人間ゲートの構成 (``on`` / ``store`` / ``run_id`` /
-    ``resolver`` / ``key`` / ``active``) を足す。決定の永続化を併せたい場合は
-    ``on_step`` に :meth:`claude_loop.store.DBProgressLog.on_step` を渡せばよい。
+    ``on_step`` / ``initial_state`` を取り、人間ゲートの構成 (``on`` / ``store`` /
+    ``run_id`` / ``resolver`` / ``key`` / ``active``) を足す。決定の永続化を併せたい
+    場合は ``on_step`` に :meth:`claude_loop.store.DBProgressLog.on_step` を渡す。
+    pause した run を **中断地点から継続** して再開するには、その永続状態
+    (:attr:`~claude_loop.store.DBProgressLog.state` など) を ``initial_state`` に
+    渡す (省略すると iteration 0 からの replay resume になる。差は HumanGate の
+    docstring「resume の 2 モデル」を参照)。
     """
     gate = HumanGate(
         on=on,
@@ -347,6 +352,7 @@ def run_gated_loop(
         gather=gather,
         on_step=on_step,
         gate=gate,
+        initial_state=initial_state,
         **run_kwargs,
     )
 
