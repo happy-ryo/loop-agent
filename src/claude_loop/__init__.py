@@ -28,6 +28,7 @@ from .conditions import (
     TokenBudget,
 )
 from .loop import ActOutcome, LoopResult, VerifyOutcome, run_loop
+from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
 
 __all__ = [
@@ -43,6 +44,8 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
+    "ProgressLog",
+    "read_progress",
 ]
 
 __version__ = "0.0.1"

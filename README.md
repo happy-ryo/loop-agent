@@ -27,7 +27,9 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 
 - ✅ ループドライバ + 機械的な合成 stop 条件（発火した条件と理由を保持）
 - ✅ `act` / `verify` は**注入可能なフック**（PoC は in-memory スタブで駆動。LLM 実呼び出しは抽象境界のみ用意）
-- ⛔ 人間ゲート・state.db SoT・Reflexion は**非スコープ**（Phase 2/3）
+- ✅ **暴走防止の保証**: ゴール未達・無進捗・反復アクションでも、上限で必ず停止することを sandbox test で証明（`tests/test_runaway_guard.py`）
+- ✅ **最小状態（進捗ファイル）**: 各反復の記録を JSON Lines で外部ファイルに追記し、プロセスをまたいで進捗が残る（`ProgressLog` / state.db SoT の最小の前身）
+- ⛔ 人間ゲート・state.db SoT・Reflexion・NoProgress 高度検出は**非スコープ**（Phase 2/3）
 
 ### インストール
 
@@ -79,6 +81,23 @@ assert result.stop.name == "max_iterations"   # 発火した条件
 print(result.reason)                          # "reached max iterations (2/2)"
 ```
 
+### 最小状態（進捗ファイル）
+
+各反復の記録を JSON Lines で外部ファイルに追記する最小の永続状態。`ProgressLog.on_step`
+を `run_loop` の `on_step` に渡し、終了後に終了理由を 1 行追記するだけ。1 行 = 1 反復の完結した
+レコードなので、途中でクラッシュしても直前までの反復は読み戻せる（state.db SoT の最小の前身）。
+
+```python
+from claude_loop import run_loop, ProgressLog, read_progress
+
+progress = ProgressLog("progress.jsonl")
+result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)],
+                  on_step=progress.on_step)
+progress.record_result(result)               # 終了理由（"result" 行）を追記
+
+records = read_progress("progress.jsonl")     # 反復ごとの "step" 行 + 末尾 "result" 行
+```
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -88,6 +107,8 @@ print(result.reason)                          # "reached max iterations (2/2)"
 | `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
 | `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
 | `LoopResult` | `status` / `stop`(発火条件) / `reason` / `iterations` / `tokens_used` / `elapsed` / `history` |
+| `ProgressLog(path)` | 各反復を JSON Lines で追記する最小の永続状態。`on_step` を `run_loop` に渡し、`record_result(result)` で終了理由を追記 |
+| `read_progress(path)` | 進捗ファイルを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
@@ -111,7 +132,9 @@ python3 examples/verify_driven_demo.py
 ### テスト
 
 ```bash
-python3 -m pytest        # 29 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 / 検証駆動デモの実走 など
+python3 -m pytest        # 55 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 /
+                         # 暴走防止の証明（test_runaway_guard）/ 進捗ファイル（test_progress）/
+                         # 検証駆動デモの実走（test_verify_demo）
 ```
 
 ## レポートの要約
