@@ -196,18 +196,17 @@ def agreement(evaluator: Evaluator, held_out: HeldOut) -> float:
 
 @dataclass(frozen=True)
 class AdmissionResult:
-    """:func:`admit_evaluator` の結果: 採用された評価器と両者の一致度。"""
+    """:func:`admit_evaluator` の結果: 採用された評価器と両者の一致度。
+
+    ``promoted`` は **候補が実際に採用されたか** を表す明示フラグ。version 比較ではなく
+    採用判定そのものを持つので、候補と incumbent が (明示 version 指定や衝突で) 同 version
+    でも、却下されたなら ``False`` を正しく返す。
+    """
 
     chosen: Evaluator
     incumbent_agreement: float
     candidate_agreement: float
-
-    @property
-    def promoted(self) -> bool:
-        return self.chosen.version == self._candidate_version
-
-    # promoted の判定用に候補 version を保持 (chosen is candidate でも version で比較)。
-    _candidate_version: str = ""
+    promoted: bool = False
 
 
 def _probe_squared_error(evaluator: Evaluator, probe: Probe) -> float:
@@ -258,7 +257,7 @@ def admit_evaluator(
             chosen=incumbent,
             incumbent_agreement=inc_agree,
             candidate_agreement=cand_agree,
-            _candidate_version=candidate.version,
+            promoted=False,
         )
 
     # (1) 集約一致度の厳格改善 (anti-overfit のため measure 上で評価)。
@@ -282,7 +281,7 @@ def admit_evaluator(
         chosen=candidate,
         incumbent_agreement=inc_agree,
         candidate_agreement=cand_agree,
-        _candidate_version=candidate.version,
+        promoted=True,
     )
 
 

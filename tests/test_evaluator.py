@@ -223,3 +223,17 @@ def test_lambda_evaluators_distinguished_by_source_location():
 def test_explicit_version_is_preserved():
     e = Evaluator(score=lambda o: Score(ground_truth=0.0), name="x", version="v-pinned")
     assert e.version == "v-pinned"
+
+
+def test_promoted_flag_false_on_reject_even_with_shared_version():
+    """却下時 promoted は False (候補と incumbent が同 version でも version 比較に依らない)。"""
+    held = _held(
+        ("c1", 0.0, {"inc": 0.0}, 0, False),
+        ("c2", 0.3, {"inc": 0.3}, 0, False),
+    )
+    inc = Evaluator(score=lambda o: Score(ground_truth=o["inc"]), name="x", version="shared")
+    # 緩い候補 (却下されるべき) に incumbent と同じ明示 version を付ける。
+    lenient = Evaluator(score=lambda o: Score(ground_truth=1.0), name="x", version="shared")
+    res = admit_evaluator(inc, lenient, held, epsilon=0.02)
+    assert res.chosen is inc
+    assert res.promoted is False  # version 一致でも誤って promoted=True にしない

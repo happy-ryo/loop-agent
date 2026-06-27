@@ -471,6 +471,42 @@ def test_memory_unwired_control_shows_no_improvement():
     assert history[1] == pytest.approx(0.2)  # 改善しない (memory 未配線)
 
 
+def test_resume_rejects_mismatched_evaluator_version():
+    """外側 resume: 復元 evaluator_version と渡された評価器が食い違えば loud に弾く。"""
+    from claude_loop.reflexion import ReflexionState
+
+    seed = ReflexionState(episode=4, epoch=2, evaluator_version="some-promoted-version")
+    with pytest.raises(ValueError, match="resume"):
+        run_reflexion(
+            **_base_kwargs(
+                episode=lambda ctx: make_result(False),
+                evaluator=HONEST,  # version != "some-promoted-version"
+                convergence=[MaxEpisodes(6)],
+                held_out=held_out_matching(0.2, 0.8),
+                epoch_len=2,
+                initial_state=seed,
+            )
+        )
+
+
+def test_resume_accepts_matching_evaluator_version():
+    """復元 version と一致する評価器なら resume できる (継続する)。"""
+    from claude_loop.reflexion import ReflexionState
+
+    seed = ReflexionState(episode=2, epoch=1, evaluator_version=HONEST.version)
+    result = run_reflexion(
+        **_base_kwargs(
+            episode=lambda ctx: make_result(False),
+            evaluator=HONEST,
+            convergence=[MaxEpisodes(4)],
+            held_out=held_out_matching(0.2, 0.8),
+            epoch_len=2,
+            initial_state=seed,
+        )
+    )
+    assert result.state.episode == 4  # 復元 episode=2 から継続して 4 で停止
+
+
 def test_production_path_never_runs_held_out_probes():
     """dual-component: episode() は production task のみ受け取り probe を実行しない。"""
     seen_tasks = []
