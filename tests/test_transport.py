@@ -69,22 +69,26 @@ def test_push_primary_delivers_and_marks_delivered():
 
 
 def test_pull_fallback_when_backend_down():
-    """backend 不通 (NullPushBackend) でも、pull poll で配送が継続する。"""
+    """backend 不通 (NullPushBackend) でも、pull poll で配送が継続する (中核の成功条件)。"""
     clock = ManualClock()
-    t = Transport(InMemoryWakeQueue(), NullPushBackend(), time_fn=clock)
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
 
     routes = [t.deliver(_wake(i)) for i in range(3)]
     # push は全部失敗 -> 全件 queue 滞留。
     assert routes == ["queued", "queued", "queued"]
 
-    delivered = t.poll("coordinator")
-    assert [w.id for w in delivered] == [
-        "r1:loop_done:0",
-        "r1:loop_done:1",
-        "r1:loop_done:2",
-    ]
-    # 二度目の poll は何も返さない (at-most-once: 確定済みは再配達しない)。
-    assert t.poll("coordinator") == []
+    # 受信側は poll_and_handle で claim -> handle -> confirm。push が落ちていても届く。
+    seen: list[str] = []
+    handled = t.poll_and_handle("coordinator", lambda w: seen.append(w.id))
+    assert seen == ["r1:loop_done:0", "r1:loop_done:1", "r1:loop_done:2"]
+    assert [w.id for w in handled] == seen
+    assert all(queue.state_of(i) == DELIVERED for i in seen)
+
+    # 確定済みは lease を過ぎても再配達されない (at-most-once)。
+    clock.advance(100.0)
+    assert t.poll_and_handle("coordinator", lambda w: seen.append("DUP")) == []
+    assert "DUP" not in seen
 
 
 def test_pull_fallback_when_no_backend_configured():
@@ -129,6 +133,72 @@ def test_duplicate_enqueue_is_idempotent():
 
     delivered = t.poll("coordinator")
     assert len(delivered) == 1
+
+
+def test_poll_default_claims_without_confirming():
+    """poll の既定 (confirm=False) は claim のみ。確定しないので lease 失効で再配送される。"""
+    clock = ManualClock()
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
+    t.deliver(_wake(0))
+
+    claimed = t.poll("coordinator")  # 既定 = confirm しない
+    assert [w.id for w in claimed] == ["r1:loop_done:0"]
+    assert queue.state_of("r1:loop_done:0") == CLAIMED  # DELIVERED ではない
+
+    # confirm しないまま lease 失効 -> 再配送される (crash recovery)。
+    clock.advance(31.0)
+    assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
+
+
+def test_poll_confirm_true_marks_delivered():
+    """confirm=True を明示した poll は返す前に即確定する (単純ケース)。"""
+    clock = ManualClock()
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
+    t.deliver(_wake(0))
+
+    got = t.poll("coordinator", confirm=True)
+    assert [w.id for w in got] == ["r1:loop_done:0"]
+    assert queue.state_of("r1:loop_done:0") == DELIVERED
+    clock.advance(100.0)
+    assert t.poll("coordinator", confirm=True) == []  # 再配達されない
+
+
+def test_poll_and_handle_confirms_only_on_success():
+    """poll_and_handle は handler が成功した wake だけ confirm する。"""
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=ManualClock())
+    t.deliver(_wake(0))
+
+    handled = t.poll_and_handle("coordinator", lambda w: None)
+    assert [w.id for w in handled] == ["r1:loop_done:0"]
+    assert queue.state_of("r1:loop_done:0") == DELIVERED
+
+
+def test_poll_and_handle_redelivers_when_handler_crashes():
+    """handler が raise した wake は confirm されず、lease 失効後に再配送される (crash-safe)。"""
+    clock = ManualClock()
+    queue = InMemoryWakeQueue()
+    t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
+    t.deliver(_wake(0))
+
+    def boom(_w: Wake) -> None:
+        raise RuntimeError("handler failed mid-processing")
+
+    # handler の例外は握り潰さず伝播する。
+    with pytest.raises(RuntimeError):
+        t.poll_and_handle("coordinator", boom)
+    # 処理前に死んだ wake は未確定のまま (喪失していない)。
+    assert queue.state_of("r1:loop_done:0") == CLAIMED
+
+    # lease 失効後に再配送され、今度は成功 handler で確定できる。
+    clock.advance(31.0)
+    ok: list[str] = []
+    handled = t.poll_and_handle("coordinator", lambda w: ok.append(w.id))
+    assert ok == ["r1:loop_done:0"]
+    assert [w.id for w in handled] == ok
+    assert queue.state_of("r1:loop_done:0") == DELIVERED
 
 
 def test_claim_then_confirm_requires_explicit_confirm():

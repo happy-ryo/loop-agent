@@ -422,18 +422,26 @@ class Transport:
         *,
         owner: Optional[str] = None,
         limit: Optional[int] = None,
-        confirm: bool = True,
+        confirm: bool = False,
     ) -> list[Wake]:
-        """``recipient`` 宛の未配送 wake を pull で引き取る (claim-then-confirm)。
+        """``recipient`` 宛の未配送 wake を pull で claim する (claim-then-confirm の claim)。
 
-        ``UNDELIVERED`` な wake を lease 占有 (claim) して返す。``confirm=True`` (既定) なら
-        返す前に即 confirm して ``DELIVERED`` 化する (この呼び出しが受信側そのもので、戻り値の
-        受領 = 配送完了とみなせる単純なケース)。``confirm=False`` なら claim だけ行い、呼び出し側が
-        処理し切ってから :meth:`confirm_wakes` を呼ぶ責務を負う (処理中に死んだら lease 失効で
-        再配送される at-least-once 規律)。
+        ``UNDELIVERED`` な wake を lease 占有 (claim) して返す。**確定はしない** (既定
+        ``confirm=False``): 呼び出し側が wake を **処理し切ってから** :meth:`confirm_wakes` を
+        呼んで ``DELIVERED`` 化する責務を負う。処理中にクラッシュした (= confirm 前に死んだ) 場合は
+        lease 失効でその wake が再 eligible に戻り再配送される (at-least-once: idle-wake では
+        喪失 > 重複)。この claim-then-confirm が crash recovery の肝なので **既定は確定しない**。
+        確定漏れを避けたい一般ケースは :meth:`poll_and_handle` (handler 成功後に wake 単位で
+        confirm する crash-safe な受信ループ) を使うのが推奨。
 
-        ``owner`` は claim の所有者識別 (省略時は ``recipient``)。同一受信者が複数 worker で
-        並行 poll する場合に owner を変えると、三状態の owner fencing が二重確定を弾く。
+        ``confirm=True`` を明示すると、claim した wake を **返す前に即 confirm** する (戻り値の
+        受領 = 配送完了とみなせる、handler が決して失敗しない / プロセス内自己完結な単純ケース
+        専用)。この場合 poll が返った後に処理がクラッシュしても wake は既に ``DELIVERED`` で
+        再配送されない (= その経路だけ at-most-once で喪失しうる) ことに注意。
+
+        ``owner`` は claim の所有者識別 (省略時は ``recipient``)。同一受信者を複数 worker で
+        並行 poll する場合は worker ごとに **distinct な owner** を渡すこと。三状態の owner
+        fencing が「lease 失効後に別 worker が再 claim した wake への stale な confirm」を弾く。
         """
         own = owner if owner is not None else recipient
         now = self._time_fn()
@@ -445,11 +453,45 @@ class Transport:
                 self.queue.confirm(w.id, owner=own, now=now)
         return wakes
 
-    def confirm_wakes(self, wakes: Iterable[Wake], *, owner: str) -> int:
-        """claim 済み wake 群を確定する (``confirm=False`` で poll したときの確定 API)。
+    def poll_and_handle(
+        self,
+        recipient: str,
+        handler: Callable[[Wake], Any],
+        *,
+        owner: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[Wake]:
+        """claim -> handler(wake) -> confirm を wake 単位で行う crash-safe な受信ループ (推奨)。
 
-        確定できた (この owner が lease を保持していた) 件数を返す。lease 失効後に呼ぶと
-        owner/失効 fencing で弾かれ、その wake は再配送対象として queue に残る。
+        各 wake を claim し、``handler(wake)`` が **例外なく返ったものだけ** confirm して
+        ``DELIVERED`` 化する。これにより「受信したが処理前に死んだ」喪失窓が無い: handler が
+        raise した wake (および以降の未処理 wake) は confirm されず、lease 失効後に再配送される
+        (at-least-once。受信側は :attr:`Wake.id` で de-dup する idempotent handler 前提)。
+
+        正常に処理・確定できた wake の list を返す。``handler`` の例外は **握り潰さず伝播** する
+        (呼び出し側が失敗を観測できる。未確定 wake は再配送で拾われる)。confirm は handler 成功
+        *後* の現在時刻で行うので、handler が lease を超えて長引いた wake は fencing で弾かれ
+        (確定されず) 再配送に回る — 長い処理には十分大きい ``lease`` を設定すること。
+
+        ``owner`` / ``limit`` の意味は :meth:`poll` と同じ (省略時 owner=recipient)。
+        """
+        own = owner if owner is not None else recipient
+        claimed = self.queue.claim(
+            recipient, now=self._time_fn(), lease=self._lease, owner=own, limit=limit
+        )
+        handled: list[Wake] = []
+        for w in claimed:
+            handler(w)  # raise すれば未 confirm のまま伝播 -> lease 失効で再配送。
+            if self.queue.confirm(w.id, owner=own, now=self._time_fn()):
+                handled.append(w)
+        return handled
+
+    def confirm_wakes(self, wakes: Iterable[Wake], *, owner: str) -> int:
+        """claim 済み wake 群を確定する (:meth:`poll` を ``confirm=False`` で使ったときの確定 API)。
+
+        確定できた (この ``owner`` が lease を保持していた) 件数を返す。``owner`` は claim 時に
+        渡した値と同じものを渡すこと (省略時 owner=recipient で poll したなら recipient)。
+        lease 失効後に呼ぶと owner/失効 fencing で弾かれ、その wake は再配送対象として queue に残る。
         """
         now = self._time_fn()
         confirmed = 0

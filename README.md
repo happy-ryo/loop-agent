@@ -318,15 +318,23 @@ waker = LoopWaker(transport, run_id="r1", recipient="coordinator", next_recipien
 result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)])
 waker.record_result(result)          # 完了 wake（+ 次反復 wake）を配送 → push 失敗で queue 滞留
 
-# 受信側は役割 cadence で能動 poll（claim-then-confirm）。push が落ちていても届く。
-for wake in transport.poll("coordinator"):
-    handle(wake)                     # idempotent handler（id で de-dup）
+# 受信側は役割 cadence で能動 poll。push が落ちていても届く。poll_and_handle は
+# handler が成功した wake だけ confirm する crash-safe な受信ループ（処理前に死んだら
+# lease 失効で再配送 = at-least-once。受信側は wake.id で de-dup する idempotent handler）。
+transport.poll_and_handle("coordinator", lambda wake: handle(wake))
 ```
 
 `PushBackend` は `push(wake) -> bool` の best-effort 契約（確定配送のみ `True`、不通・例外は
 `False` 扱いで pull fallback に委ねる）。実 backend（renga / broker CLI 等）はこの Protocol を
 実装して注入する。`CallablePushBackend(fn)` は任意関数を、`NullPushBackend` は「常に push 失敗
 （= backend 不通）」を表す。
+
+受信は **claim-then-confirm** が既定: `poll(recipient)` は wake を claim するだけで確定しない
+（処理し切ってから `confirm_wakes(wakes, owner=…)`）。処理前にクラッシュした wake は lease 失効で
+再配送される（idle-wake では**喪失より重複**を選ぶ設計）。確定漏れを避けたい一般ケースは
+`poll_and_handle(recipient, handler)` が handler 成功後に wake 単位で confirm するので推奨。
+プロセス内自己完結で handler が決して失敗しない単純ケースのみ `poll(recipient, confirm=True)`
+で即確定できる（その経路は poll 後のクラッシュで喪失しうる at-most-once）。
 
 ### API 概要
 
@@ -354,7 +362,7 @@ for wake in transport.poll("coordinator"):
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True)` | `HumanGate` を組んで `run_loop` を回す入口 |
 | `Wake(id, kind, recipient, run_id=…, payload=…)` | 配送する 1 wake。`id` が at-most-once / de-dup の鍵。`kind` ∈ `loop_done`/`next_iteration`/`decision_request` |
-| `Transport(queue=…, backend=…, *, lease=30.0, time_fn=…)` | push 一次 / pull fallback のオーケストレータ。`deliver(wake)`（→ `"push"`/`"queued"`）/ `poll(recipient, *, owner=…, limit=…, confirm=True)` / `confirm_wakes(wakes, *, owner)` / `pending(recipient=…)` |
+| `Transport(queue=…, backend=…, *, lease=30.0, time_fn=…)` | push 一次 / pull fallback のオーケストレータ。`deliver(wake)`（→ `"push"`/`"queued"`）/ `poll(recipient, *, owner=…, limit=…, confirm=False)`（claim のみ）/ `poll_and_handle(recipient, handler, …)`（handler 成功後に確定 = crash-safe・推奨）/ `confirm_wakes(wakes, *, owner)` / `pending(recipient=…)` |
 | `InMemoryWakeQueue()` | 配送の正本（三状態 claim-then-confirm）。`WakeQueue` Protocol 実装。`enqueue`（冪等）/ `claim` / `confirm` / `release_expired` / `mark_delivered` / `pending` |
 | `PushBackend` / `CallablePushBackend(fn)` / `NullPushBackend()` | push（即応 accelerator）の口（`push(wake)->bool` best-effort）/ 任意関数アダプタ / 常に失敗（= backend 不通） |
 | `LoopWaker(transport, *, run_id, recipient, next_recipient=…)` | ループ wake を配送する drop-in。`record_result(result)` が完了/判断要求（+次反復）wake を deliver（observer 互換） |
