@@ -302,6 +302,59 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 - `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も
   書かれない（resume で続行できる）。各 step の正本は `step` 行に残るので監査はそこから行う。
 
+### wake 配送 transport（push 一次 / pull fallback / at-most-once）
+
+Phase 3（report.md §3.3 / §4.6 / §5 Phase3 / Issue #23）では、ループの **完了 / 次反復 /
+判断要求** の wake を別ループや窓口（受信側）へ届ける配送層を新設する。claude-org runtime の
+broker sidecar は runtime 所属で直接再利用できないため、**パターンだけ抽出**して claude-loop 側に
+**依存ゼロ（stdlib のみ）**で実装した。
+
+- **push 一次 / pull fallback**: push（即応 accelerator）が通れば即配送、通らなくても wake は
+  queue に残り受信側の**能動 poll（pull）で配送が継続**する。push は accelerator、pull poll が
+  正準配送路。→ **backend 不通でも配送は途切れない**（§5 Phase3 成功条件 b）。
+- **三状態 claim-then-confirm による at-most-once**: `UNDELIVERED → CLAIMED(lease, owner)
+  → DELIVERED`。claim で lease 占有して返し、受信側が処理し切ってから confirm で確定する。
+  confirm 前に lease 失効した行は再 eligible に戻る（受信側 crash でも配送継続 = at-least-once 側に
+  倒す。idle-wake では喪失 > 重複）。owner 一致 + lease 失効チェックの fencing が「届いていないのに
+  DELIVERED」喪失窓を塞ぐ（並行 poll は worker ごとに distinct な owner を渡す前提）。確定済みは
+  二度と再配達しない。in-memory queue は RLock でスレッド安全（並行 poll の二重 claim を防ぐ）。
+- **wake id で de-dup**: wake は決定的 id（`{run_id}:{kind}:{iteration}`）を持ち、二重 enqueue は
+  no-op。resume での再配送指示や push/pull の継ぎ目の二重配送を受信側が id で de-dup できる
+  （受信側は idempotent handler 前提）。
+- **role 別 cadence**: push が失効する pull 環境では「待機」を idle 待機ではなく**能動 poll** に
+  翻訳する。受信契機を役割別に非対称設計する（dispatcher 180s / worker 60s / secretary 0 =
+  ターン冒頭で毎回 poll）。`cadence_for(role)` / `due_to_poll(role, last_poll, now)`。
+
+```python
+from claude_loop import (
+    Transport, InMemoryWakeQueue, NullPushBackend, LoopWaker, run_loop, MaxIterations,
+)
+
+# backend 不通（push 一次なし）でも pull fallback で配送が継続する構成。
+transport = Transport(InMemoryWakeQueue(), NullPushBackend())
+waker = LoopWaker(transport, run_id="r1", recipient="coordinator", next_recipient="planner")
+
+result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)])
+waker.record_result(result)          # 完了 wake（+ 次反復 wake）を配送 → push 失敗で queue 滞留
+
+# 受信側は役割 cadence で能動 poll。push が落ちていても届く。poll_and_handle は
+# handler が成功した wake だけ confirm する crash-safe な受信ループ（処理前に死んだら
+# lease 失効で再配送 = at-least-once。受信側は wake.id で de-dup する idempotent handler）。
+transport.poll_and_handle("coordinator", lambda wake: handle(wake))
+```
+
+`PushBackend` は `push(wake) -> bool` の best-effort 契約（確定配送のみ `True`、不通・例外は
+`False` 扱いで pull fallback に委ねる）。実 backend（renga / broker CLI 等）はこの Protocol を
+実装して注入する。`CallablePushBackend(fn)` は任意関数を、`NullPushBackend` は「常に push 失敗
+（= backend 不通）」を表す。
+
+受信は **claim-then-confirm** が既定: `poll(recipient)` は wake を claim するだけで確定しない
+（処理し切ってから `confirm_wakes(wakes, owner=…)`）。処理前にクラッシュした wake は lease 失効で
+再配送される（idle-wake では**喪失より重複**を選ぶ設計）。確定漏れを避けたい一般ケースは
+`poll_and_handle(recipient, handler)` が handler 成功後に wake 単位で confirm するので推奨。
+プロセス内自己完結で handler が決して失敗しない単純ケースのみ `poll(recipient, confirm=True)`
+で即確定できる（その経路は poll 後のクラッシュで喪失しうる at-most-once）。
+
 ### work-discovery（次反復対象の入力選定・propose-only / 人間ゲート維持）
 
 Phase 3（report.md §3.5 / §4.6 / §5 Phase 3 成功条件 d）では、完了したループの「次に何を
@@ -364,6 +417,13 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す。`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume の in-progress リース調整用（#21） |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True, owner=…, lease_ttl=…, now_fn=…)` | `HumanGate` を組んで `run_loop` を回す入口（`owner` / `lease_ttl` / `now_fn` は複数プロセス同時 resume 用, #21） |
+| `Wake(id, kind, recipient, run_id=…, payload=…)` | 配送する 1 wake。`id` が at-most-once / de-dup の鍵。`kind` ∈ `loop_done`/`next_iteration`/`decision_request` |
+| `Transport(queue=…, backend=…, *, lease=30.0, time_fn=…)` | push 一次 / pull fallback のオーケストレータ。`deliver(wake)`（→ `"push"`/`"queued"`）/ `poll(recipient, *, owner=…, limit=…, confirm=False)`（claim のみ）/ `poll_and_handle(recipient, handler, …)`（handler 成功後に確定 = crash-safe・推奨）/ `confirm_wakes(wakes, *, owner)` / `pending(recipient=…)` |
+| `InMemoryWakeQueue()` | 配送の正本（三状態 claim-then-confirm）。`WakeQueue` Protocol 実装。`enqueue`（冪等）/ `claim` / `confirm` / `release_expired` / `mark_delivered` / `pending` |
+| `PushBackend` / `CallablePushBackend(fn)` / `NullPushBackend()` | push（即応 accelerator）の口（`push(wake)->bool` best-effort）/ 任意関数アダプタ / 常に失敗（= backend 不通） |
+| `LoopWaker(transport, *, run_id, recipient, next_recipient=…)` | ループ wake を配送する drop-in。`record_result(result)` が完了/判断要求（+次反復）wake を deliver（observer 互換） |
+| `wakes_for_result(result, *, run_id, recipient, next_recipient=…)` | `LoopResult` → 配送すべき `Wake` 群への純粋写像（副作用なし） |
+| `cadence_for(role)` / `due_to_poll(role, last_poll, now)` | role 別 poll cadence（dispatcher 180s / worker 60s / secretary 0）/ 能動 poll の要否判定 |
 | `Candidate(id, priority=0, effort=1, depends_on=(), summary="", payload=None)` | 次反復の仕事候補（全フィールド JSON ネイティブ）。`payload` が採択時に次ループ入力へ渡る値 |
 | `triage(candidates, *, done=())` | 計算層（read-only・決定的）。依存解決・ランキング・循環検出して `Triage(ready, blocked, recommended)` を返す |
 | `WorkDiscovery(store, run_id)` | 配達層。`propose(candidates, *, done=, cycle=)` で提案を人間ゲートに pending 登録（propose-only・冪等）/ `resolve(cycle, decision, payload=)` で採否記録（edit は ready 候補のみ）/ `adopted(cycle)` で採択結果 `AdoptionResult` を読む（resume をまたいで安定） |
@@ -399,6 +459,9 @@ python3 -m pytest        # 各上限の発火 / goal 達成での自然終了 / 
                          #   （test_events / test_observe / test_otel）/
                          # 状態 SoT: 永続化・transaction・クラッシュ耐性・スキーマ独立性
                          #   （test_store）/
+                         # wake 配送: backend 不通でも pull fallback で配送継続・at-most-once・
+                         #   lease 失効再配送・owner fencing・並行 poll 安全・role 別 cadence
+                         #   （test_transport / test_waker）/
                          # work-discovery: triage の決定性・依存解決・循環検出 /
                          #   propose-only 人間ゲート・採択写像・完了→次反復の full cycle
                          #   （test_discovery）
