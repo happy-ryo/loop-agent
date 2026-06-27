@@ -284,6 +284,50 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 - `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も
   書かれない（resume で続行できる）。各 step の正本は `step` 行に残るので監査はそこから行う。
 
+### wake 配送 transport（push 一次 / pull fallback / at-most-once）
+
+Phase 3（report.md §3.3 / §4.6 / §5 Phase3 / Issue #23）では、ループの **完了 / 次反復 /
+判断要求** の wake を別ループや窓口（受信側）へ届ける配送層を新設する。claude-org runtime の
+broker sidecar は runtime 所属で直接再利用できないため、**パターンだけ抽出**して claude-loop 側に
+**依存ゼロ（stdlib のみ）**で実装した。
+
+- **push 一次 / pull fallback**: push（即応 accelerator）が通れば即配送、通らなくても wake は
+  queue に残り受信側の**能動 poll（pull）で配送が継続**する。push は accelerator、pull poll が
+  正準配送路。→ **backend 不通でも配送は途切れない**（§5 Phase3 成功条件 b）。
+- **三状態 claim-then-confirm による at-most-once**: `UNDELIVERED → CLAIMED(lease, owner, epoch)
+  → DELIVERED`。claim で lease 占有して返し、受信側が処理し切ってから confirm で確定する。
+  confirm 前に lease 失効した行は再 eligible に戻る（受信側 crash でも配送継続 = at-least-once 側に
+  倒す。idle-wake では喪失 > 重複）。owner + epoch fencing が「届いていないのに DELIVERED」喪失窓を
+  塞ぐ。確定済みは二度と再配達しない。
+- **wake id で de-dup**: wake は決定的 id（`{run_id}:{kind}:{iteration}`）を持ち、二重 enqueue は
+  no-op。resume での再配送指示や push/pull の継ぎ目の二重配送を受信側が id で de-dup できる
+  （受信側は idempotent handler 前提）。
+- **role 別 cadence**: push が失効する pull 環境では「待機」を idle 待機ではなく**能動 poll** に
+  翻訳する。受信契機を役割別に非対称設計する（dispatcher 180s / worker 60s / secretary 0 =
+  ターン冒頭で毎回 poll）。`cadence_for(role)` / `due_to_poll(role, last_poll, now)`。
+
+```python
+from claude_loop import (
+    Transport, InMemoryWakeQueue, NullPushBackend, LoopWaker, run_loop, MaxIterations,
+)
+
+# backend 不通（push 一次なし）でも pull fallback で配送が継続する構成。
+transport = Transport(InMemoryWakeQueue(), NullPushBackend())
+waker = LoopWaker(transport, run_id="r1", recipient="coordinator", next_recipient="planner")
+
+result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)])
+waker.record_result(result)          # 完了 wake（+ 次反復 wake）を配送 → push 失敗で queue 滞留
+
+# 受信側は役割 cadence で能動 poll（claim-then-confirm）。push が落ちていても届く。
+for wake in transport.poll("coordinator"):
+    handle(wake)                     # idempotent handler（id で de-dup）
+```
+
+`PushBackend` は `push(wake) -> bool` の best-effort 契約（確定配送のみ `True`、不通・例外は
+`False` 扱いで pull fallback に委ねる）。実 backend（renga / broker CLI 等）はこの Protocol を
+実装して注入する。`CallablePushBackend(fn)` は任意関数を、`NullPushBackend` は「常に push 失敗
+（= backend 不通）」を表す。
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -309,6 +353,13 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 | `HumanGate(*, on, store, run_id, resolver=…, key=…, active=True)` | 不可逆操作のみ interrupt する人間ゲート（`ActionGate` 実装）。`review(context, state)` を `run_loop(gate=…)` に渡す |
 | `Decision(kind, payload=…)` | 人間の決定（`kind` ∈ `approve`/`edit`/`reject`/`respond`）。`resolver` の返り値 |
 | `run_gated_loop(*, act, verify, conditions, on, store, run_id, gather=…, on_step=…, resolver=…, key=…, active=True)` | `HumanGate` を組んで `run_loop` を回す入口 |
+| `Wake(id, kind, recipient, run_id=…, payload=…)` | 配送する 1 wake。`id` が at-most-once / de-dup の鍵。`kind` ∈ `loop_done`/`next_iteration`/`decision_request` |
+| `Transport(queue=…, backend=…, *, lease=30.0, time_fn=…)` | push 一次 / pull fallback のオーケストレータ。`deliver(wake)`（→ `"push"`/`"queued"`）/ `poll(recipient, *, owner=…, limit=…, confirm=True)` / `confirm_wakes(wakes, *, owner)` / `pending(recipient=…)` |
+| `InMemoryWakeQueue()` | 配送の正本（三状態 claim-then-confirm）。`WakeQueue` Protocol 実装。`enqueue`（冪等）/ `claim` / `confirm` / `release_expired` / `mark_delivered` / `pending` |
+| `PushBackend` / `CallablePushBackend(fn)` / `NullPushBackend()` | push（即応 accelerator）の口（`push(wake)->bool` best-effort）/ 任意関数アダプタ / 常に失敗（= backend 不通） |
+| `LoopWaker(transport, *, run_id, recipient, next_recipient=…)` | ループ wake を配送する drop-in。`record_result(result)` が完了/判断要求（+次反復）wake を deliver（observer 互換） |
+| `wakes_for_result(result, *, run_id, recipient, next_recipient=…)` | `LoopResult` → 配送すべき `Wake` 群への純粋写像（副作用なし） |
+| `cadence_for(role)` / `due_to_poll(role, last_poll, now)` | role 別 poll cadence（dispatcher 180s / worker 60s / secretary 0）/ 能動 poll の要否判定 |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
@@ -338,7 +389,10 @@ python3 -m pytest        # 各上限の発火 / goal 達成での自然終了 / 
                          # 観測: 全終了理由が event に残る・メトリクスが追える・OTel span
                          #   （test_events / test_observe / test_otel）/
                          # 状態 SoT: 永続化・transaction・クラッシュ耐性・スキーマ独立性
-                         #   （test_store）
+                         #   （test_store）/
+                         # wake 配送: backend 不通でも pull fallback で配送継続・at-most-once・
+                         #   lease 失効再配送・owner fencing・role 別 cadence
+                         #   （test_transport / test_waker）
 ```
 
 ## レポートの要約

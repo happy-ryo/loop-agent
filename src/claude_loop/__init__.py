@@ -48,6 +48,24 @@ from .otel import LoopSpan, otel_available
 from .progress import ProgressLog, read_progress
 from .state import LoopState, StepRecord
 from .store import DBProgressLog, DECISION_KINDS, LoopStore, connect
+from .transport import (
+    CADENCE_SECONDS,
+    CallablePushBackend,
+    DEFAULT_CADENCE_SECONDS,
+    InMemoryWakeQueue,
+    NullPushBackend,
+    PushBackend,
+    Transport,
+    WAKE_DECISION_REQUEST,
+    WAKE_KINDS,
+    WAKE_LOOP_DONE,
+    WAKE_NEXT_ITERATION,
+    Wake,
+    WakeQueue,
+    cadence_for,
+    due_to_poll,
+)
+from .waker import LoopWaker, wake_id_for, wakes_for_result
 
 __all__ = [
     "run_loop",
@@ -92,6 +110,25 @@ __all__ = [
     "HumanGate",
     "Decision",
     "run_gated_loop",
+    # wake 配送 transport (report.md S3.3 / S4.6 / S5 Phase3; Issue #23)
+    "Wake",
+    "WAKE_LOOP_DONE",
+    "WAKE_NEXT_ITERATION",
+    "WAKE_DECISION_REQUEST",
+    "WAKE_KINDS",
+    "PushBackend",
+    "CallablePushBackend",
+    "NullPushBackend",
+    "WakeQueue",
+    "InMemoryWakeQueue",
+    "Transport",
+    "CADENCE_SECONDS",
+    "DEFAULT_CADENCE_SECONDS",
+    "cadence_for",
+    "due_to_poll",
+    "LoopWaker",
+    "wakes_for_result",
+    "wake_id_for",
 ]
 
 __version__ = "0.0.1"
