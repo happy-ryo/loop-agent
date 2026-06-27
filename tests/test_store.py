@@ -223,22 +223,42 @@ def test_records_are_durable_after_each_step_not_only_at_the_end(tmp_path):
     assert seen_counts == [1, 2, 3, 4]
 
 
-def test_record_step_is_idempotent_on_run_and_iteration(tmp_path):
-    # 同一反復の再永続化 (resume #14) は重複行ではなく上書きになる。
+def test_record_step_overwrites_row_on_same_iteration(tmp_path):
+    # 同一反復を別結果で再永続化すると、重複行ではなく上書きになる。
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
-    rec = StepRecord(iteration=0, observation="a", tokens=5, goal_met=False)
     st = LoopState(iteration=1, tokens_used=5)
-    store.record_step("r1", rec, st)
-    rec2 = StepRecord(iteration=0, observation="b", tokens=7, goal_met=True)
-    store.record_step("r1", rec2, st)
+    store.record_step(
+        "r1", StepRecord(iteration=0, observation="a", tokens=5, goal_met=False), st
+    )
+    store.record_step(
+        "r1", StepRecord(iteration=0, observation="b", tokens=7, goal_met=True), st
+    )
 
     steps = store.read_steps("r1")
     assert len(steps) == 1
     assert steps[0]["observation"] == "b"
     assert steps[0]["tokens"] == 7
     assert steps[0]["goal_met"] is True
-    # 再永続化では loop_step event を重ねない (journal が step SoT と 1:1)。
+    # 内容が変わった再永続化は新しい内容の event を 1 件追記し、最新 event が
+    # 現在の step 行と矛盾しない (event[-1] == 現在値)。
+    step_events = [e for e in store.read_events("r1") if e["kind"] == EVENT_STEP]
+    assert len(step_events) == 2
+    assert step_events[-1]["payload"]["tokens"] == 7
+    assert step_events[-1]["payload"]["goal_met"] is True
+
+
+def test_record_step_identical_replay_does_not_duplicate_event(tmp_path):
+    # まったく同じ内容での再永続化 (純粋な resume replay) は step 行も event も
+    # 重ねない (append-only journal が同一内容でノイズを増やさない)。
+    store = LoopStore(connect(tmp_path / "state.db"))
+    store.load_or_init("r1")
+    rec = StepRecord(iteration=0, observation={"k": 1}, tokens=5, goal_met=False)
+    st = LoopState(iteration=1, tokens_used=5, elapsed=0.5)
+    store.record_step("r1", rec, st)
+    store.record_step("r1", rec, st)  # 同一内容で replay
+
+    assert len(store.read_steps("r1")) == 1
     step_events = [e for e in store.read_events("r1") if e["kind"] == EVENT_STEP]
     assert len(step_events) == 1
 
@@ -505,3 +525,19 @@ def test_dbprogresslog_borrows_connection_and_keeps_it_open(tmp_path):
     assert db._owns_conn is False
     db.close()  # 借用接続は閉じない
     assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_loopstore_initializes_a_bare_sqlite_connection(tmp_path):
+    # connect() を介さず素の sqlite3.connect() で開いた借用接続を渡しても、
+    # LoopStore が防御的にスキーマ + PRAGMA + row_factory を適用して動く
+    # ("no such table: run" にならない / 行が列名アクセスできる)。
+    bare = sqlite3.connect(str(tmp_path / "state.db"))
+    store = LoopStore(bare)
+    store.load_or_init("r1")
+    assert store.get_run("r1")["status"] == "running"  # Row 化されている
+
+
+def test_dbprogresslog_accepts_a_bare_sqlite_connection(tmp_path):
+    bare = sqlite3.connect(str(tmp_path / "state.db"))
+    db = DBProgressLog(bare, "r1")
+    assert db.store.get_run("r1") is not None

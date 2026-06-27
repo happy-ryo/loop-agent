@@ -176,7 +176,7 @@ python3 examples/verify_driven_demo.py
 ### テスト
 
 ```bash
-python3 -m pytest        # 81 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 /
+python3 -m pytest        # 86 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 /
                          # 暴走防止の証明（test_runaway_guard）/ 進捗ファイル（test_progress）/
                          # 検証駆動デモの実走（test_verify_demo）/ 状態 SoT の永続化・
                          # transaction・クラッシュ耐性・スキーマ独立性（test_store）

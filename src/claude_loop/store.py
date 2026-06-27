@@ -112,18 +112,30 @@ DbSource = Union[str, "os.PathLike[str]", sqlite3.Connection]
 def connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
     """loop 用 state DB を開き (無ければ作り)、スキーマを適用して返す。
 
-    ``path`` には通常のファイルパスか ``":memory:"`` を渡す。接続には以下を設定する:
+    ``path`` には通常のファイルパスか ``":memory:"`` を渡す。詳細は
+    :func:`_init_connection` 参照 (スキーマ適用 + PRAGMA + row_factory)。
+    """
+    return _init_connection(sqlite3.connect(str(path)))
+
+
+def _init_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """接続にスキーマと PRAGMA を適用して返す (冪等)。
+
+    :func:`connect` と :class:`LoopStore` の両方から呼ばれる。後者は素の
+    ``sqlite3.connect()`` で開いた借用接続を渡されても動くよう **防御的に** これを
+    呼ぶ (org の StateWriter と同じ方針)。``IF NOT EXISTS`` のスキーマと冪等な PRAGMA
+    なので、初期化済みの接続に再適用しても安全。
 
     - ``isolation_level = None`` (autocommit): トランザクションは
       :meth:`LoopStore.transaction` の明示的な ``BEGIN`` / ``COMMIT`` で完全制御する
       (sqlite3 既定の暗黙トランザクションに依存しない StateWriter 風の制御)。
+    - ``row_factory = sqlite3.Row``: 読み出しを列名アクセスにする。
     - ``foreign_keys = ON``: ``run`` 削除時に子行を CASCADE するため必須。
     - ``busy_timeout``: 並行アクセス時のロック待ち。
     - ``journal_mode = WAL``: writer と reader が衝突しにくくなる (file DB のみ有効。
       ``:memory:`` では無視される)。
-    - ``row_factory = sqlite3.Row``: 読み出しを列名アクセスにする。
     """
-    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.isolation_level = None
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -173,12 +185,15 @@ def _encode_observation(observation: Any) -> str:
 class LoopStore:
     """接続に束ねた loop 状態の writer/reader。StateWriter 風の明示的 transaction。
 
-    ``conn`` は :func:`connect` が返した接続を渡すのが前提 (PRAGMA が設定済み)。
-    すべての書き込みは :meth:`transaction` 配下で atomic に行う。
+    ``conn`` は :func:`connect` が返した接続でも、素の ``sqlite3.connect()`` で開いた
+    借用接続でもよい。後者でも動くよう、生成時に :func:`_init_connection` を防御的に
+    呼んでスキーマ + PRAGMA + row_factory を (冪等に) 適用する (org の StateWriter と
+    同じ方針)。すべての書き込みは :meth:`transaction` 配下で atomic に行う。
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        _init_connection(conn)
 
     # -- transaction 制御 ----------------------------------------------------
 
@@ -325,16 +340,30 @@ class LoopStore:
         event の追記」を束ねる。``UNIQUE(run_id, iteration)`` 衝突時は ``DO UPDATE``
         で上書きするので、同一反復の再実行 (resume #14) に冪等。
 
-        ``loop_step`` event は **新規 insert のときだけ** 追記する。同一反復の再永続化
-        (resume) では step 行を上書きするが event は重ねない。これにより append-only
-        な journal が step SoT と 1:1 で整合し続ける (再構成/監査する consumer が同一
-        反復の loop_step を複数見ることがない)。
+        ``loop_step`` event は **新規 insert か、再永続化で内容が変わったときだけ**
+        追記する。同一反復をまったく同じ内容で再永続化する純粋な replay (resume) では
+        step 行も event も実質変わらないので event を重ねない。一方、同一反復を*別の
+        結果*で書き直した場合は、その新しい内容を持つ event を 1 件追記する。これにより
+        append-only な journal は「同一内容の replay でノイズを増やさず」「最新 event が
+        step SoT と矛盾しない (最後の event = 現在の step 行)」の両方を満たす。
         """
+        obs_json = _encode_observation(record.observation)
+        goal_int = int(bool(record.goal_met))
         with self.transaction():
-            is_new = self.conn.execute(
-                "SELECT 1 FROM step WHERE run_id = ? AND iteration = ?",
+            existing = self.conn.execute(
+                "SELECT tokens, tokens_used, elapsed, goal_met, detail, "
+                "observation FROM step WHERE run_id = ? AND iteration = ?",
                 (run_id, record.iteration),
-            ).fetchone() is None
+            ).fetchone()
+            # 新規、または既存と内容が 1 つでも異なるなら event を追記する。
+            changed = existing is None or (
+                existing["tokens"] != record.tokens
+                or existing["tokens_used"] != state.tokens_used
+                or existing["elapsed"] != state.elapsed
+                or existing["goal_met"] != goal_int
+                or existing["detail"] != record.detail
+                or existing["observation"] != obs_json
+            )
             self.conn.execute(
                 "INSERT INTO step "
                 "(run_id, iteration, tokens, tokens_used, elapsed, goal_met, "
@@ -353,13 +382,13 @@ class LoopStore:
                     record.tokens,
                     state.tokens_used,
                     state.elapsed,
-                    int(bool(record.goal_met)),
+                    goal_int,
                     record.detail,
-                    _encode_observation(record.observation),
+                    obs_json,
                 ),
             )
             self._bump_run(run_id, state)
-            if is_new:
+            if changed:
                 self._append_event(
                     run_id,
                     EVENT_STEP,
