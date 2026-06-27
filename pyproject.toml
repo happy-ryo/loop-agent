@@ -10,8 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+# OTel GenAI span 連携は optional 依存（report.md S4.5）。未導入環境では
+# claude_loop.otel.LoopSpan が no-op へ degrade し、JSONL/event sink は動き続ける。
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+otel = ["opentelemetry-api>=1.20"]
+# dev では SDK も入れ、in-memory exporter で OTel span の中身まで CI で検証する。
+dev = ["pytest>=7", "opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_loop"]
