@@ -273,6 +273,27 @@ def test_custom_gate_bare_proceed_keeps_gathered_context(tmp_path):
     assert seen == ["ctx@0", "ctx@1"]  # None ではなく gather した context
 
 
+def test_unknown_gate_disposition_fails_closed(tmp_path):
+    # 不正な disposition (typo 等) は proceed へ fall-through せず loud に弾く
+    # (= 不可逆 action を誤って実行しない fail-closed)。
+    executed = []
+
+    class BadGate:
+        def review(self, context, state):
+            return GateReview(disposition="paused")  # GATE_PAUSE の typo
+
+    def act(action):
+        executed.append(action)
+        return ActOutcome(observation=action, tokens=0)
+
+    with pytest.raises(ValueError, match="unknown disposition"):
+        run_loop(
+            act=act, verify=never_done, conditions=[MaxIterations(2)],
+            gather=lambda s: "x", gate=BadGate(),
+        )
+    assert executed == []  # action は実行されない
+
+
 def test_synchronous_resolver_resolves_inline(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)

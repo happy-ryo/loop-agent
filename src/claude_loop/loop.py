@@ -310,6 +310,15 @@ def run_loop(
                 if on_step is not None and review.persist:
                     on_step(record, state)
                 continue
+            if review.disposition != GATE_PROCEED:
+                # Fail closed: an unrecognised disposition (e.g. a typo'd
+                # "paused") must NOT silently fall through to executing the
+                # action -- for a safety gate that could run an irreversible
+                # side effect instead of pausing. Reject loudly instead.
+                raise ValueError(
+                    f"gate returned unknown disposition {review.disposition!r}; "
+                    f"expected one of {GATE_PROCEED!r}/{GATE_SKIP!r}/{GATE_PAUSE!r}"
+                )
             # GATE_PROCEED: execute the (possibly edited) action. An unset
             # context keeps the gathered action; only an explicit value (an
             # edit) replaces it -- so a bare proceed never passes None to act.
