@@ -15,6 +15,7 @@
 | [`report.md`](./report.md) | 調査・設計レポート（**Single Source of Truth**, Markdown） |
 | [`report.html`](./report.html) | 同内容の閲覧用単一 HTML（CSS インライン・ブラウザで直接開ける） |
 | [`src/claude_loop/`](./src/claude_loop) | PoC ループコア（ループドライバ + 合成可能 stop 条件） |
+| [`examples/verify_driven_demo.py`](./examples/verify_driven_demo.py) | 検証駆動デモ（sandbox テストが green になるまで回す実走デモ） |
 
 `report.html` はブラウザで直接開けます（外部 CSS/JS 依存なし）。内容の正本は `report.md` です。
 
@@ -93,10 +94,24 @@ print(result.reason)                          # "reached max iterations (2/2)"
 - `gather` を省略すると `LoopState` がそのまま `act` の context になる。`on_step(record, state)` は各反復完了後に呼ばれる最小の観測フック。
 - stop 条件を 1 つも渡さないと `ValueError`（無限ループ防止 = R3）。
 
+### 検証駆動デモ（sandbox テストが green になるまで回す）
+
+ループコアを **実コード** に当てた具体デモ。一時 sandbox にわざと壊した関数とその pytest を書き出し、`act`（修正候補を当てる）→ `verify`（**実際の pytest の exit-code** を ground truth に判定）を **テストが green になるまで** 反復する。`goal_met=True`（exit-code 0）でループは**自然終了**し、直らないシナリオでも `MaxIterations` 等の上限で必ず止まる（暴走防止）。LLM judge には頼らない（report.md R1）。
+
+```bash
+python3 examples/verify_driven_demo.py
+# iter 0: applied candidate #0 -> verify=red   (red (exit=1))
+# iter 1: applied candidate #1 -> verify=red   (red (exit=1))
+# iter 2: applied candidate #2 -> verify=GREEN (green)
+# status: goal_met / iterations: 3 / exit-codes: [1, 1, 0]
+```
+
+再利用フックは `claude_loop.demo`（`CandidateApplier` = act / `ExitCodeVerifier` = verify / `attempt_index` = gather）。この実走そのものを `tests/test_verify_demo.py` が pytest で再現・検証する（出荷物 == 検証対象）。
+
 ### テスト
 
 ```bash
-python3 -m pytest        # 21 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 など
+python3 -m pytest        # 29 tests: 各上限の発火 / goal 達成での自然終了 / 終了理由の判別 / 検証駆動デモの実走 など
 ```
 
 ## レポートの要約
