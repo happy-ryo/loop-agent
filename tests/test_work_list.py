@@ -26,6 +26,7 @@ from loop_agent import (
     run_loop,
 )
 from loop_agent.discovery.work_list import ScheduleContext
+from loop_agent.loop import GATE_PROCEED, GATE_SKIP, GateReview
 from loop_agent.state import LoopState, StepRecord
 
 from conftest import never_done
@@ -54,8 +55,12 @@ def scripted_act(dispatched: list[str], completes: dict[str, int]):
 
 
 def done_from_observation(_item: WorkItem, record: StepRecord) -> bool:
-    """``scripted_act`` が焼いた done フラグを読む done 判定フック。"""
-    return bool(record.observation["done"])
+    """``scripted_act`` が焼いた done フラグを読む done 判定フック。
+
+    gate SKIP 行など ``done`` キーを持たない observation には ``False`` (未完了扱い)。
+    """
+    obs = record.observation
+    return bool(isinstance(obs, dict) and obs.get("done"))
 
 
 def history_of(*ids_done: tuple[str, bool]) -> LoopState:
@@ -380,6 +385,70 @@ def test_from_triage_orders_by_ranking_and_excludes_blocked():
     # priority / payload を引き継ぐ。
     assert g.items[0].priority == 9
     assert g.items[0].payload == {"seed": 1}
+
+
+def test_count_attempt_excludes_gate_skips_from_exhaustion():
+    # gate が item の action を SKIP すると run_loop は act せず StepRecord を積む。
+    # 既定ではそれも 1 試行として数えてしまい、走ってもいない item が per-item 上限で
+    # exhausted になりうる (#56 codex review)。count_attempt で非実行行を除外して防ぐ。
+
+    class SkipFirstTwo:
+        """最初の 2 回は SKIP、以降は PROCEED する gate (skip 行に印を付ける)。"""
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        def review(self, context, state):
+            self.n += 1
+            if self.n <= 2:
+                return GateReview(
+                    disposition=GATE_SKIP, observation={"skipped": True}
+                )
+            return GateReview(disposition=GATE_PROCEED)
+
+    is_real_attempt = lambda rec: not (
+        isinstance(rec.observation, dict) and rec.observation.get("skipped")
+    )
+
+    # 単一 item, cap=2。skip を試行に数えると 2 回の skip で即 exhausted (act 0 回) になる。
+    g = WorkListGather(
+        ["a"],
+        max_attempts_per_item=2,
+        done_when=done_from_observation,
+        count_attempt=is_real_attempt,
+    )
+    dispatched: list[str] = []
+    result = run_loop(
+        act=scripted_act(dispatched, {"a": 1}),  # 実際に act すれば 1 回で done
+        verify=never_done,
+        gather=g,
+        gate=SkipFirstTwo(),
+        conditions=[WorkListDrained(g), MaxIterations(20)],
+    )
+    # skip は試行に数えないので a は exhausted されず、PROCEED 後に実 act して done になる。
+    rep = g.report(result.state)
+    assert rep.done == ("a",)
+    assert rep.exhausted == ()
+    assert dispatched == ["a"]  # 実 act は 1 回だけ (skip 2 回は act を呼ばない)
+
+
+def test_skips_counted_as_attempts_by_default():
+    # 対照: count_attempt を渡さなければ skip 行も 1 試行として数える (既定挙動)。
+    class AlwaysSkip:
+        def review(self, context, state):
+            return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
+
+    g = WorkListGather(["a"], max_attempts_per_item=2, done_when=done_from_observation)
+    result = run_loop(
+        act=scripted_act([], {}),
+        verify=never_done,
+        gather=g,
+        gate=AlwaysSkip(),
+        conditions=[WorkListDrained(g), MaxIterations(20)],
+    )
+    # skip 2 回で a が exhausted (act は 0 回)。既定の数え方を明示。
+    assert g.exhausted_items(result.state) == {"a"}
+    assert g.attempts(result.state) == {"a": 2}
 
 
 def test_schedule_context_is_exported_from_facades():
