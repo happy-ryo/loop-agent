@@ -1,16 +1,19 @@
 """外部エージェント実行系を loop-agent の ``act`` フックに繋ぐアダプタ群。
 
-現状は Claude Code (headless ``claude --print``) を 1 行で ``run_loop`` に
-差し込む :class:`ClaudeCodeAct` と、subprocess を使わないテスト用
-:class:`MockClaudeCodeAct` を提供する。いずれも ``ActHook``
+Claude Code (headless ``claude --print``) を 1 行で ``run_loop`` に差し込む
+:class:`ClaudeCodeAct` と、Codex CLI (headless ``codex exec``) を同様に差し込む
+:class:`CodexAct`、および subprocess を使わないテスト用
+:class:`MockClaudeCodeAct` / :class:`MockCodexAct` を提供する。いずれも ``ActHook``
 (``Callable[[context], ActOutcome]``) として使える。
 
 使い方::
 
     from loop_agent import run_loop, MaxIterations, TokenBudget
-    from loop_agent.adapters import ClaudeCodeAct
+    from loop_agent.adapters import ClaudeCodeAct, CodexAct
 
     act = ClaudeCodeAct(allowed_tools=["Read", "Edit"], timeout=600)
+    # または Codex 経由:
+    act = CodexAct(model="gpt-5.5", effort="medium", timeout=600)
     result = run_loop(
         act=act,
         verify=my_verify,
@@ -28,11 +31,19 @@ from .claude_code import (
     parse_tokens,
     render_prompt,
 )
+from .codex import (
+    CodexAct,
+    CodexResult,
+    MockCodexAct,
+)
 
 __all__ = [
     "ClaudeCodeAct",
     "ClaudeCodeResult",
     "MockClaudeCodeAct",
+    "CodexAct",
+    "CodexResult",
+    "MockCodexAct",
     "parse_tokens",
     "render_prompt",
 ]

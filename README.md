@@ -770,6 +770,64 @@ act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 
 非スコープ: TUI モード / stream-json の深い統合 / Plan mode 連携。
 
+### Codex 経由でループを回す（headless adapter）
+
+`loop_agent.adapters.CodexAct` は `ClaudeCodeAct` と**完全同型**の `act` フックで、反復ごとに **headless の `codex exec` を subprocess で 1 回起動**する。差分は subprocess コマンド・フラグ・token/output 解析のみ。これにより同じ `run_loop` に Claude / Codex のどちらでも 1 行で差し替えられる（report.md S4.4 の act シーム / Issue #49）。
+
+```python
+from loop_agent import run_loop, MaxIterations, TokenBudget, VerifyOutcome
+from loop_agent.adapters import CodexAct
+
+act = CodexAct(
+    model="gpt-5.5",        # -m（ChatGPT アカウント運用では gpt-5.5 系を明示）
+    effort="medium",        # -c model_reasoning_effort=<effort>
+    timeout=600,            # 超過は failed=True で graceful（例外を投げない）
+    # sandbox="workspace-write",  # 省略可（-s。None で codex 既定）
+    # env=None なら os.environ を継承 → 既存 codex セッション + OPENAI_API_KEY が効く
+)
+
+def verify(outcome):
+    # 応答は ActOutcome.observation（CodexResult）に構造化される。
+    # .failed / .text / .tokens / .returncode / .error を見て判定できる。
+    res = outcome.observation
+    return VerifyOutcome(goal_met=(not res.failed) and "DONE" in res.text)
+
+result = run_loop(
+    act=act,
+    verify=verify,
+    gather=lambda state: {"prompt": f"次の修正を 1 つ書け（試行 {state.iteration}）"},
+    conditions=[MaxIterations(10), TokenBudget(200_000)],
+)
+```
+
+設計上の約束は `ClaudeCodeAct` と同一（例外でループを殺さない / token を予算に積む / auth は CLI に委譲 / `prompt_template` 埋め込み）。Codex 固有の差分は次の 3 点:
+
+- **token 種別の意味**: Codex/OpenAI の `usage` は `cached_input_tokens` が `input_tokens` の、`reasoning_output_tokens` が `output_tokens` の**部分集合**。そのため総処理量は `input_tokens + output_tokens` のみで取り、二重計上を避ける（`--json` の `turn.completed` を解析、無ければ正規表現フォールバック）。
+- **応答本文**: 単一フィールドではなく `--json` の JSONL イベント列に乗るため、最後の `agent_message`（`item.completed`）の `text` を本文として採る。
+- **stdin 固定**: codex は stdin が pipe だと追加入力を読みに行くため、子の stdin は `DEVNULL` に固定する（プロンプトは `--` 後の位置引数で確定済み）。`--skip-git-repo-check` を既定 on にし、git リポジトリ外でも起動失敗しない。
+
+subprocess を使わないテスト/デモには `MockCodexAct(responses=[...])` を使う（`ClaudeCodeAct` 版と同じ契約。各要素は `str` / `dict` / `CodexResult`）。実装は `src/loop_agent/adapters/codex.py`、検証は `tests/test_adapters_codex.py`。
+
+```python
+from loop_agent.adapters import MockCodexAct
+act = MockCodexAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
+```
+
+非スコープ: TUI モード（Issue #34）/ stream-json の深い統合。
+
+#### adapter API 概要
+
+| 項目 | `ClaudeCodeAct` | `CodexAct` |
+| --- | --- | --- |
+| 起動コマンド | `claude --print [--output-format json] -- <prompt>` | `codex exec [--json] [--skip-git-repo-check] -m <model> -c model_reasoning_effort=<effort> -- <prompt>` |
+| 主な引数 | `allowed_tools` / `model` / `permission_mode` / `output_format` / `extra_args` | `model="gpt-5.5"` / `effort="medium"` / `sandbox` / `json_output` / `skip_git_repo_check` / `allowed_args` |
+| 共通引数 | `timeout` / `prompt_template` / `env` / `cwd` / `runner` | 同左 |
+| 観測オブジェクト | `ClaudeCodeResult(.text/.failed/.tokens/.returncode/.error)` | `CodexResult(.text/.failed/.tokens/.returncode/.error)` |
+| token 集計 | `usage` の全 `*tokens*` を合算 | `input_tokens + output_tokens`（cached/reasoning は部分集合のため除外） |
+| auth | os.environ 継承（claude セッション + `ANTHROPIC_API_KEY`） | os.environ 継承（codex セッション + `OPENAI_API_KEY`） |
+| 失敗時 | `failed=True` を観測に載せて graceful（例外なし） | 同左 |
+| Mock | `MockClaudeCodeAct(responses=[...])` | `MockCodexAct(responses=[...])` |
+
 ### テスト
 
 ```bash
