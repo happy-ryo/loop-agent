@@ -62,10 +62,10 @@ class Score:
 class GroundTruthSignal:
     """episode の一次信号。内側 verify (test/lint/exit-code) に由来する権威ある成否。
 
-    - ``succeeded``           : 内側 :class:`~claude_loop.loop.LoopResult` の成否。
+    - ``succeeded``           : 内側 :class:`~loop_agent.loop.LoopResult` の成否。
     - ``score``               : ``ground_truth`` 軸が verify から埋まった :class:`Score`。
     - ``ground_truth_backed`` : test/lint 等の実信号が存在したか。``False`` の episode は
-      収束判定 (:class:`~claude_loop.convergence.RubricThreshold`) に算入しない
+      収束判定 (:class:`~loop_agent.convergence.RubricThreshold`) に算入しない
       (緩い評価器が一次信号を捏造して収束を宣言するのを防ぐ)。
     """
 

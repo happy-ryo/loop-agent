@@ -1,7 +1,7 @@
 """外側 Reflexion ループの状態 SoT: epoch/lesson/評価器 version を state.db に永続化 (Issue #29).
 
-MVP 内側 resume (:meth:`claude_loop.store.LoopStore.load_or_init` / Issue #14) と store lease
-機構 (Issue #21) を土台に、外側 :func:`claude_loop.reflexion.run_reflexion` の **試行間の学習状態**
+MVP 内側 resume (:meth:`loop_agent.store.LoopStore.load_or_init` / Issue #14) と store lease
+機構 (Issue #21) を土台に、外側 :func:`loop_agent.reflexion.run_reflexion` の **試行間の学習状態**
 (epoch 進行・episodic memory の lesson・固定評価器の version) を SQLite に永続化し、再起動後も
 **学習の続きから resume** できるようにする (report.md S4.4/S5 Phase3 follow-up)。
 
@@ -11,7 +11,7 @@ MVP 内側 resume (:meth:`claude_loop.store.LoopStore.load_or_init` / Issue #14)
   には一切触れず、``reflexion_run / reflexion_episode / reflexion_lesson / reflexion_evaluator``
   の 4 表を ``IF NOT EXISTS`` で **非破壊に追加** する。古い DB を開いても既存データは無傷で、
   本クラスの生成時に不足テーブルだけが作られる (:meth:`ReflexionStore.__init__`)。
-- **settled state を SoT にする**: :func:`~claude_loop.reflexion.run_reflexion` の ``persist`` フック
+- **settled state を SoT にする**: :func:`~loop_agent.reflexion.run_reflexion` の ``persist`` フック
   (epoch 境界処理の *後* に発火) から :meth:`ReflexionStore.persist_episode` を呼び、1 episode 分の
   「episode 行 + memory の全 lesson 行 + reflexion_run のスカラ + 評価器 version 登録」を **1 つの
   transaction** に束ねる (内側 :meth:`LoopStore.record_step` と同じ atomic 境界の方針)。途中クラッシュ
@@ -19,7 +19,7 @@ MVP 内側 resume (:meth:`claude_loop.store.LoopStore.load_or_init` / Issue #14)
 - **評価器 version registry + fail-loud**: 各 epoch で固定された評価器の version を
   ``reflexion_evaluator`` に追記 (audit)、現行 version を ``reflexion_run`` に持つ。resume 時、
   復元 ``evaluator_version`` と渡された ``evaluator.version`` が食い違えば
-  :func:`~claude_loop.reflexion.run_reflexion` が **loud に弾く** (callable は直列化できないので
+  :func:`~loop_agent.reflexion.run_reflexion` が **loud に弾く** (callable は直列化できないので
   別評価器に silently 差し替えない。PR #28 で確立した安全核を継ぐ)。本モジュールは version を
   忠実に往復させるだけで、採択基準・二信号モデルには一切踏み込まない。
 
@@ -180,12 +180,12 @@ def _decode_lesson(blob: Optional[str]) -> Optional[Lesson]:
 
 
 class ReflexionStore:
-    """外側 Reflexion 状態の writer/reader (内側 :class:`~claude_loop.store.LoopStore` の対)。
+    """外側 Reflexion 状態の writer/reader (内側 :class:`~loop_agent.store.LoopStore` の対)。
 
-    ``conn`` は :func:`~claude_loop.store.connect` が返した接続でも、素の ``sqlite3.connect()``
-    で開いた借用接続でもよい。後者でも動くよう、生成時に :func:`~claude_loop.store._init_connection`
+    ``conn`` は :func:`~loop_agent.store.connect` が返した接続でも、素の ``sqlite3.connect()``
+    で開いた借用接続でもよい。後者でも動くよう、生成時に :func:`~loop_agent.store._init_connection`
     を防御的に呼んで PRAGMA (row_factory=Row / isolation_level=None / foreign_keys=ON / WAL) と
-    内側スキーマを冪等適用し (:class:`~claude_loop.store.LoopStore` と同方針)、続けて外側用スキーマ
+    内側スキーマを冪等適用し (:class:`~loop_agent.store.LoopStore` と同方針)、続けて外側用スキーマ
     (:data:`_REFLEXION_SCHEMA`) を非破壊に追加する (古い DB には不足テーブルだけが作られ、既存の
     内側データは無傷)。``row_factory`` を立てないと全 read が列名アクセスで壊れ、``foreign_keys``
     を立てないと ``ON DELETE CASCADE`` が効かないため、この正規化は必須。すべての書き込みは
@@ -449,7 +449,7 @@ class ReflexionStore:
 
         ``status`` (``converged`` / ``stopped`` / ``paused``) と発火条件 / 理由を記録し、加えて
         ``result.state`` の settled スカラ + memory + 評価器 version を :meth:`_flush_settled` で
-        書き直す (内側 :meth:`~claude_loop.store.LoopStore.record_result` が最終集計を畳むのと同方針)。
+        書き直す (内側 :meth:`~loop_agent.store.LoopStore.record_result` が最終集計を畳むのと同方針)。
         これにより、resume の末尾境界 recovery が episode を 1 つも完了させずに停止した場合でも、
         recovery 後の状態が DB に確実に反映され、返り値と DB が一致する。``paused`` は終端ではない
         ので ``ended_at`` を立てない (resume で続行できる)。
@@ -502,9 +502,9 @@ class ReflexionStore:
 
 
 class DBReflexionLog:
-    """DB-backed の外側 Reflexion 進捗記録。内側 :class:`~claude_loop.store.DBProgressLog` の対。
+    """DB-backed の外側 Reflexion 進捗記録。内側 :class:`~loop_agent.store.DBProgressLog` の対。
 
-    ``db`` にはファイルパス (内部で :func:`~claude_loop.store.connect` し所有権を持って
+    ``db`` にはファイルパス (内部で :func:`~loop_agent.store.connect` し所有権を持って
     :meth:`close` で閉じる) か既存の ``sqlite3.Connection`` (借用。close では閉じない) を渡せる。
     生成時に ``load_or_init(run_id)`` を呼んで :attr:`state` (新規なら空・既存なら復元した途中状態)
     を保持する。これが **resume の入口**:

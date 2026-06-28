@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from claude_loop.transport import (
+from loop_agent.transport import (
     CLAIMED,
     DELIVERED,
     UNDELIVERED,

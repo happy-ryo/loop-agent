@@ -1,6 +1,6 @@
 """Minimal external state: an append-only progress file (report.md S5 Phase 1).
 
-The PoC keeps live loop state in memory (:mod:`claude_loop.state`); this module
+The PoC keeps live loop state in memory (:mod:`loop_agent.state`); this module
 externalises a *record* of each completed iteration to a JSON Lines file so the
 loop's forward progress survives the process. It is the smallest possible
 stand-in for the ``state.db`` SoT that Phase 2 introduces (report.md S4.6): one
@@ -19,8 +19,8 @@ driver's ``on_step`` observer, then record the terminal verdict::
     result = run_loop(act=..., verify=..., conditions=..., on_step=progress.on_step)
     progress.record_result(result)
 
-The records use only the fields already on :class:`~claude_loop.state.StepRecord`
-and :class:`~claude_loop.state.LoopState`, so no time source beyond the loop's
+The records use only the fields already on :class:`~loop_agent.state.StepRecord`
+and :class:`~loop_agent.state.LoopState`, so no time source beyond the loop's
 injected clock is consulted -- the file is fully deterministic for a given run.
 """
 

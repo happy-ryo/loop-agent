@@ -55,7 +55,7 @@ KEEP_CONTEXT = _KeepContext()
 class ActOutcome:
     """What one ``act`` invocation produced.
 
-    ``tokens`` is the cost charged to :class:`~claude_loop.conditions.TokenBudget`
+    ``tokens`` is the cost charged to :class:`~loop_agent.conditions.TokenBudget`
     for this step; stubs may report ``0``.
     """
 
@@ -88,7 +88,7 @@ class GateReview:
 
     The driver stays gate-agnostic: it only understands these three
     dispositions. The store/human lifecycle lives behind the gate object
-    (:class:`claude_loop.gate.HumanGate`).
+    (:class:`loop_agent.gate.HumanGate`).
     """
 
     disposition: str
@@ -147,7 +147,7 @@ class LoopResult:
         """True only for *natural* termination via the ``verify`` hook.
 
         This reflects the ``verify``-hook channel specifically (``status ==
-        "goal_met"``). A goal reached instead by a :class:`~claude_loop.conditions.GoalMet`
+        "goal_met"``). A goal reached instead by a :class:`~loop_agent.conditions.GoalMet`
         *stop condition* terminates with ``status == "stopped"`` and leaves this
         ``False`` -- use :attr:`succeeded` to detect success across both channels.
         """
@@ -159,7 +159,7 @@ class LoopResult:
 
         The goal can be verified two ways (report.md S4.5): the ``verify`` hook
         ending the loop naturally (:attr:`goal_met`), or a
-        :class:`~claude_loop.conditions.GoalMet` stop condition firing at the
+        :class:`~loop_agent.conditions.GoalMet` stop condition firing at the
         guard (``stop.name == "goal_met"``). Both are successes, distinct from a
         ``NoProgress`` abort or a mechanical cut-off; this collapses them so a
         caller can ask "did it succeed?" without knowing which channel fired.
@@ -232,7 +232,7 @@ def run_loop(
         act: Hook producing an :class:`ActOutcome` from the gathered context.
         verify: Hook turning an :class:`ActOutcome` into a :class:`VerifyOutcome`;
             ``goal_met=True`` terminates the loop naturally.
-        conditions: An :class:`~claude_loop.conditions.AnyOf`, or any non-empty
+        conditions: An :class:`~loop_agent.conditions.AnyOf`, or any non-empty
             sequence of stop conditions (wrapped in ``AnyOf`` automatically).
         gather: Hook building the context handed to ``act``. Defaults to passing
             the :class:`LoopState` through.
@@ -250,12 +250,12 @@ def run_loop(
         initial_state: Seed the loop with already-accumulated state to **resume**
             an interrupted run (report.md S4.4 / S5 Phase 2, Issue #14). Pass the
             :class:`LoopState` reconstructed by
-            :meth:`~claude_loop.store.LoopStore.load_or_init` (or
-            :attr:`~claude_loop.store.DBProgressLog.state`): the loop continues
+            :meth:`~loop_agent.store.LoopStore.load_or_init` (or
+            :attr:`~loop_agent.store.DBProgressLog.state`): the loop continues
             from its ``iteration`` / ``tokens_used`` / ``goal_met`` / ``history``
             instead of starting empty, and ``elapsed`` keeps accumulating from
             the persisted value (the wall-clock origin is back-dated by it so
-            stop conditions like :class:`~claude_loop.conditions.Timeout` see the
+            stop conditions like :class:`~loop_agent.conditions.Timeout` see the
             *total* run time, not just this leg). ``None`` (the default) starts a
             fresh run; an empty :class:`LoopState` is equivalent to ``None``. The
             seed is copied, so the caller's object is not mutated.
@@ -274,15 +274,15 @@ def run_loop(
     run would have. Resume is only meaningful for hooks that derive their verdict
     from the (gathered) state rather than from in-process call counters, since a
     fresh process rebuilds the hooks but not their private counters; pair resume
-    with state-based stop conditions (e.g. :class:`~claude_loop.conditions.GoalMet`)
+    with state-based stop conditions (e.g. :class:`~loop_agent.conditions.GoalMet`)
     for a run that reproduces a straight-through result exactly.
 
     One fidelity caveat when the seed was reconstructed from the state.db SoT
-    (:meth:`~claude_loop.store.LoopStore.load_or_init`): ``history`` observations
+    (:meth:`~loop_agent.store.LoopStore.load_or_init`): ``history`` observations
     survive a JSON round-trip, so non-JSON-native types drift (``tuple`` ->
     ``list``, ``dict`` int-keys -> ``str``, sets/custom objects/NaN -> ``repr``
     string). A condition that *keys* directly on the raw ``observation`` --
-    notably :class:`~claude_loop.conditions.NoProgress`'s default key -- can then
+    notably :class:`~loop_agent.conditions.NoProgress`'s default key -- can then
     diverge across the seam (a ``tuple`` becomes an unhashable ``list``; other
     types re-key), so its window straddling the resume point may fire at a
     different iteration or raise. Use JSON-stable observations, or give such a

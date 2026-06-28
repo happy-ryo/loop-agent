@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """検証駆動デモ: sandbox のテストが green になるまで gather->act->verify を反復する。
 
-claude-loop のループコアを *実コード* に当てる具体デモ。一時ディレクトリに
+loop-agent のループコアを *実コード* に当てる具体デモ。一時ディレクトリに
 わざと壊した関数 ``add`` とその pytest を書き出し、検証(verify)が実際の
 pytest の exit-code を見て green になるまでループを回す。
 
@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path
 from typing import NamedTuple, Optional, Sequence
 
-from claude_loop import (
+from loop_agent import (
     LoopResult,
     MaxIterations,
     StepRecord,
@@ -37,13 +37,13 @@ from claude_loop import (
     TokenBudget,
     run_loop,
 )
-from claude_loop.demo import (
+from loop_agent.demo import (
     CandidateApplier,
     ExitCodeVerifier,
     attempt_index,
     write_sandbox,
 )
-from claude_loop.state import LoopState
+from loop_agent.state import LoopState
 
 # -- sandbox の中身 --------------------------------------------------------
 
@@ -143,11 +143,11 @@ def _print_step(record: StepRecord, _state: LoopState) -> None:
 
 
 def main() -> int:
-    print("=== claude-loop verification-driven demo ===")
+    print("=== loop-agent verification-driven demo ===")
     print("goal: keep gather->act->verify until the sandbox tests are GREEN")
     print("verify = real pytest exit-code (ground truth, not an LLM judge)\n")
 
-    with tempfile.TemporaryDirectory(prefix="claude-loop-demo-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="loop-agent-demo-") as tmp:
         workdir = Path(tmp)
         run = run_repair(workdir, on_step=_print_step)
         result = run.result

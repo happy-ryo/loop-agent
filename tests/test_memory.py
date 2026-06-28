@@ -6,14 +6,14 @@ from dataclasses import dataclass
 
 import pytest
 
-from claude_loop.memory import (
+from loop_agent.memory import (
     EpisodicMemory,
     Lesson,
     LessonVerdict,
     default_admit,
     step_signature,
 )
-from claude_loop.state import StepRecord
+from loop_agent.state import StepRecord
 
 
 @dataclass

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     AnyOf,
     GoalCheck,
     GoalMet,
@@ -13,7 +13,7 @@ from claude_loop import (
     Timeout,
     TokenBudget,
 )
-from claude_loop.state import LoopState, StepRecord
+from loop_agent.state import LoopState, StepRecord
 
 
 def _history(*observations) -> list[StepRecord]:

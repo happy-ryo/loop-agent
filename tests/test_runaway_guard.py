@@ -31,7 +31,7 @@ import time
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     ActOutcome,
     AnyOf,
     MaxIterations,

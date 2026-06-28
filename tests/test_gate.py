@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     ActOutcome,
     DBProgressLog,
     DECISION_KINDS,
@@ -29,8 +29,8 @@ from claude_loop import (
     run_gated_loop,
     run_loop,
 )
-from claude_loop.loop import GATE_PROCEED, GateReview
-from claude_loop.store import EVENT_GATE
+from loop_agent.loop import GATE_PROCEED, GateReview
+from loop_agent.store import EVENT_GATE
 from conftest import never_done
 
 

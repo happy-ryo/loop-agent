@@ -21,7 +21,7 @@ import threading
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     DBProgressLog,
     HumanGate,
     LoopState,
@@ -30,8 +30,8 @@ from claude_loop import (
     connect,
     run_loop,
 )
-from claude_loop.loop import GATE_PAUSE, GATE_PROCEED, GATE_SKIP
-from claude_loop.store import (
+from loop_agent.loop import GATE_PAUSE, GATE_PROCEED, GATE_SKIP
+from loop_agent.store import (
     LEASE_ACQUIRED,
     LEASE_EXECUTED,
     LEASE_WAIT,
@@ -51,7 +51,7 @@ def make_world(actions):
 
     def act(action):
         executed.append(action)
-        from claude_loop import ActOutcome
+        from loop_agent import ActOutcome
 
         return ActOutcome(observation=action, tokens=0)
 

@@ -1,6 +1,6 @@
 """検証駆動デモのエンジン: 実テストの exit-code を ground truth に回す再利用フック。
 
-このモジュールは claude-loop のループコア(:func:`claude_loop.run_loop`)を、
+このモジュールは loop-agent のループコア(:func:`loop_agent.run_loop`)を、
 *実際のテスト実行* に当てるための最小の足場を提供する。検証(verify)は
 LLM judge ではなく、subprocess で起動したテストコマンドの ``returncode`` を
 唯一の真実として使う(report.md R1: ground truth 優先)。
@@ -145,7 +145,7 @@ class CandidateApplier:
     直らないシナリオでもハード上限が止めるまで安全に反復できる。
 
     ``cost_per_step`` は 1 ステップあたりに計上するトークン量で、
-    :class:`~claude_loop.conditions.TokenBudget` のデモに使える(既定は 0)。
+    :class:`~loop_agent.conditions.TokenBudget` のデモに使える(既定は 0)。
     """
 
     target: Path
