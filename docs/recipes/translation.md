@@ -74,6 +74,6 @@ loop-agent 自身の 10 ファイル（合計 290 の日本語 hit）を `haiku`
 ## 要点
 
 - **文字列リテラルを翻訳対象から外す**のが肝。コメント / docstring だけをターゲティングし、`print()` 等の文字列は触らない。これを誤ると「翻訳しきれない正当な日本語」でゴールが到達不能になります。
-- **token 計上の落とし穴**: `ClaudeCodeAct` を `Read`+`Edit` 付きで回すと `cache_read` の累積で `TokenBudget` が早発火します（PoC で発見）。`MaxIterations` で律速し、`TokenBudget` は大きめ（例 `20_000_000`）に。詳細は [quickstart のトラブルシュート](../quickstart.md#5-トラブルシュートよくある詰まり)。
+- **token 計上**: `ClaudeCodeAct` を `Read`+`Edit` 付きで回すと内部マルチターンで `cache_read` が累積しますが、token 計上は `cache_read` を除外するよう修正済みなので `TokenBudget` は実コストに比例して効きます（Issue #55、以前は早発火していた）。長時間 run の確実な律速には `MaxIterations` 併用が堅実。詳細は [quickstart のトラブルシュート](../quickstart.md#5-トラブルシュートよくある詰まり)。
 - **Reflexion は要らないことが多い**: この翻訳タスクの初回失敗は *stochastic*（haiku が長いファイルで末尾コメントを 1 個落とす類）で、blind retry で resample すれば通ります。Run 1（no Reflexion）と Run 2（Reflexion）はほぼ同コストで同結果でした。Reflexion が勝つのは *systematic* な失敗のときだけ（→ [reflexion-when-to-use.md](../reflexion-when-to-use.md)）。
 - **公平 scheduling**: ファイル単位の round-robin（試行回数最小から）で、難物 1 ファイルが全反復を独占しないように。

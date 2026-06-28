@@ -103,7 +103,7 @@ result = run_loop(
 
 ### 動線 C: PoC 実走例（embeddability の実証）
 
-**Self-translation PoC** では、loop-agent の*自分自身*のループエンジンを loop-agent の*自分自身*のソースに向け、`ClaudeCodeAct(haiku)` を `act` に据えて `src/loop_agent/` の 10 ファイルの日本語 docstring / コメントを英訳した — **コード・公開 API・型・テスト名は一切変えず**、`pytest` 全件 green を維持して。Run 1（no-Reflexion）は **10/10 ファイル・13 反復・約 33 分・559 件 green 維持**。これは「組み込まれたループエンジンが自分自身を改変しても挙動不変を保てる」ことの実証であり、同時に「実走するから現実の落とし穴が見つかる」例でもある（`ClaudeCodeAct` の token 計上が `cache_read` を累積し `TokenBudget` を誤発火させる bug を発見 → [docs/quickstart.md のトラブルシュート](./docs/quickstart.md) に回避策）。PoC の設計・全結果は [docs/recipes/translation.md](./docs/recipes/translation.md) に要約。
+**Self-translation PoC** では、loop-agent の*自分自身*のループエンジンを loop-agent の*自分自身*のソースに向け、`ClaudeCodeAct(haiku)` を `act` に据えて `src/loop_agent/` の 10 ファイルの日本語 docstring / コメントを英訳した — **コード・公開 API・型・テスト名は一切変えず**、`pytest` 全件 green を維持して。Run 1（no-Reflexion）は **10/10 ファイル・13 反復・約 33 分・559 件 green 維持**。これは「組み込まれたループエンジンが自分自身を改変しても挙動不変を保てる」ことの実証であり、同時に「実走するから現実の落とし穴が見つかる」例でもある（`ClaudeCodeAct` の token 計上が `cache_read` を累積し `TokenBudget` を誤発火させる bug を発見 → cache_read を計上から除外して修正済み。詳細は [docs/quickstart.md のトラブルシュート](./docs/quickstart.md)）。PoC の設計・全結果は [docs/recipes/translation.md](./docs/recipes/translation.md) に要約。
 
 ### 動線 D: 応用パターン（シームで自分でも書ける正準例）
 
