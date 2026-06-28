@@ -11,15 +11,15 @@ import sqlite3
 
 import pytest
 
-from claude_loop.conditions import StopTrigger
-from claude_loop.convergence import EvaluatorUpdateBudget, MaxEpisodes, RubricThreshold
-from claude_loop.evaluator import Evaluator, GroundTruthSignal, HeldOut, Probe, Score
-from claude_loop.loop import LoopResult
-from claude_loop.memory import EpisodicMemory, Lesson, step_signature
-from claude_loop.reflexion import ReflexionState, run_reflexion
-from claude_loop.reflexion_store import DBReflexionLog, ReflexionStore
-from claude_loop.state import LoopState, StepRecord
-from claude_loop.store import LoopStore, connect
+from loop_agent.conditions import StopTrigger
+from loop_agent.convergence import EvaluatorUpdateBudget, MaxEpisodes, RubricThreshold
+from loop_agent.evaluator import Evaluator, GroundTruthSignal, HeldOut, Probe, Score
+from loop_agent.loop import LoopResult
+from loop_agent.memory import EpisodicMemory, Lesson, step_signature
+from loop_agent.reflexion import ReflexionState, run_reflexion
+from loop_agent.reflexion_store import DBReflexionLog, ReflexionStore
+from loop_agent.state import LoopState, StepRecord
+from loop_agent.store import LoopStore, connect
 
 
 # -- 共通スタブ (test_reflexion.py の意匠を踏襲) --------------------------------
@@ -330,7 +330,7 @@ def test_observed_resume_epoch_events_consistent_with_db(tmp_path):
     recovery がその境界を取り戻すと on_epoch が 1 度 emit され、DB の epoch/version もそれと一致
     する (観測の epoch 数が DB の SoT と食い違わない)。
     """
-    from claude_loop import EPOCH_BOUNDARY, ListSink, run_observed_reflexion
+    from loop_agent import EPOCH_BOUNDARY, ListSink, run_observed_reflexion
 
     db = tmp_path / "obs.db"
     common = dict(

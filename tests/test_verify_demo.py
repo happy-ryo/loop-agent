@@ -28,8 +28,8 @@ if str(EXAMPLES_DIR) not in sys.path:
 
 import verify_driven_demo as demo  # noqa: E402
 
-from claude_loop import MaxIterations  # noqa: E402
-from claude_loop.demo import (  # noqa: E402
+from loop_agent import MaxIterations  # noqa: E402
+from loop_agent.demo import (  # noqa: E402
     DEFAULT_TEST_COMMAND,
     ExitCodeVerifier,
     sandbox_env,

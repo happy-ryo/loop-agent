@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop.conditions import StopTrigger
-from claude_loop.convergence import MaxEpisodes, ReflectionBudget, RubricThreshold
-from claude_loop.evaluator import Evaluator, HeldOut, Probe, Score, GroundTruthSignal
-from claude_loop.loop import LoopResult
-from claude_loop.memory import EpisodicMemory, Lesson, LessonVerdict, step_signature
-from claude_loop.reflexion import ReflexionContext, run_reflexion
-from claude_loop.state import LoopState, StepRecord
+from loop_agent.conditions import StopTrigger
+from loop_agent.convergence import MaxEpisodes, ReflectionBudget, RubricThreshold
+from loop_agent.evaluator import Evaluator, HeldOut, Probe, Score, GroundTruthSignal
+from loop_agent.loop import LoopResult
+from loop_agent.memory import EpisodicMemory, Lesson, LessonVerdict, step_signature
+from loop_agent.reflexion import ReflexionContext, run_reflexion
+from loop_agent.state import LoopState, StepRecord
 
 
 # -- 共通スタブ ----------------------------------------------------------------
@@ -544,7 +544,7 @@ def test_real_humangate_pause_propagates_through_reflexion():
     従来どおり status="paused" + pending を返す。外側はそれを score/reflect せず伝播する
     (二信号駆動と lease exactly-once が episode 境界で両立することの実証)。
     """
-    from claude_loop import (
+    from loop_agent import (
         ActOutcome,
         HumanGate,
         LoopStore,
@@ -552,7 +552,7 @@ def test_real_humangate_pause_propagates_through_reflexion():
         connect,
         run_loop,
     )
-    from claude_loop import MaxIterations as InnerMaxIterations
+    from loop_agent import MaxIterations as InnerMaxIterations
 
     store = LoopStore(connect(":memory:"))
     run_id = "episode-with-gate"
@@ -602,7 +602,7 @@ def test_real_humangate_pause_propagates_through_reflexion():
 
 def test_resume_rejects_mismatched_evaluator_version():
     """外側 resume: 復元 evaluator_version と渡された評価器が食い違えば loud に弾く。"""
-    from claude_loop.reflexion import ReflexionState
+    from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=4, epoch=2, evaluator_version="some-promoted-version")
     with pytest.raises(ValueError, match="resume"):
@@ -620,7 +620,7 @@ def test_resume_rejects_mismatched_evaluator_version():
 
 def test_resume_rejects_mismatched_declared_keys():
     """別の declared_keys で resume すると stale な集約で誤収束しうるので loud に弾く。"""
-    from claude_loop.reflexion import ReflexionState
+    from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(
         episode=2, epoch=1, evaluator_version=HONEST.version,
@@ -642,7 +642,7 @@ def test_resume_rejects_mismatched_declared_keys():
 
 def test_resume_accepts_matching_evaluator_version():
     """復元 version と一致する評価器なら resume できる (継続する)。"""
-    from claude_loop.reflexion import ReflexionState
+    from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=2, epoch=1, evaluator_version=HONEST.version)
     result = run_reflexion(
@@ -660,7 +660,7 @@ def test_resume_accepts_matching_evaluator_version():
 
 def test_resume_does_not_mutate_seed_state():
     """initial_state を破壊的に使わない (caller の snapshot は不変)。"""
-    from claude_loop.reflexion import ReflexionState
+    from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=1, epoch=0, gt_aggregate_history=[0.2])
     seed_mem_len = len(seed.memory)

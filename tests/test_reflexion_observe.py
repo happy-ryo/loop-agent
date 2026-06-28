@@ -19,7 +19,7 @@ from collections import Counter
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     EpochRecord,
     Evaluator,
     GroundTruthSignal,
@@ -37,11 +37,11 @@ from claude_loop import (
     run_observed_reflexion,
     run_reflexion,
 )
-from claude_loop.conditions import StopTrigger
-from claude_loop.evaluator import AdmissionResult
-from claude_loop.loop import LoopResult
-from claude_loop.memory import LessonVerdict, step_signature
-from claude_loop.reflexion_observe import (
+from loop_agent.conditions import StopTrigger
+from loop_agent.evaluator import AdmissionResult
+from loop_agent.loop import LoopResult
+from loop_agent.memory import LessonVerdict, step_signature
+from loop_agent.reflexion_observe import (
     EPISODE_BEGIN,
     EPISODE_END,
     EPOCH_BOUNDARY,
@@ -49,7 +49,7 @@ from claude_loop.reflexion_observe import (
     REFLEXION_BEGIN,
     REFLEXION_END,
 )
-from claude_loop.state import LoopState, StepRecord
+from loop_agent.state import LoopState, StepRecord
 
 
 # -- 共通スタブ (test_reflexion.py と同じ作法) -------------------------------
@@ -377,7 +377,7 @@ def test_best_gt_aggregate_omitted_when_no_grounded_episode():
 
 def test_episode_end_never_emits_negative_infinity_in_jsonl(tmp_path):
     """非 ground-truth-backed の先行 episode が -Infinity (仕様外 JSON) を書かないこと。"""
-    from claude_loop import JsonlEventSink
+    from loop_agent import JsonlEventSink
 
     path = tmp_path / "reflexion.jsonl"
     run_observed_reflexion(
@@ -504,7 +504,7 @@ def test_observer_hook_swallows_internal_errors(monkeypatch):
     obs._span = BoomSpan()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        from claude_loop.reflexion import ReflexionContext
+        from loop_agent.reflexion import ReflexionContext
         obs.on_episode_begin(
             ReflexionContext(episode=0, epoch=0, task="t", evaluator=FLAT, memory_block="")
         )
@@ -532,7 +532,7 @@ def test_error_in_episode_records_error_end():
 
 def test_resume_error_end_preserves_prior_state_metrics():
     """外側 resume 中に最初の episode 前で例外 → error end が復元 state の集計を保つ。"""
-    from claude_loop import ReflexionState
+    from loop_agent import ReflexionState
 
     sink = ListSink()
     seed = ReflexionState(
@@ -657,7 +657,7 @@ def test_reflexion_span_noop_when_disabled():
 
 
 def test_reflexion_span_degrades_when_otel_unavailable(monkeypatch):
-    import claude_loop.otel as otel_mod
+    import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", False)
     span = otel_mod.ReflexionSpan(tracer="would-be-a-tracer", enabled=True)
@@ -687,7 +687,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor  # noqa: E402
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E402
     InMemorySpanExporter,
 )
-from claude_loop.otel import (  # noqa: E402
+from loop_agent.otel import (  # noqa: E402
     ATTR_REFLEXION_BEST,
     ATTR_REFLEXION_EPISODES,
     ATTR_REFLEXION_EPOCHS,
@@ -728,10 +728,10 @@ def test_run_creates_single_reflexion_span_with_genai_attrs(otel_tracer):
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     span = spans[0]
-    assert span.name == "claude_loop.reflexion"
+    assert span.name == "loop_agent.reflexion"
     attrs = dict(span.attributes)
     assert attrs[GEN_AI_OPERATION_NAME] == "reflexion"
-    assert attrs[GEN_AI_SYSTEM] == "claude_loop"
+    assert attrs[GEN_AI_SYSTEM] == "loop_agent"
     assert attrs[ATTR_REFLEXION_STATUS] == "converged"
     assert attrs[ATTR_REFLEXION_STOP] == "rubric_threshold"
     assert attrs[ATTR_REFLEXION_EPISODES] == 1
@@ -782,7 +782,7 @@ def test_exception_marks_reflexion_span_error(otel_tracer):
 
 
 def test_misbehaving_tracer_does_not_crash_reflexion(monkeypatch):
-    import claude_loop.otel as otel_mod
+    import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", True)
 

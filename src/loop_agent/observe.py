@@ -1,6 +1,6 @@
 """観測オーケストレーション: loop_begin/step/end を emit し OTel span を張る。
 
-:class:`LoopObserver` は :class:`~claude_loop.progress.ProgressLog` と同じ作法
+:class:`LoopObserver` は :class:`~loop_agent.progress.ProgressLog` と同じ作法
 （``on_step`` 観測フック + ``record_result``）に乗りつつ、ループ境界の
 ``loop_begin`` / ``loop_end`` も足し、1 本の OTel GenAI span を run 全体に被せる。
 
@@ -65,7 +65,7 @@ class LoopObserver:
     """1 回のループ run を観測し、構造化イベント + OTel span を emit する。
 
     sink へは best-effort で配る（sink の例外でループを殺さない）。span は OTel 不在
-    なら自動で no-op になる（:class:`~claude_loop.otel.LoopSpan`）。
+    なら自動で no-op になる（:class:`~loop_agent.otel.LoopSpan`）。
     """
 
     def __init__(
@@ -75,7 +75,7 @@ class LoopObserver:
         conditions: Optional[Conditions] = None,
         otel: bool = True,
         tracer: "Optional[Any]" = None,
-        span_name: str = "claude_loop.loop",
+        span_name: str = "loop_agent.loop",
         on_sink_error: Optional[SinkErrorHandler] = None,
         initial_state: Optional[LoopState] = None,
     ) -> None:
@@ -263,16 +263,16 @@ def run_observed_loop(
     on_step: Optional[StepHook] = None,
     otel: bool = True,
     tracer: "Optional[Any]" = None,
-    span_name: str = "claude_loop.loop",
+    span_name: str = "loop_agent.loop",
     on_sink_error: Optional[SinkErrorHandler] = None,
     time_fn: Optional[Callable[[], float]] = None,
     initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
-    """観測を配線して :func:`~claude_loop.loop.run_loop` を回す一括の入口。
+    """観測を配線して :func:`~loop_agent.loop.run_loop` を回す一括の入口。
 
     ``run_loop`` と同じ ``act`` / ``verify`` / ``conditions`` / ``gather`` を取り、
     観測用に ``sinks`` と OTel 設定を足す。利用者の ``on_step`` があれば観測フックと
-    合成して両方呼ぶ。返り値は ``run_loop`` の :class:`~claude_loop.loop.LoopResult`。
+    合成して両方呼ぶ。返り値は ``run_loop`` の :class:`~loop_agent.loop.LoopResult`。
 
     ``initial_state`` を渡すと中断したループを観測を保ったまま **resume** できる
     (``run_loop`` の同名引数へ素通し; 詳細・限界はそちらの docstring 参照)。観測は

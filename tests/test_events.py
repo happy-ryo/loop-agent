@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     LOOP_BEGIN,
     LOOP_END,
     LOOP_STEP,
@@ -21,7 +21,7 @@ from claude_loop import (
     LoopEvent,
     read_events,
 )
-from claude_loop.events import EventSink, _jsonable, fan_out
+from loop_agent.events import EventSink, _jsonable, fan_out
 
 
 def test_loop_event_to_dict_flattens_payload():

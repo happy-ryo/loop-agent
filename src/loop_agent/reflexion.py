@@ -1,13 +1,13 @@
 """外側 Reflexion ループ駆動: 試行間の言語的自己改善 + RQGM epoch 安全核 (Issue #22).
 
-内側 ReAct ループ (:func:`claude_loop.loop.run_loop`) を **1 episode** として包み、episode
+内側 ReAct ループ (:func:`loop_agent.loop.run_loop`) を **1 episode** として包み、episode
 境界で ``reflect(trajectory, signal, reward)`` を回して言語的指針を
-:class:`~claude_loop.memory.EpisodicMemory` に取り込み、次 episode の context へ配線する
+:class:`~loop_agent.memory.EpisodicMemory` に取り込み、次 episode の context へ配線する
 (report.md S4.4 擬似コード / S5 Phase3)。
 
 **二信号モデル (本設計の肝・安全核)**: 各 episode は 2 つの異なる信号を生む。
 
-- ``signal`` (:class:`~claude_loop.evaluator.GroundTruthSignal`): **ground-truth 一次**。
+- ``signal`` (:class:`~loop_agent.evaluator.GroundTruthSignal`): **ground-truth 一次**。
   内側 verify (test/lint/exit-code) と ``LoopResult.succeeded`` に由来し、駆動側が計算する。
   収束/頭打ち/best/評価器昇格ゲート/lesson 採用 ― すべての **帰結ある制御** はこれが駆動する。
   epoch をまたぐ評価器の入れ替えに依存しない (評価器非依存スケール)。
@@ -16,11 +16,11 @@
 
 これにより「gameable な評価器スカラを押し上げて収束を宣言する」抜け道が構造的に塞がれる
 (report.md 原則: ground-truth 優先)。評価器の入れ替えは **epoch 境界** でのみ、かつ held-out
-固定 gold に対する epsilon-best-belief ゲート (:func:`claude_loop.evaluator.admit_evaluator`)
+固定 gold に対する epsilon-best-belief ゲート (:func:`loop_agent.evaluator.admit_evaluator`)
 を通ったときに限る (RQGM。Issue #4)。
 
 **dual-component 分離**: production 経路 (``episode`` -> 内側 run_loop。副作用あり) と、評価器
-昇格の測定経路 (事前収録 :class:`~claude_loop.evaluator.HeldOut` probe の採点。副作用なし) を
+昇格の測定経路 (事前収録 :class:`~loop_agent.evaluator.HeldOut` probe の採点。副作用なし) を
 分ける。両者の task 名前空間が素であることを構成時に検証する。
 
 本モジュールは **単一プロセス** の self-improving に集中する。分散協調・外側ループの永続化は
@@ -56,7 +56,7 @@ from .state import StepRecord
 
 @dataclass(frozen=True)
 class EpisodeOutcome:
-    """内側 :class:`~claude_loop.loop.LoopResult` の **読み取り専用** ビュー。
+    """内側 :class:`~loop_agent.loop.LoopResult` の **読み取り専用** ビュー。
 
     ground-truth 一次信号 (内側 verify の結果) の権威ソース。reflect / 取込前検証 / 評価器が
     参照するのは ``history`` (軌跡) と ``succeeded`` (権威ある成否)。
@@ -164,7 +164,7 @@ class ReflexionState:
     memory: EpisodicMemory = field(default_factory=EpisodicMemory)
 
     def outer_state(self) -> OuterState:
-        """収束条件 (:class:`~claude_loop.convergence.OuterState`) 用の不変射影を返す。"""
+        """収束条件 (:class:`~loop_agent.convergence.OuterState`) 用の不変射影を返す。"""
         return OuterState(
             episode=self.episode,
             epoch=self.epoch,
@@ -182,11 +182,11 @@ class ReflexiveResult:
     """外側ループの結果。``status`` は ``"converged"`` / ``"stopped"`` / ``"paused"``。
 
     ``succeeded`` は **トリガ順に依存せず** 状態から判定する: 終了時点で成功条件
-    (:class:`~claude_loop.convergence.RubricThreshold`) が満たされていれば成功
+    (:class:`~loop_agent.convergence.RubricThreshold`) が満たされていれば成功
     (内側ループの ``stop.name`` 依存判定が抱える順序問題を踏まない)。
 
     ``status == "paused"`` は内側 episode が人間ゲートで中断した場合 (``stop`` は ``None``、
-    ``pending`` に内側 :class:`~claude_loop.loop.LoopResult` の pending を載せる)。この episode は
+    ``pending`` に内側 :class:`~loop_agent.loop.LoopResult` の pending を載せる)。この episode は
     **未完了**として記録せず (gt/reflect も走らせず) episode を進めない。人間がゲート決定を
     永続化した後に同じ引数で resume すれば、同じ episode が再実行され内側ゲートが決定を適用して
     完了する (内側の pause/resume 契約をそのまま外側へ伝播する。Issue #15)。
@@ -235,7 +235,7 @@ ReflectHook = Callable[
 EpisodeHook = Callable[[EpisodeRecord, ReflexionState], None]
 # epoch 境界の観測フック。境界で評価器交代の判定が確定した後に呼ばれる純粋な側チャネル
 # (制御に載らない)。例外で run を倒さないよう、実装側が best-effort に握る責務を負う
-# (既存 on_episode と同契約。観測の degrade は :class:`~claude_loop.reflexion_observe.ReflexionObserver`)。
+# (既存 on_episode と同契約。観測の degrade は :class:`~loop_agent.reflexion_observe.ReflexionObserver`)。
 EpochHook = Callable[[EpochRecord], None]
 ProposeEvaluatorFn = Callable[[OuterState, Evaluator], Optional[Evaluator]]
 OuterConditions = Union[AnyOf, Sequence[StopCondition]]
@@ -278,7 +278,7 @@ def _advance_epoch_boundary(
     """epoch 境界処理: epoch を 1 つ進め、incumbent を入れ替えてよい **唯一** の場所。
 
     本体は ``run_reflexion`` のメインループから切り出した **挙動不変** のヘルパ (安全核の昇格
-    ゲート :func:`~claude_loop.evaluator.admit_evaluator` / 二信号モデル / 採択基準には一切踏み
+    ゲート :func:`~loop_agent.evaluator.admit_evaluator` / 二信号モデル / 採択基準には一切踏み
     込まない。呼び出し点を増やすだけ)。メインループの境界と、resume 時に「中断地点で *終端扱い*
     として抑止された末尾境界」を取り戻す recovery の **両方** から呼ぶ。これにより、ある境界を
     跨いで継続する resume が通し実行と同じ epoch 進行・評価器昇格・**観測 (on_epoch) emit** を
@@ -351,15 +351,15 @@ def run_reflexion(
 
     Args:
         episode: production 経路。``ReflexionContext`` を受け取り内側 ``run_loop`` を 1 回
-            回して :class:`~claude_loop.loop.LoopResult` を返す (driver は内側に手を入れない)。
+            回して :class:`~loop_agent.loop.LoopResult` を返す (driver は内側に手を入れない)。
         ground_truth: **一次信号源**。``EpisodeOutcome`` から
-            :class:`~claude_loop.evaluator.GroundTruthSignal` を作る (内側 verify 由来)。
+            :class:`~loop_agent.evaluator.GroundTruthSignal` を作る (内側 verify 由来)。
         reflect: episode 境界で軌跡/一次信号/reward から言語的 lesson を抽出するフック。
             例外は **非致命** (lesson を捨てて続行する)。
         evaluator: 初期 incumbent 評価器。各 epoch 内で固定され、reward (reflect 用ラベル)
-            を採点する。境界でのみ :func:`~claude_loop.evaluator.admit_evaluator` 経由で交代。
-        convergence: :class:`~claude_loop.conditions.AnyOf` または停止条件列
-            (:mod:`claude_loop.convergence`)。内側と同じ合成プロトコルを再利用する。
+            を採点する。境界でのみ :func:`~loop_agent.evaluator.admit_evaluator` 経由で交代。
+        convergence: :class:`~loop_agent.conditions.AnyOf` または停止条件列
+            (:mod:`loop_agent.convergence`)。内側と同じ合成プロトコルを再利用する。
         declared_keys: 多様評価の宣言軸 (集約は宣言軸の最小値。欠落は 0.0)。非空必須。
         production_tasks: episode ごとの production タスク列 (``episode % len`` で循環)。
         held_out: 評価器昇格の測定基盤 (固定 gold ラベル付き probe)。dual-component の測定経路。
@@ -367,7 +367,7 @@ def run_reflexion(
         epsilon: epsilon-best-belief の churn 防止余白。``> 0`` 必須。
         delta: fold 単位後退の許容幅。
         propose_evaluator: 境界で候補評価器を提案するフック (``None`` なら評価器は不変)。
-        admit_lesson: 取込前検証フック (既定 :func:`~claude_loop.memory.default_admit`)。
+        admit_lesson: 取込前検証フック (既定 :func:`~loop_agent.memory.default_admit`)。
             **support は driver が grounding から再計算して上書き** するので、自己申告 support は
             効かない。意味的/効果ベースの検証はここを差し替える。
         memory: 既存の :class:`EpisodicMemory` (resume 等)。``None`` なら新規。
@@ -381,9 +381,9 @@ def run_reflexion(
             evaluator_version / evaluator_updates) を見るので、これを state.db に書けば中断
             地点から resume したとき通し実行と一致する (epoch 進行・採用 lesson・評価器 version・
             best ground-truth)。例外は **非致命にしない** (永続化に失敗したら resume できない
-            ので loud に倒す。:class:`~claude_loop.reflexion_store.DBReflexionLog` が配線例)。
+            ので loud に倒す。:class:`~loop_agent.reflexion_store.DBReflexionLog` が配線例)。
         initial_state: 外側 resume の seed (内側 ``run_loop`` の ``initial_state`` に対応)。
-            :meth:`~claude_loop.reflexion_store.ReflexionStore.load_or_init` が state.db から
+            :meth:`~loop_agent.reflexion_store.ReflexionStore.load_or_init` が state.db から
             復元した :class:`ReflexionState` を渡すと、永続化済みの続きから再開できる。
 
     Raises:

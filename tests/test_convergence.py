@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import AnyOf
-from claude_loop.convergence import (
+from loop_agent import AnyOf
+from loop_agent.convergence import (
     EvaluatorUpdateBudget,
     MaxEpisodes,
     OuterState,

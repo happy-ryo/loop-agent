@@ -8,16 +8,16 @@
 JSONL/event sink 側はそのまま機能する。``enabled=False`` でも同じ no-op になる。
 
 semantic conventions の対応（experimental な GenAI 規約に準拠しつつ、ループ固有の
-情報は ``claude_loop.*`` 名前空間に置く）:
+情報は ``loop_agent.*`` 名前空間に置く）:
 
 - ``gen_ai.operation.name`` = ``"loop"``      （この span が表す操作）
-- ``gen_ai.system``         = ``"claude_loop"``
+- ``gen_ai.system``         = ``"loop_agent"``
 - ``gen_ai.usage.output_tokens`` = 累積 tokens（ダッシュボード互換のため GenAI usage に写像）
-- ``claude_loop.iterations``       = 総反復数（= 反復番号）
-- ``claude_loop.status``           = ``"goal_met" | "stopped" | "error" | "incomplete"``
-- ``claude_loop.stop``             = 発火した停止条件名（無ければ未設定）
-- ``claude_loop.termination_reason`` = 人間可読の終了理由
-- ``claude_loop.tokens_used`` / ``claude_loop.elapsed`` = メトリクス
+- ``loop_agent.iterations``       = 総反復数（= 反復番号）
+- ``loop_agent.status``           = ``"goal_met" | "stopped" | "error" | "incomplete"``
+- ``loop_agent.stop``             = 発火した停止条件名（無ければ未設定）
+- ``loop_agent.termination_reason`` = 人間可読の終了理由
+- ``loop_agent.tokens_used`` / ``loop_agent.elapsed`` = メトリクス
 
 各反復は span の add_event（``loop_step``）としてタイムラインに刻む。
 """
@@ -43,37 +43,37 @@ GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
 GEN_AI_SYSTEM = "gen_ai.system"
 GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 
-# ループ固有の属性は claude_loop.* 名前空間に置く（GenAI 規約を汚さない）。
-ATTR_ITERATIONS = "claude_loop.iterations"
-ATTR_STATUS = "claude_loop.status"
-ATTR_STOP = "claude_loop.stop"
-ATTR_TERMINATION_REASON = "claude_loop.termination_reason"
-ATTR_TOKENS_USED = "claude_loop.tokens_used"
-ATTR_ELAPSED = "claude_loop.elapsed"
+# ループ固有の属性は loop_agent.* 名前空間に置く（GenAI 規約を汚さない）。
+ATTR_ITERATIONS = "loop_agent.iterations"
+ATTR_STATUS = "loop_agent.status"
+ATTR_STOP = "loop_agent.stop"
+ATTR_TERMINATION_REASON = "loop_agent.termination_reason"
+ATTR_TOKENS_USED = "loop_agent.tokens_used"
+ATTR_ELAPSED = "loop_agent.elapsed"
 
-DEFAULT_SPAN_NAME = "claude_loop.loop"
+DEFAULT_SPAN_NAME = "loop_agent.loop"
 OPERATION_NAME = "loop"
-SYSTEM_NAME = "claude_loop"
+SYSTEM_NAME = "loop_agent"
 
 # 外側 Reflexion ループ (run_reflexion) 観測用の span 規約 (Issue #30)。内側 loop と
 # 同じ GenAI 規約 (gen_ai.operation.name / gen_ai.system) を踏襲しつつ、外側固有の情報は
-# claude_loop.reflexion.* 名前空間へ置く。span event (episode/epoch_boundary/lesson_decision)
+# loop_agent.reflexion.* 名前空間へ置く。span event (episode/epoch_boundary/lesson_decision)
 # が epoch 番号・評価器 version (= 採点係 id)・lesson 由来 (provenance) をタイムラインに刻む。
-REFLEXION_SPAN_NAME = "claude_loop.reflexion"
+REFLEXION_SPAN_NAME = "loop_agent.reflexion"
 REFLEXION_OPERATION_NAME = "reflexion"
 
-ATTR_REFLEXION_STATUS = "claude_loop.reflexion.status"
-ATTR_REFLEXION_STOP = "claude_loop.reflexion.stop"
-ATTR_REFLEXION_REASON = "claude_loop.reflexion.termination_reason"
-ATTR_REFLEXION_EPISODES = "claude_loop.reflexion.episodes"
-ATTR_REFLEXION_EPOCHS = "claude_loop.reflexion.epochs"
-ATTR_REFLEXION_BEST = "claude_loop.reflexion.best_gt_aggregate"
-ATTR_REFLEXION_REFLECTIONS = "claude_loop.reflexion.reflections"
-ATTR_REFLEXION_EVALUATOR_UPDATES = "claude_loop.reflexion.evaluator_updates"
-ATTR_REFLEXION_EVALUATOR_VERSION = "claude_loop.reflexion.evaluator_version"
-ATTR_REFLEXION_DECLARED_KEYS = "claude_loop.reflexion.declared_keys"
-ATTR_REFLEXION_EPOCH_LEN = "claude_loop.reflexion.epoch_len"
-ATTR_REFLEXION_EPSILON = "claude_loop.reflexion.epsilon"
+ATTR_REFLEXION_STATUS = "loop_agent.reflexion.status"
+ATTR_REFLEXION_STOP = "loop_agent.reflexion.stop"
+ATTR_REFLEXION_REASON = "loop_agent.reflexion.termination_reason"
+ATTR_REFLEXION_EPISODES = "loop_agent.reflexion.episodes"
+ATTR_REFLEXION_EPOCHS = "loop_agent.reflexion.epochs"
+ATTR_REFLEXION_BEST = "loop_agent.reflexion.best_gt_aggregate"
+ATTR_REFLEXION_REFLECTIONS = "loop_agent.reflexion.reflections"
+ATTR_REFLEXION_EVALUATOR_UPDATES = "loop_agent.reflexion.evaluator_updates"
+ATTR_REFLEXION_EVALUATOR_VERSION = "loop_agent.reflexion.evaluator_version"
+ATTR_REFLEXION_DECLARED_KEYS = "loop_agent.reflexion.declared_keys"
+ATTR_REFLEXION_EPOCH_LEN = "loop_agent.reflexion.epoch_len"
+ATTR_REFLEXION_EPSILON = "loop_agent.reflexion.epsilon"
 
 
 def otel_available() -> bool:
@@ -84,7 +84,7 @@ def otel_available() -> bool:
 class LoopSpan:
     """ループ run 1 回を表す OTel span の薄いラッパ。OTel 不在なら no-op。
 
-    span のライフサイクルは :class:`~claude_loop.observe.LoopObserver` が握る:
+    span のライフサイクルは :class:`~loop_agent.observe.LoopObserver` が握る:
     :meth:`start` で開始、:meth:`add_step` で反復をタイムラインに刻み、
     :meth:`end` で gen_ai.* 属性 + 終了理由を載せて終了する。
 
@@ -181,7 +181,7 @@ class LoopSpan:
         stop: Optional[str] = None,
         error: "Optional[BaseException]" = None,
     ) -> None:
-        """終了理由 + メトリクスを gen_ai.* / claude_loop.* に載せて span を閉じる。
+        """終了理由 + メトリクスを gen_ai.* / loop_agent.* に載せて span を閉じる。
 
         ``status="error"`` または ``error`` が渡された場合は span status を ERROR に
         し、例外を記録する。goal_met / stopped は正常終了として OK 扱い。
@@ -225,7 +225,7 @@ class ReflexionSpan:
 
     内側 :class:`LoopSpan` と同じライフサイクル契約 (start/…/end + best-effort degrade) を
     踏襲する。違いは、刻むタイムラインが **反復** ではなく **episode / epoch 境界 / lesson 採否**
-    である点だけ。span のライフサイクルは :class:`~claude_loop.reflexion_observe.ReflexionObserver`
+    である点だけ。span のライフサイクルは :class:`~loop_agent.reflexion_observe.ReflexionObserver`
     が握る:
 
     - :meth:`start` で span を開始し、run 不変の GenAI 属性 + 構成 (declared_keys/epoch_len/epsilon)
@@ -234,7 +234,7 @@ class ReflexionSpan:
       version = 採点係 id・一次集約 / reward・lesson 採否 / 由来 provenance を属性化)。
     - :meth:`add_epoch` で 1 epoch 境界を ``epoch_boundary`` event として刻む (評価器昇格/却下と
       version 遷移)。
-    - :meth:`end` で外側の終了理由 + 集計を ``claude_loop.reflexion.*`` に載せて span を閉じる。
+    - :meth:`end` で外側の終了理由 + 集計を ``loop_agent.reflexion.*`` に載せて span を閉じる。
 
     OTel が未導入、または ``enabled=False`` の場合は全メソッドが安全に何もしない
     (:attr:`recording` は ``False`` を返す)。tracer/span の例外は best-effort で握り、外側
@@ -427,7 +427,7 @@ class ReflexionSpan:
         stop: Optional[str] = None,
         error: "Optional[BaseException]" = None,
     ) -> None:
-        """外側の終了理由 + 集計を ``claude_loop.reflexion.*`` に載せて span を閉じる。
+        """外側の終了理由 + 集計を ``loop_agent.reflexion.*`` に載せて span を閉じる。
 
         ``status="error"`` または ``error`` が渡された場合は span status を ERROR にし例外を
         記録する。``converged`` / ``stopped`` / ``paused`` は正常終了として OK 扱い。二重 end は

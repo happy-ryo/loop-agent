@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from claude_loop import ActOutcome, VerifyOutcome
+from loop_agent import ActOutcome, VerifyOutcome
 
 
 class ManualClock:

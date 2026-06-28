@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     ActOutcome,
     AdoptionResult,
     Candidate,
@@ -36,9 +36,9 @@ from claude_loop import (
     run_loop,
     triage,
 )
-from claude_loop.discovery import GATE_KEY_PREFIX
-from claude_loop.loop import LoopResult
-from claude_loop.store import EVENT_GATE
+from loop_agent.discovery import GATE_KEY_PREFIX
+from loop_agent.loop import LoopResult
+from loop_agent.store import EVENT_GATE
 
 
 # -- 計算層 (triage): 決定的・read-only -------------------------------------

@@ -1,8 +1,8 @@
 """外側 Reflexion ループの収束/停止条件 (report.md S2.6 / S4.5 / Issue #22).
 
-内側ループの :mod:`claude_loop.conditions` と **同じ合成プロトコル** (``name`` +
-``check(state) -> reason | None``) を踏襲し、:class:`~claude_loop.conditions.AnyOf` /
-:class:`~claude_loop.conditions.StopTrigger` を **そのまま再利用** する。違いは check が
+内側ループの :mod:`loop_agent.conditions` と **同じ合成プロトコル** (``name`` +
+``check(state) -> reason | None``) を踏襲し、:class:`~loop_agent.conditions.AnyOf` /
+:class:`~loop_agent.conditions.StopTrigger` を **そのまま再利用** する。違いは check が
 :class:`OuterState` (episode/epoch 粒度) を見る点だけ。
 
 収束判定は report.md S2.6 (AWS evaluator reflect-refine) の三本柱:

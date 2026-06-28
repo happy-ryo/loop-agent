@@ -16,7 +16,7 @@ CLI 出力は ASCII のみ (cp932 端末での --help / print クラッシュ回
 
 from __future__ import annotations
 
-from claude_loop import (
+from loop_agent import (
     ActOutcome,
     Evaluator,
     GroundTruthSignal,
@@ -31,7 +31,7 @@ from claude_loop import (
     run_loop,
     run_reflexion,
 )
-from claude_loop.memory import step_signature
+from loop_agent.memory import step_signature
 
 DECLARED_KEYS = ("correctness",)
 LESSON_HINT = "increment the index by 1"
@@ -114,7 +114,7 @@ def run() -> object:
 
 def main() -> None:
     result = run()
-    print("=== claude-loop Reflexion demo ===")
+    print("=== loop-agent Reflexion demo ===")
     for rec in result.state.episodes:
         outcome = "PASS" if rec.succeeded else "fail"
         print(

@@ -3,27 +3,27 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "claude-loop"
+name = "loop-agent"
 version = "0.0.1"
-description = "claude-loop PoC: a minimal gather->act->verify->repeat loop core with composable stop conditions."
+description = "loop-agent PoC: a minimal gather->act->verify->repeat loop core with composable stop conditions."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
 # OTel GenAI span 連携は optional 依存（report.md S4.5）。未導入環境では
-# claude_loop.otel.LoopSpan が no-op へ degrade し、JSONL/event sink は動き続ける。
+# loop_agent.otel.LoopSpan が no-op へ degrade し、JSONL/event sink は動き続ける。
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.20"]
 # dev では SDK も入れ、in-memory exporter で OTel span の中身まで CI で検証する。
 dev = ["pytest>=7", "opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/claude_loop"]
+packages = ["src/loop_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-# Resolve `import claude_loop` against this checkout's src/ first, ahead of any
+# Resolve `import loop_agent` against this checkout's src/ first, ahead of any
 # editable install that might point at a sibling worktree, so the suite always
 # tests the code in this tree regardless of the ambient environment.
 pythonpath = ["src"]

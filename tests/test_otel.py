@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     LoopObserver,
     LoopSpan,
     MaxIterations,
@@ -22,7 +22,7 @@ from claude_loop import (
     otel_available,
     run_observed_loop,
 )
-from claude_loop.otel import (
+from loop_agent.otel import (
     ATTR_ITERATIONS,
     ATTR_STATUS,
     ATTR_STOP,
@@ -49,7 +49,7 @@ def test_loop_span_noop_when_disabled():
 
 def test_loop_span_degrades_when_otel_unavailable(monkeypatch):
     # OTel 未導入を擬似再現: _OTEL_AVAILABLE=False なら、tracer を渡しても no-op。
-    import claude_loop.otel as otel_mod
+    import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", False)
     span = otel_mod.LoopSpan(tracer="would-be-a-tracer", enabled=True)
@@ -108,10 +108,10 @@ def test_run_creates_single_span_with_genai_attributes(otel_tracer):
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     span = spans[0]
-    assert span.name == "claude_loop.loop"
+    assert span.name == "loop_agent.loop"
     attrs = dict(span.attributes)
     assert attrs[GEN_AI_OPERATION_NAME] == "loop"
-    assert attrs[GEN_AI_SYSTEM] == "claude_loop"
+    assert attrs[GEN_AI_SYSTEM] == "loop_agent"
     assert attrs[ATTR_STATUS] == "stopped"
     assert attrs[ATTR_STOP] == "max_iterations"
     assert attrs[ATTR_ITERATIONS] == 3
@@ -215,7 +215,7 @@ def test_exception_marks_span_error(otel_tracer):
 def test_misbehaving_tracer_does_not_crash_the_loop(monkeypatch):
     # 観測層はループを殺さない: tracer/span が例外を投げても best-effort で握り、
     # 警告を出しつつループは完走し、event sink は正常に終了まで残る。
-    import claude_loop.otel as otel_mod
+    import loop_agent.otel as otel_mod
     import warnings
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", True)
@@ -264,7 +264,7 @@ def test_misbehaving_tracer_does_not_crash_the_loop(monkeypatch):
 
 def test_start_failure_degrades_to_noop(monkeypatch):
     # start_span 自体が落ちても以後 no-op に倒れ、ループは完走する。
-    import claude_loop.otel as otel_mod
+    import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", True)
 

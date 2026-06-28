@@ -3,7 +3,7 @@
 report.md S3.3 / S4.6 / S5 Phase3。ループの **完了 / 次反復 / 判断要求** を別ループや
 窓口 (受信側) に届ける wake 配送の実体をここに新設する。claude-org runtime の broker
 sidecar は runtime 所属で直接再利用できない[^pattern-only]ため、**パターンだけ抽出** して
-claude-loop 側に依存ゼロ (stdlib のみ) で実装する。
+loop-agent 側に依存ゼロ (stdlib のみ) で実装する。
 
 抽出したパターン (出典 ``knowledge/curated/broker-transport.md`` / backend 契約):
 
@@ -185,7 +185,7 @@ class InMemoryWakeQueue:
     - ``confirm`` : ``CLAIMED`` かつ **owner が claim 時のまま** で、かつ lease 未失効なら
       ``DELIVERED`` (terminal) にする。lease 失効後に別 owner が再 claim した行への stale な
       confirm は owner 不一致で弾く (fencing) ので、喪失窓で「届いていないのに DELIVERED」化
-      しない (前提: 並行 poll は distinct owner を使う。:meth:`~claude_loop.transport.Transport.poll` 参照)。
+      しない (前提: 並行 poll は distinct owner を使う。:meth:`~loop_agent.transport.Transport.poll` 参照)。
     - ``release_expired`` : lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻す (再 eligible)。
     - ``mark_delivered`` : push が確定配送した wake を直接 ``DELIVERED`` (terminal) にする。
       任意の非 terminal 状態から冪等に遷移できる (push と pull の継ぎ目を吸収)。

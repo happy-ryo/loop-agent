@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop.evaluator import (
+from loop_agent.evaluator import (
     Evaluator,
     HeldOut,
     Probe,
@@ -222,8 +222,8 @@ def test_lambda_evaluators_distinguished_by_source_location():
 
 def test_version_detects_in_place_body_change():
     """定義位置を動かさず本体 (定数) を変えた scorer は別 version になる。"""
-    src_a = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=0.5)\n"
-    src_b = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=1.0)\n"
+    src_a = "def s(o):\n    return __import__('loop_agent').Score(ground_truth=0.5)\n"
+    src_b = "def s(o):\n    return __import__('loop_agent').Score(ground_truth=1.0)\n"
     ns_a: dict = {}
     ns_b: dict = {}
     # 同一 filename/firstlineno を持つ別本体の関数を作る (in-place 書き換えを模す)。
@@ -251,7 +251,7 @@ def test_version_detects_factory_default_argument_change():
 
 
 def test_version_reproducible_for_identical_source():
-    src = "def s(o):\n    return __import__('claude_loop').Score(ground_truth=0.5)\n"
+    src = "def s(o):\n    return __import__('loop_agent').Score(ground_truth=0.5)\n"
     ns1: dict = {}
     ns2: dict = {}
     exec(compile(src, "scorer.py", "exec"), ns1)

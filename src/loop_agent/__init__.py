@@ -1,11 +1,11 @@
-"""claude-loop PoC loop core.
+"""loop-agent PoC loop core.
 
 A minimal, single-process ``gather -> act -> verify -> repeat`` driver with
 composable, reason-bearing stop conditions. See report.md S4.4 / S5 Phase 1.
 
 Quick start::
 
-    from claude_loop import run_loop, ActOutcome, VerifyOutcome, MaxIterations
+    from loop_agent import run_loop, ActOutcome, VerifyOutcome, MaxIterations
 
     def act(ctx):
         return ActOutcome(observation="did one unit of work", tokens=10)

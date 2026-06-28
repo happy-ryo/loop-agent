@@ -16,7 +16,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from claude_loop import (
+from loop_agent import (
     ActOutcome,
     JsonlEventSink,
     ListSink,

@@ -2,7 +2,7 @@
 
 外側 Reflexion ループ (report.md S4.4 / S5 Phase3) が episode 境界で生成する「言語的
 指針 (lesson)」を保持し、次 episode の context へ ``render()`` で配線するための器。
-本モジュールは **葉モジュール** で、``claude_loop.state`` (StepRecord) 以外に依存しない
+本モジュールは **葉モジュール** で、``loop_agent.state`` (StepRecord) 以外に依存しない
 (LLM 依存も無い)。意味的な検証が要るなら :data:`LessonVerifier` を注入する。
 
 安全設計 (report.md S6 + RQGM / Issue #4) ― ここで担保する不変条件:
@@ -14,7 +14,7 @@
   でっち上げ lesson (実 step に紐づかない) は ``provenance`` 不一致で弾かれる。
 - **自己申告 support を信用しない**: ``Lesson.support`` は **駆動側 (run_reflexion) が
   権威ある信号から再計算して上書き** する値であり、``reflect`` フックが詐称しても
-  admission には効かない (driver が overwrite する。:mod:`claude_loop.reflexion` 参照)。
+  admission には効かない (driver が overwrite する。:mod:`loop_agent.reflexion` 参照)。
 - **肥大化・劣化の抑止 (反復上限)**: 保持件数 ``cap`` / 1 lesson の文字上限
   ``per_lesson_chars`` / ``render()`` の総バイト上限 ``render_byte_cap`` で、蓄積も
   next-context への描画も有界にする (report.md「3 反復で 4 倍膨張」緩和)。

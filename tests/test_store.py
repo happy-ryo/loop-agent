@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     DBProgressLog,
     LoopStore,
     MaxIterations,
@@ -24,7 +24,7 @@ from claude_loop import (
     connect,
     run_loop,
 )
-from claude_loop.store import (
+from loop_agent.store import (
     EVENT_BEGIN,
     EVENT_END,
     EVENT_STEP,
@@ -86,7 +86,7 @@ def test_schema_carries_no_claude_org_tables(tmp_path):
 
 
 def test_store_module_does_not_import_org_state_db(tmp_path):
-    # claude_loop.store / connect が claude-org の tools.state_db を一切 import
+    # loop_agent.store / connect が claude-org の tools.state_db を一切 import
     # しないこと (import するとパッケージとして org に密結合する)。
     connect(tmp_path / "state.db")
     assert not any("tools.state_db" in m for m in sys.modules)

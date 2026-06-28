@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from claude_loop import (
+from loop_agent import (
     LOOP_BEGIN,
     LOOP_END,
     LOOP_STEP,

@@ -1,23 +1,23 @@
 """ループ wake と transport 配送の配線 (report.md S5 Phase3, Issue #23)。
 
-:mod:`claude_loop.transport` は配送機構 (push 一次 / pull fallback / at-most-once) を
+:mod:`loop_agent.transport` は配送機構 (push 一次 / pull fallback / at-most-once) を
 提供するが、**ループのどの瞬間がどの wake になるか** はループ側の関心である。本モジュールは
-その対応付け (loop 完了 / 次反復 / 判断要求 -> :class:`~claude_loop.transport.Wake`) を担い、
-:class:`~claude_loop.observe.LoopObserver` / :class:`~claude_loop.store.DBProgressLog` と同じ
+その対応付け (loop 完了 / 次反復 / 判断要求 -> :class:`~loop_agent.transport.Wake`) を担い、
+:class:`~loop_agent.observe.LoopObserver` / :class:`~loop_agent.store.DBProgressLog` と同じ
 作法 (``record_result`` 観測フック) に乗る drop-in として配線できるようにする。
 
 配送する 3 wake (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」):
 
-- **完了** (:data:`~claude_loop.transport.WAKE_LOOP_DONE`): ``run_loop`` が終端した
+- **完了** (:data:`~loop_agent.transport.WAKE_LOOP_DONE`): ``run_loop`` が終端した
   (``goal_met`` / ``stopped``)。受信側 (coordinator / 窓口) に終了と理由を届ける。
-- **判断要求** (:data:`~claude_loop.transport.WAKE_DECISION_REQUEST`): 人間ゲートで
+- **判断要求** (:data:`~loop_agent.transport.WAKE_DECISION_REQUEST`): 人間ゲートで
   ``paused`` した。不可逆 action の判断を人間に要求する wake (gate_key を載せる)。
-- **次反復** (:data:`~claude_loop.transport.WAKE_NEXT_ITERATION`): 完了 -> 次反復の接続を
+- **次反復** (:data:`~loop_agent.transport.WAKE_NEXT_ITERATION`): 完了 -> 次反復の接続を
   起こす wake。完了後に次候補へ進む合図 (人間ゲート維持の前提で、提案として配送)。
 
 wake id は **決定的** に組む (``f"{run_id}:{kind}:{iteration}"``)。これにより resume での
 再配送指示や push/pull の継ぎ目で同じ wake を二度 deliver しても、queue の二重 enqueue 冪等性
-(:meth:`~claude_loop.transport.InMemoryWakeQueue.enqueue`) で de-dup され、受信側に二重に
+(:meth:`~loop_agent.transport.InMemoryWakeQueue.enqueue`) で de-dup され、受信側に二重に
 届かない (at-most-once の土台)。
 """
 
@@ -109,7 +109,7 @@ def wakes_for_result(
 class LoopWaker:
     """ループの wake を :class:`Transport` 経由で配送する drop-in 配線。
 
-    :class:`~claude_loop.observe.LoopObserver` / :class:`~claude_loop.store.DBProgressLog`
+    :class:`~loop_agent.observe.LoopObserver` / :class:`~loop_agent.store.DBProgressLog`
     と同じ ``record_result`` フック形を実装するので、観測の配線にそのまま並べられる::
 
         waker = LoopWaker(transport, run_id="r1", recipient="coordinator")
