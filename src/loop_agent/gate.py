@@ -198,6 +198,7 @@ class HumanGate:
             従来通り無通知。通知は best-effort で、失敗は warning 化して :class:`HumanGate` を
             止めない (承認要求自体は store に永続化済みなので通知が落ちても loop は進む)。
             既登録ゲートの resume 再訪では再通知しない (``entry`` が既に存在するため)。
+            ``resolver`` 併用時は通知しない (同期 inline 解決で人間待ちにならないため)。
         describe: 任意。``describe(action) -> Mapping`` で通知 payload
             (:class:`~loop_agent.notify.ApprovalRequest`) の ``summary`` / ``action_kind`` /
             ``deadline`` を導出・上書きする。未指定なら ``summary`` は action から自動生成
@@ -272,10 +273,12 @@ class HumanGate:
             # 新規承認要求の発火点はこの INSERT 1 回だけ: ``created`` のときだけ通知する。
             # resume 再訪 (entry が既存で None でない) も、get_decision で None を見た後の
             # TOCTOU レースで敗者が相手の行を受け取ったケース (created=False) も再通知しない。
+            # さらに resolver 併用時は通知しない: 直後の resolver 分岐が同期で inline 解決し
+            # **人間待ちにならない** ため (外部チャネルへ「承認待ち」を誤って page しない)。
             entry, created = self.store.register_decision(
                 self.run_id, gate_key, context
             )
-            if created:
+            if created and self.resolver is None:
                 self._notify_new_request(gate_key, context)
 
         # どの分岐に進む前に **必ず** 登録時の action と現在の提案 action の一致を確認する。

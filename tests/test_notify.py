@@ -488,6 +488,28 @@ def test_gate_does_not_renotify_on_resume(tmp_path):
     assert executed2 == ["work", "deploy", "work2"]
 
 
+def test_gate_does_not_notify_when_resolver_present(tmp_path):
+    # resolver 併用は同期 inline 解決で人間待ちにならないので通知しない (P2 回帰)。
+    from loop_agent import Decision
+
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    gather, act, executed = make_world(ACTIONS)
+    notifier = RecordingNotifier()
+    gate = HumanGate(
+        on=is_deploy, store=store, run_id=RUN_ID, notifier=notifier,
+        resolver=lambda pending: Decision("approve"),
+    )
+    res = run_loop(
+        act=act, verify=never_done, conditions=[MaxIterations(3)],
+        gather=gather, gate=gate,
+    )
+    # resolver が "deploy" を inline approve するので最後まで進む。通知は発火しない。
+    assert res.status == "stopped"
+    assert executed == ["work", "deploy", "work2"]
+    assert notifier.requests == []
+
+
 def test_register_decision_reports_created_flag(tmp_path):
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
