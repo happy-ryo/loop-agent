@@ -79,6 +79,7 @@ from loop_agent import (  # noqa: E402
     VerifyOutcome,
     connect,
     run_gated_loop,
+    run_loop,
 )
 from loop_agent.adapters.claude_code import ClaudeCodeAct  # noqa: E402
 from loop_agent.memory import step_signature  # noqa: E402
@@ -319,8 +320,6 @@ def run_no_reflexion(
                 on_step=observer.on_step,
             )
         else:
-            from loop_agent import run_loop
-
             result = run_loop(
                 act=act,
                 verify=translator.verify,
@@ -410,6 +409,7 @@ def run_with_reflexion(
     max_episodes: int = 3,
     epoch_len: int = 2,
     timeout: float = 6_000.0,
+    gate: bool = True,
 ) -> RunResult:
     """Run the Reflexion outer loop; lessons from failed episodes feed the next.
 
@@ -434,26 +434,35 @@ def run_with_reflexion(
             sinks=[sink], conditions=conditions, span_name="loop_agent.episode"
         )
         with inner_obs:
-            run_id = f"self-translation-ep{ctx.episode}-{uuid.uuid4().hex[:8]}"
-            store = LoopStore(
-                connect(
-                    REPO_ROOT
-                    / "examples"
-                    / "self_translation_poc"
-                    / f".gate-{run_id}.sqlite3"
+            if gate:
+                run_id = f"self-translation-ep{ctx.episode}-{uuid.uuid4().hex[:8]}"
+                store = LoopStore(
+                    connect(
+                        REPO_ROOT
+                        / "examples"
+                        / "self_translation_poc"
+                        / f".gate-{run_id}.sqlite3"
+                    )
                 )
-            )
-            result = run_gated_loop(
-                act=act,
-                verify=translator.verify,
-                conditions=conditions,
-                gather=translator.gather,
-                on=lambda _ctx: True,
-                resolver=_auto_approve,
-                store=store,
-                run_id=run_id,
-                on_step=inner_obs.on_step,
-            )
+                result = run_gated_loop(
+                    act=act,
+                    verify=translator.verify,
+                    conditions=conditions,
+                    gather=translator.gather,
+                    on=lambda _ctx: True,
+                    resolver=_auto_approve,
+                    store=store,
+                    run_id=run_id,
+                    on_step=inner_obs.on_step,
+                )
+            else:
+                result = run_loop(
+                    act=act,
+                    verify=translator.verify,
+                    conditions=conditions,
+                    gather=translator.gather,
+                    on_step=inner_obs.on_step,
+                )
             inner_obs.record_result(result)
         token_acc["total"] += result.tokens_used
         return result
@@ -562,6 +571,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--no-gate", action="store_true", help="disable the HumanGate (act-only)")
     parser.add_argument("--model", default="haiku", help="claude model alias (default: haiku)")
     parser.add_argument("--timeout", type=float, default=600.0, help="per-call timeout seconds")
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=20_000_000,
+        help=(
+            "TokenBudget cap. Default is high on purpose: ClaudeCodeAct charges "
+            "cache-read tokens, so a real run reports millions of tokens (see "
+            "docs/dogfood/self-translation-poc.md Finding A). The spec value "
+            "2000000 would trip around iteration 3."
+        ),
+    )
     parser.add_argument("--log", default=None, help="JSONL log path")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -582,10 +602,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     translator = Translator(TARGET_FILES, run_tests=run_tests)
 
     if args.reflexion:
-        res = run_with_reflexion(translator, act, log_path=log_path)
+        res = run_with_reflexion(
+            translator,
+            act,
+            log_path=log_path,
+            token_budget=args.token_budget,
+            gate=not args.no_gate,
+        )
     else:
         res = run_no_reflexion(
-            translator, act, log_path=log_path, gate=not args.no_gate
+            translator,
+            act,
+            log_path=log_path,
+            token_budget=args.token_budget,
+            gate=not args.no_gate,
         )
 
     print("=== self-translation PoC ===")

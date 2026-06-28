@@ -270,8 +270,9 @@ adapter -- e.g. count only `input_tokens + output_tokens + cache_creation_input_
 a `token_fields` allowlist. Relevant hunk: `src/loop_agent/adapters/claude_code.py`
 `_sum_token_fields` / `parse_tokens`.
 
-**Workaround used here:** raised the run budget so the loop is governed by
-`MaxIterations` instead, and recorded the inflated token figure as-is.
+**Workaround used here:** the harness governs the run by `MaxIterations` instead,
+exposing `--token-budget` (default 20,000,000 so a real `--real` run completes)
+and recording the inflated token figure as-is.
 
 **Cross-references:** relates to the token/cost accounting touched by the
 ModelLadder work (#53) and the self-improvement RFC (#54); the standalone Issue
@@ -297,10 +298,17 @@ and pairs with the existing `discovery.triage` work-selection seam.
 python examples/self_translation_poc/harness.py --selfcheck
 pytest tests/test_self_translation_poc.py
 
-# Real run 1 (no Reflexion):
+# Real run 1 (no Reflexion). --token-budget defaults to 20M so the run completes
+# despite the cache-read token inflation (Finding A):
 python examples/self_translation_poc/harness.py --real --model haiku
 
 # Real run 2 (Reflexion); reset the ten files to their Japanese originals first:
-#   for f in ...; do git show HEAD:src/loop_agent/$f.py > src/loop_agent/$f.py; done
+#   for f in waker convergence observe events memory evaluator reflexion_store transport gate; do \
+#     git show HEAD:src/loop_agent/$f.py > src/loop_agent/$f.py; done
+#   git show HEAD:src/loop_agent/adapters/claude_code.py > src/loop_agent/adapters/claude_code.py
 python examples/self_translation_poc/harness.py --real --reflexion --model haiku
 ```
+
+The two committed runs above were driven by the same functions with
+`token_budget=20_000_000`; `--no-gate` is honored on both the Reflexion and
+non-Reflexion paths.
