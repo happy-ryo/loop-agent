@@ -203,6 +203,7 @@ report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェン
 - ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
 - ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤）
 - ✅ **中断 → 再開（resume）**: 永続化済み step から `LoopState` を復元し、`run_loop(initial_state=…)` で状態欠落なく途中から継続（iteration・コスト累積・`elapsed`・history を引き継ぐ）。中断して再開した結果が通し実行と一致することを回帰テストで実証（`tests/test_resume.py` / Issue #14）
+- ✅ **async/await 対応**: 非同期エントリポイント `async_run_loop`（`await async_run_loop(…)`）。同期 API `run_loop` は完全維持（内部は `asyncio.run` ラッパ）。`gather`/`act`/`verify`/`conditions`/`gate`/`on_step` の各シームは **同期 callable のまま受けつつ非同期（acallable）も受ける**（混在可・同期フックは追加コストなし）。`asyncio.gather` で複数ループを並行実行できる（`tests/test_async_loop.py` / Issue #40）
 - ✅ **限定人間ゲート**: 不可逆操作のみ approve/edit/reject/respond で interrupt（state 永続化で pause/resume・不可逆は exactly-once。Issue #15）
 - ✅ **複数プロセス同時 resume の協調（in-progress リース）**: 同一 `run_id` を複数プロセスで同時に resume しても、不可逆 action は **exactly-once + 順序整合**（`pending → resolved → executing → executed` 多段化 + リース single-winner）。敗者は `executed` まで pause、勝者クラッシュ時はリース失効で別プロセスが取り直し step も欠落しない。並行プロセス模擬で実証（`tests/test_concurrent_resume.py` / Issue #21）
 - ✅ **wake 配送 transport / 次反復入力選定 work-discovery**: 完了/次反復/判断要求 wake を push 一次 / pull fallback で配送（`tests/test_transport.py` / Issue #23）。次反復対象を計算層（決定的 triage）+ 配達層（propose-only 人間ゲート）で選定（`tests/test_discovery.py` / Issue #24）
