@@ -481,6 +481,27 @@ def test_looks_async_partial_allows_kill_without_alarm(monkeypatch):
         )
 
 
+def test_looks_async_partial_of_async_call_instance_allows_kill_without_alarm(monkeypatch):
+    """functools.partial wrapping an instance with async __call__ is recognised async."""
+    monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
+
+    class AsyncCallAct:
+        async def __call__(self, _ctx):
+            await asyncio.sleep(5.0)
+            return ActOutcome(tokens=1)
+
+    part = functools.partial(AsyncCallAct())
+    with pytest.raises(SeamTimeout):
+        asyncio.run(
+            async_run_loop(
+                act=part,
+                verify=afast_verify,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
+            )
+        )
+
+
 def test_looks_async_async_dunder_call_allows_kill_without_alarm(monkeypatch):
     monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
 
@@ -660,6 +681,34 @@ def test_no_alarm_sync_prefix_overrun_trips_before_await(monkeypatch):
     assert result.iterations == 2
     assert [r.observation for r in result.history] == [ACT_TIMEOUT_OBSERVATION] * 2
     assert result.tokens_used == 0  # the returned awaitable was never awaited
+
+
+def test_prefix_overrun_cancels_returned_task(monkeypatch):
+    """When the sync prefix exhausts the budget and the seam returned a scheduled
+    Task, that Task is cancelled (not left running side effects in background)."""
+    monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
+    ran = {"flag": False}
+
+    async def background():
+        await asyncio.sleep(1.0)
+        ran["flag"] = True
+        return ActOutcome(tokens=1)
+
+    def blocking_then_task(_ctx):
+        time.sleep(0.05)  # synchronous prefix exceeds the 0.02s deadline
+        return asyncio.ensure_future(background())  # an already-scheduled Task
+
+    result = asyncio.run(
+        async_run_loop(
+            act=blocking_then_task,
+            verify=afast_verify,
+            conditions=[MaxIterations(1)],
+            timeout=TimeoutPolicy(act=0.02, on_timeout=TIMEOUT_GRACEFUL),
+        )
+    )
+    assert result.iterations == 1
+    assert result.history[0].observation == ACT_TIMEOUT_OBSERVATION
+    assert ran["flag"] is False  # the returned Task was cancelled, never ran
 
 
 # -- seam's OWN TimeoutError is preserved, not conflated with ours ----------

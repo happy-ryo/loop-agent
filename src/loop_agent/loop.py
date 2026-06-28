@@ -277,7 +277,8 @@ def _looks_async(fn: Any) -> bool:
     Used only on platforms without ``SIGALRM`` to decide, *before* calling, that
     a hard-kill timeout on an apparently-synchronous seam cannot be honoured
     (avoiding entry into an uninterruptible blocking call). Detects ``async def``
-    callables directly and through ``functools.partial`` / ``__call__``. A plain
+    callables directly and through ``functools.partial`` / ``__call__`` (including
+    a partial wrapping an instance whose ``__call__`` is ``async``). A plain
     callable that *returns* a coroutine is conservatively treated as synchronous
     -- erring toward a loud :class:`UnsupportedTimeoutKill` rather than a silent
     hang (use ``async def`` for guaranteed kill).
@@ -285,8 +286,12 @@ def _looks_async(fn: Any) -> bool:
     if asyncio.iscoroutinefunction(fn):
         return True
     inner = getattr(fn, "func", None)  # functools.partial
-    if inner is not None and asyncio.iscoroutinefunction(inner):
-        return True
+    if inner is not None:
+        if asyncio.iscoroutinefunction(inner):
+            return True
+        inner_call = getattr(type(inner), "__call__", None)
+        if inner_call is not None and asyncio.iscoroutinefunction(inner_call):
+            return True
     call = getattr(type(fn), "__call__", None)
     if call is not None and asyncio.iscoroutinefunction(call):
         return True
@@ -355,6 +360,27 @@ def _on_timeout(mode: str, seam: str, seconds: float) -> Exception:
     if mode == TIMEOUT_KILL:
         return SeamTimeout(seam, seconds)
     return _GracefulTimeout(seam, seconds)
+
+
+def _abandon_awaitable(aw: Any) -> None:
+    """Best-effort stop an awaitable we will not await (timeout / rejection).
+
+    Cancels a scheduled ``Task``/``Future`` -- so a timed-out seam that returned
+    one does not keep running side effects in the background, even under
+    ``kill`` -- and consumes its outcome via a done-callback to avoid asyncio
+    warnings. A bare coroutine (no ``cancel``) is ``close()``d so Python does not
+    warn it was never awaited.
+    """
+    cancel = getattr(aw, "cancel", None)
+    if cancel is not None:
+        cancel()
+        add_done_callback = getattr(aw, "add_done_callback", None)
+        if add_done_callback is not None:
+            add_done_callback(_discard_task_outcome)
+        return
+    close = getattr(aw, "close", None)
+    if close is not None:
+        close()
 
 
 def _discard_task_outcome(task: "asyncio.Future[Any]") -> None:
@@ -440,9 +466,7 @@ async def _run_seam(
             # run_loop drives this synchronously: an awaitable seam is rejected
             # exactly as on the no-timeout path (maybe_await), pointing at
             # async_run_loop instead of attempting to await without a loop.
-            close = getattr(result, "close", None)
-            if close is not None:
-                close()
+            _abandon_awaitable(result)
             raise AsyncSeamInSyncLoop(
                 "run_loop() received an async (awaitable) seam "
                 "(act/verify/gather/condition/gate/on_step/on_complete); "
@@ -451,12 +475,11 @@ async def _run_seam(
         # Carry the single per-call budget into the await: subtract the real
         # wall-clock time the synchronous prefix already consumed. If it already
         # exhausted the deadline, trip now instead of giving the awaitable a fresh
-        # budget (a blocking sync prefix is not interruptible anyway).
+        # budget (a blocking sync prefix is not interruptible anyway). Cancel the
+        # un-awaited awaitable (a Task/Future would otherwise keep running).
         remaining = seconds - (time.monotonic() - wall_start)
         if remaining <= 0:
-            close = getattr(result, "close", None)
-            if close is not None:
-                close()
+            _abandon_awaitable(result)
             raise _on_timeout(mode, seam, seconds)
         # Drive the awaitable as a task and decide by whether it is still PENDING
         # at the deadline -- distinguishing OUR per-call timeout from a
