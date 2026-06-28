@@ -121,13 +121,21 @@ def escalating_act(ctx):
 result = run_loop(act=escalating_act, ...)
 ```
 
-**WorkListGather（multi-item ループの公平 scheduling）** — N ファイル / N bug を回すとき、素朴な「先頭未完を返す `gather`」は 1 件が `MaxIterations` を独占して他を starve させる。試行回数最小から選ぶ round-robin を `gather` に書けば公平になる（Self-translation PoC でこの形を実走）:
+**WorkListGather（multi-item ループの公平 scheduling）** — N ファイル / N bug を回すとき、素朴な「先頭未完を返す `gather`」は 1 件が `MaxIterations` を独占して他を starve させる（Self-translation PoC でこの罠を実走）。これを正規化した `WorkListGather`（`loop_agent.discovery.work_list`, Issue #56）を `gather` に渡せば、公平 scheduling + per-item 上限 + per-item の done 判定が手に入る:
 
 ```python
-def gather(state):
-    rem = [f for f in files if f not in done]
-    return min(rem, key=lambda f: (attempts[f], files.index(f)))   # 公平 scheduling
+from loop_agent import WorkListGather, WorkListDrained
+
+gather = WorkListGather(
+    files, strategy="fewest_attempts",   # 試行回数最小から選ぶ round-robin
+    max_attempts_per_item=3,             # 1 件が独占しないよう per-item で打ち止め
+    done_when=lambda item, rec: rec.observation["passed"],
+)
+result = run_loop(act=act, verify=verify, gather=gather,
+                  conditions=[WorkListDrained(gather), MaxIterations(50)])
 ```
+
+手書きの round-robin（`min(rem, key=lambda f: (attempts[f], files.index(f)))`）でも同じことはできるが、attempt counter / done 集合 / resume 安全を `WorkListGather` が肩代わりする。詳細は [docs/recipes/multi-item-work-list.md](./docs/recipes/multi-item-work-list.md)。
 
 **Reflexion 合成** — `run_reflexion` は実装済み。escalating act と重ねれば「lessons 蓄積 + モデル昇格」の二段防御になる。ただし **Reflexion が効くのは systematic failure のタスクだけ**で、stochastic な取りこぼしには blind retry と差が出ない（[docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md) に判断基準と PoC 実証）。
 
@@ -732,6 +740,26 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 # adoption.candidate.payload == {"goal": "X"} → これを次ループの gather 入力にする
 ```
 
+**multi-item を 1 本のループで公平に回す `WorkListGather`**（`loop_agent.discovery.work_list`, Issue #56）: triage が「何を どの順で回すか」を決めるのに対し、`WorkListGather` は「採択済みの複数 item を **1 本のループで どう公平に回すか**」を担う `gather` フック。素朴な「先頭未完を返す gather」は 1 件が `MaxIterations` を独占して他を starve させるが、`WorkListGather` は公平 scheduling（`round_robin` / `fewest_attempts` / `fifo` / `priority` / custom）+ per-item 上限 + per-item の done 判定で starve を防ぐ。attempts / done / exhausted は毎回 `state.history` から導出する（**resume 安全** = in-process カウンタを持たない）。
+
+```python
+from loop_agent import WorkListGather, WorkListDrained, run_loop, MaxIterations
+
+gather = WorkListGather(
+    ["a.py", "b.py", "c.py"], strategy="fewest_attempts",
+    max_attempts_per_item=3,                                  # 1 件 3 回で打ち止め（exhausted）
+    done_when=lambda item, rec: rec.observation["passed"],    # この item は終わったか
+)
+result = run_loop(act=act, verify=verify, gather=gather,
+                  conditions=[WorkListDrained(gather), MaxIterations(50)])  # 全件 done/exhausted で停止
+gather.report(result.state)   # WorkListProgress(done=…, exhausted=…, remaining=…, attempts=…)
+
+# triage に優先度・順序計算を委譲（依存が解けた ready 候補だけを取り込む）
+gather = WorkListGather.from_triage([Candidate(id="hi", priority=9), Candidate(id="lo")])
+```
+
+詳細は [docs/recipes/multi-item-work-list.md](./docs/recipes/multi-item-work-list.md)。
+
 ### API 概要
 
 | 要素 | 役割 |
@@ -788,6 +816,8 @@ adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respon
 | `WorkDiscovery(store, run_id)` | 配達層。`propose(candidates, *, done=, cycle=)` で提案を人間ゲートに pending 登録（propose-only・冪等）/ `resolve(cycle, decision, payload=)` で採否記録（edit は ready 候補のみ）/ `adopted(cycle)` で採択結果 `AdoptionResult` を読む（resume をまたいで安定） |
 | `AdoptionResult` | 採否解決の結果。`status`(`pending`/`resolved`/`absent`) / `decision` / `candidate`(採択候補 or None) / `recommended` / `response` / `adopted`(候補が採択されたか) |
 | `discover_next(*, store, run_id, candidates, result=None, done=(), cycle=0)` | 完了→次反復の接続。`result.paused` なら提案せず `None`、完了していれば `propose` を呼ぶ（採択・起動はしない） |
+| `WorkListGather(items, *, strategy="fewest_attempts", max_attempts_per_item=None, done_when=…, build_ctx=…)` | multi-item を 1 本のループで公平に回す `gather` フック（Issue #56）。`strategy`=`round_robin`/`fewest_attempts`/`fifo`/`priority`/custom callable。`max_attempts_per_item` で per-item 上限（*exhausted*）。`done_when(item, record)` で per-item の完了判定。`attempts`/`done_items`/`exhausted_items`/`remaining`/`report` で進捗を `state` から導出（resume 安全）。`from_triage(candidates, *, done=, strategy=, …)` で triage に優先度・順序を委譲 |
+| `WorkListDrained(gatherer)` | 全 item が done/exhausted になったら止める stop 条件（gather より先に評価され `DRAINED` の漏れを防ぐ）。`WorkItem(id, priority=0, payload=None)` が scheduling 対象の 1 件 |
 | `loop_agent.cli:main(argv=None)` | CLI エントリポイント（`[project.scripts]` の `loop-agent`, Issue #31）。`run`/`status`/`resume`/`logs` サブコマンド + 引数なしでクイックヘルプ。プロセス終了コードを返す（成功 0 / 停止 1 / 設定エラー 2） |
 | `cli.load_config(path)` / `cli.parse_config(data)` | `task.toml` を検証済み `Config` に読み込む（`[loop]`/`[conditions]`/`[act]`/`[verify]`/`[state]`）。stdlib `tomllib`（3.11+）か 3.10 では `tomli` を使用 |
 | `cli.build_conditions(cfg, *, max_iter=…, token_budget=…, timeout=…)` | `Config` から stop 条件を合成（CLI フラグ > TOML 値 > 未指定）。1 つも無ければ `ConfigError`（R3） |
