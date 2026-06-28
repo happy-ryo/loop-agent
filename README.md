@@ -724,6 +724,52 @@ python3 examples/verify_driven_demo.py
 
 再利用フックは `loop_agent.demo`（`CandidateApplier` = act / `ExitCodeVerifier` = verify / `attempt_index` = gather）。この実走そのものを `tests/test_verify_demo.py` が pytest で再現・検証する（出荷物 == 検証対象）。
 
+### Claude Code 経由でループを回す（headless adapter）
+
+`loop_agent.adapters.ClaudeCodeAct` は、反復ごとに **headless の `claude --print` を subprocess で 1 回起動**する `act` フック。これにより `run_loop` の 1 行で「Claude Code をループの実行体に据える」ことができる（report.md S4.4 の act シーム / Issue #32）。
+
+```python
+from loop_agent import run_loop, MaxIterations, TokenBudget, VerifyOutcome
+from loop_agent.adapters import ClaudeCodeAct
+
+act = ClaudeCodeAct(
+    allowed_tools=["Read", "Edit"],   # --allowed-tools
+    timeout=600,                       # 超過は failed=True で graceful（例外を投げない）
+    model="opus",                      # 省略可（--model のエイリアス可）
+    permission_mode="acceptEdits",     # 省略可
+    # env=None なら os.environ を継承 → 既存 claude セッション + ANTHROPIC_API_KEY が効く
+)
+
+def verify(outcome):
+    # 応答は ActOutcome.observation（ClaudeCodeResult）に構造化される。
+    # .failed / .text / .tokens / .returncode / .error を見て判定できる。
+    res = outcome.observation
+    return VerifyOutcome(goal_met=(not res.failed) and "DONE" in res.text)
+
+result = run_loop(
+    act=act,
+    verify=verify,
+    gather=lambda state: {"prompt": f"次の修正を 1 つ書け（試行 {state.iteration}）"},
+    conditions=[MaxIterations(10), TokenBudget(200_000)],
+)
+```
+
+設計上の約束（ループコアの性質を壊さない）:
+
+- **例外でループを殺さない**: timeout 超過・非 0 終了・実行ファイル不在/権限不足は、例外を送出せず `failed=True` の `ClaudeCodeResult` を載せた `ActOutcome` として graceful に返る。境界評価の `Timeout` / `MaxIterations` は常に効く。
+- **token を予算に積む**: `--output-format json`（既定）の `usage` を解析し（無ければ stdout/stderr のフォールバック解析）、`ActOutcome.tokens` に載せる。driver がこれを `state.tokens_used` に積むので `TokenBudget` がそのまま効く。
+- **auth は claude CLI に委譲**: 既定で `os.environ` を継承し、既存の claude CLI セッション（`~/.claude` ログイン）を第一義に、`ANTHROPIC_API_KEY` を CLI 側フォールバックとして使う。`env=` で上書きマージできる。
+- **プロンプトの組み立て**: `prompt_template`（既定 `"{prompt}"`）を `gather` の戻り値（Mapping / `LoopState` / 文字列）で `str.format` 埋めする。`"... iter={iteration}"` のように `LoopState` のフィールドも埋め込める。
+
+subprocess を使わないテスト/デモには `MockClaudeCodeAct(responses=[...])` を使う（`responses` の各要素は `str` / `dict` / `ClaudeCodeResult`。`{"text": ..., "tokens": ..., "failed": ...}` で `TokenBudget` や失敗系も in-memory で再現できる）。実装は `src/loop_agent/adapters/claude_code.py`、検証は `tests/test_adapters_claude_code.py`。
+
+```python
+from loop_agent.adapters import MockClaudeCodeAct
+act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
+```
+
+非スコープ: TUI モード / stream-json の深い統合 / Plan mode 連携。
+
 ### テスト
 
 ```bash
