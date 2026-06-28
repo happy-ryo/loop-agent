@@ -487,7 +487,17 @@ async def _run_seam(
         # around a network/tool call). `asyncio.wait_for` cannot tell these apart
         # (both surface as `asyncio.TimeoutError`); `asyncio.wait` membership can.
         task = asyncio.ensure_future(result)
-        done, _pending = await asyncio.wait({task}, timeout=remaining)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            # The *outer* run was cancelled (e.g. the caller cancelled the task
+            # or wrapped it in asyncio.timeout) while the seam was in flight.
+            # asyncio.wait does not cancel the awaited task on its own
+            # cancellation, so abandon the seam task here -- matching the direct
+            # `await` path, where cancellation would have propagated into the
+            # seam -- then re-raise so the cancellation is honoured.
+            _abandon_awaitable(task)
+            raise
         if not done:
             # Our deadline expired while the seam was still running. Request
             # cancellation but do NOT block on its cleanup -- a seam that swallows

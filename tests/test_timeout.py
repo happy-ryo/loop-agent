@@ -776,6 +776,36 @@ def test_async_kill_wins_over_cancellederror_swallow():
         )
 
 
+def test_outer_cancellation_cancels_inflight_seam_task():
+    """If async_run_loop is cancelled while a timed async seam is in flight, the
+    inner seam task is cancelled too (no background side effects) -- parity with
+    the direct-await path."""
+    ran = {"flag": False}
+
+    async def slow_act(_ctx):
+        await asyncio.sleep(0.1)
+        ran["flag"] = True
+        return ActOutcome(tokens=1)
+
+    async def driver():
+        loop_task = asyncio.ensure_future(
+            async_run_loop(
+                act=slow_act,
+                verify=afast_verify,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=10.0, on_timeout=TIMEOUT_KILL),
+            )
+        )
+        await asyncio.sleep(0.02)  # let the loop enter the seam
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        await asyncio.sleep(0.2)  # an un-cancelled seam would set the flag by now
+        assert ran["flag"] is False
+
+    asyncio.run(driver())
+
+
 def test_async_kill_bounds_despite_slow_cancellation_cleanup():
     """The timeout reliably bounds the call: a seam that swallows CancelledError
     and then runs slow cleanup must not delay SeamTimeout (we do not await its
