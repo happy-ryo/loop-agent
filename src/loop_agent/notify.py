@@ -79,20 +79,31 @@ ApprovalDescriber = Callable[[Any], Mapping[str, Any]]
 def _summarize_action(action: Any, *, limit: int = 200) -> str:
     """action から既定の人間可読 1 行要約を作る (describe 未指定時のフォールバック)。
 
-    dict なら ``kind``/``type``/``summary`` を優先的に拾い、無ければ ``repr`` を
-    ``limit`` 文字で切り詰める。要約はあくまで通知の見出し用で、正本は
-    ``ApprovalRequest.action`` 側に full payload が残る。
+    **要約に生の値を埋め込まない** (機密漏洩防止)。要約はそのまま通知の見出し
+    (webhook JSON の ``summary`` / Slack text / email 件名) に載り、key ベースの
+    :func:`redact_payload` ではマスクされないため、値を入れると機密が素通りしうる
+    (action 本体は ``ApprovalRequest.action`` に full payload として残り、そちらは redaction
+    される)。よって:
+
+    - ``str`` の action はそのまま (action 識別子。値そのものが見出し)。
+    - ``Mapping`` は人間可読ラベル用の既知キー (``summary``/``description``/``kind``/
+      ``type``) の **str 値のみ** 拾う。無ければ **キー名だけ** を並べた構造要約にする
+      (値は出さない)。リッチな要約が要るなら ``describe`` で明示的に組むこと。
+    - それ以外 (任意オブジェクト) は ``repr`` が機密を含みうるので **型名だけ**。
     """
-    if isinstance(action, Mapping):
-        for key in ("summary", "description", "kind", "type", "action"):
+    if isinstance(action, str):
+        text = action
+    elif isinstance(action, Mapping):
+        for key in ("summary", "description", "kind", "type"):
             value = action.get(key)
             if isinstance(value, str) and value:
                 text = value
                 break
         else:
-            text = repr(dict(action))
+            keys = ", ".join(sorted(str(k) for k in action.keys()))
+            text = f"action with fields: {keys}" if keys else "action (empty mapping)"
     else:
-        text = action if isinstance(action, str) else repr(action)
+        text = f"action of type {type(action).__name__}"
     if len(text) > limit:
         return text[:limit] + "..."
     return text

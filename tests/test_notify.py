@@ -34,7 +34,31 @@ from loop_agent import (
     run_loop,
 )
 from loop_agent import notify as notify_mod
+from loop_agent.notify import _summarize_action
 from conftest import never_done
+
+
+# -- summary フォールバックは生の値を漏らさない (P1 回帰) ----------------------
+
+
+def test_summary_fallback_does_not_leak_mapping_values():
+    # 既知ラベルキーが無い mapping → キー名だけの構造要約。値 (secret) は出さない。
+    summary = _summarize_action({"token": "s3cr3t", "op": "delete"})
+    assert "s3cr3t" not in summary
+    assert "op" in summary and "token" in summary
+
+
+def test_summary_uses_label_keys_and_type_fallback():
+    assert _summarize_action({"kind": "deploy"}) == "deploy"
+    assert _summarize_action("deploy") == "deploy"
+
+    class Weird:
+        def __repr__(self):  # 機密を含みうる repr は使わない。
+            return "Weird(secret=hunter2)"
+
+    summary = _summarize_action(Weird())
+    assert "hunter2" not in summary
+    assert "Weird" in summary
 
 
 # -- テスト用ヘルパ -----------------------------------------------------------
@@ -440,6 +464,43 @@ def test_gate_does_not_renotify_on_resume(tmp_path):
     conn2.close()
     assert n2.requests == []  # resume では再通知なし
     assert executed2 == ["work", "deploy", "work2"]
+
+
+def test_register_decision_reports_created_flag(tmp_path):
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    store.load_or_init(RUN_ID)
+    row1, created1 = store.register_decision(RUN_ID, "g1", "deploy")
+    row2, created2 = store.register_decision(RUN_ID, "g1", "deploy")
+    assert created1 is True and created2 is False
+    assert row1["gate_key"] == row2["gate_key"] == "g1"
+
+
+def test_gate_does_not_notify_when_register_loses_race(tmp_path, monkeypatch):
+    # get_decision で None を見た後、register_decision が created=False (敗者) を返す
+    # TOCTOU レースを模す: このとき通知を発火しないこと (P2 回帰)。
+    conn = connect(tmp_path / "s.db")
+    store = LoopStore(conn)
+    notifier = RecordingNotifier()
+    gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID, notifier=notifier)
+
+    loser_entry = {
+        "gate_key": "gate-1",
+        "action": "deploy",
+        "status": "pending",
+        "decision": None,
+        "payload": None,
+    }
+    monkeypatch.setattr(store, "get_decision", lambda run_id, gate_key: None)
+    monkeypatch.setattr(
+        store, "register_decision", lambda run_id, gate_key, action: (loser_entry, False)
+    )
+
+    from loop_agent.state import LoopState
+
+    review = gate.review("deploy", LoopState(iteration=1))
+    assert notifier.requests == []  # 敗者は再通知しない
+    assert review.disposition  # pause で返る (登録済み pending を読む)
 
 
 def test_gate_describe_overrides_request_metadata(tmp_path):

@@ -268,10 +268,15 @@ class HumanGate:
         # request_decision の戻り値 (= 並行作成済みなら相手の行) を権威として扱う。
         entry = self.store.get_decision(self.run_id, gate_key)
         if entry is None:
-            entry = self.store.request_decision(self.run_id, gate_key, context)
-            # 新規承認要求の発火点。このプロセスで初めて pending を登録したときのみ通知し、
-            # resume 再訪 (entry が既存) や別プロセスが先に登録済みのケースでは再通知しない。
-            self._notify_new_request(gate_key, context)
+            # register_decision は権威行に加え **この呼び出しが INSERT したか** を返す。
+            # 新規承認要求の発火点はこの INSERT 1 回だけ: ``created`` のときだけ通知する。
+            # resume 再訪 (entry が既存で None でない) も、get_decision で None を見た後の
+            # TOCTOU レースで敗者が相手の行を受け取ったケース (created=False) も再通知しない。
+            entry, created = self.store.register_decision(
+                self.run_id, gate_key, context
+            )
+            if created:
+                self._notify_new_request(gate_key, context)
 
         # どの分岐に進む前に **必ず** 登録時の action と現在の提案 action の一致を確認する。
         # 提案列が resume 間でずれ、別の不可逆 action が同じ gate_key に来た場合に、(a) 古い

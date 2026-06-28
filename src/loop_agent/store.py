@@ -715,6 +715,26 @@ class LoopStore:
         ``action`` は **JSON ネイティブ (round-trip lossless)** を要求する。gated action は
         resume 時に同一性比較 (誤適用防止) の基準になり、欠損符号化を許すと別 action と
         誤一致しうるため (:func:`_require_json_native` 参照)。
+
+        **この呼び出しが新規 INSERT したか** を知りたい場合 (= 並行登録レースで「先に
+        登録した 1 者」だけが副作用 — 通知等 — を起こしたいとき) は
+        :meth:`register_decision` を使うこと。本メソッドは権威ある現在行のみ返す。
+        """
+        row, _created = self.register_decision(run_id, gate_key, action)
+        return row
+
+    def register_decision(
+        self, run_id: str, gate_key: str, action: Any
+    ) -> tuple[dict[str, Any], bool]:
+        """:meth:`request_decision` と同じ登録を行い ``(現在行, 新規 INSERT したか)`` を返す。
+
+        ``created`` は **この呼び出しが pending を INSERT したとき** のみ ``True``。既存行
+        (別プロセスが先に登録済み or 自分の前 run で登録済み) を読んだときは ``False`` で、
+        その行をそのまま返す。これにより、``get_decision`` で ``None`` を見た後の TOCTOU
+        レースで敗者が ``request_decision`` から相手の行を受け取ったケースでも、
+        ``created=False`` を見て **承認通知を二重に発火しない** ように呼び出し側が判定できる
+        (:meth:`loop_agent.gate.HumanGate._notify_new_request` の発火条件)。INSERT は
+        transaction 内の single-winner なので、並行登録でも ``created=True`` は厳密に 1 者。
         """
         if not gate_key:
             raise ValueError("request_decision: gate_key must be a non-empty string")
@@ -725,7 +745,7 @@ class LoopStore:
                 (run_id, gate_key),
             ).fetchone()
             if existing is not None:
-                return self._decode_decision(existing)
+                return self._decode_decision(existing), False
             self.conn.execute(
                 "INSERT INTO pending_decision (run_id, gate_key, status, action) "
                 "VALUES (?, ?, 'pending', ?)",
@@ -740,7 +760,7 @@ class LoopStore:
                 "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
                 (run_id, gate_key),
             ).fetchone()
-            return self._decode_decision(row)
+            return self._decode_decision(row), True
 
     def resolve_decision(
         self,
