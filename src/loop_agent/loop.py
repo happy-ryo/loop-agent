@@ -27,11 +27,20 @@ Two entry points share one control-flow implementation (Issue #40):
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Protocol, Union, runtime_checkable
 
-from ._async import maybe_await, reject_awaitables
+from ._async import (
+    AsyncSeamInSyncLoop,
+    driven_synchronously,
+    maybe_await,
+    reject_awaitables,
+)
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
 from .state import LoopState, StepRecord
 
@@ -39,6 +48,370 @@ from .state import LoopState, StepRecord
 GATE_PROCEED = "proceed"
 GATE_SKIP = "skip"
 GATE_PAUSE = "pause"
+
+# act/verify の per-call timeout 超過時の挙動 (Issue #42)。
+#   graceful: 当該シームを諦め、failed=True な合成 step を記録して **次 iteration** へ。
+#             ループは返り続ける (例外を投げない)。stop 条件 (MaxIterations / Timeout /
+#             NoProgress) が次の guard で繰り返し timeout を捕捉・収束させる。
+#   kill    : 当該シームを cancel し、:class:`SeamTimeout` を **ループ外へ送出** する
+#             (LoopResult は返らない)。async シームは asyncio.wait_for で実際に cancel
+#             され、sync シームは POSIX main thread の SIGALRM で実際に中断される。
+TIMEOUT_GRACEFUL = "graceful"
+TIMEOUT_KILL = "kill"
+_TIMEOUT_MODES = (TIMEOUT_GRACEFUL, TIMEOUT_KILL)
+
+# graceful timeout で記録する合成 step の observation マーカー (seam 別)。
+# JSON ネイティブで hashable な文字列にしてあるので、永続化 / resume を通っても安定し、
+# NoProgress の既定 key (observation そのもの) で「timeout の繰り返し」を検出できる。
+ACT_TIMEOUT_OBSERVATION = "<seam-timeout:act>"
+VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
+
+
+class SeamTimeout(Exception):
+    """A loop seam exceeded its per-call timeout under ``on_timeout="kill"``.
+
+    Raised *out of the loop* (so :func:`run_loop` / :func:`async_run_loop` does
+    not return a :class:`LoopResult`) when ``act`` or ``verify`` overruns its
+    configured :class:`TimeoutPolicy` deadline in hard-kill mode. For an async
+    seam the underlying coroutine has already been cancelled
+    (:func:`asyncio.wait_for`); for a synchronous seam on a POSIX main thread it
+    was interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
+    ``seconds`` the deadline that was exceeded.
+    """
+
+    def __init__(self, seam: str, seconds: float) -> None:
+        self.seam = seam
+        self.seconds = seconds
+        super().__init__(
+            f"{seam!r} seam exceeded its {seconds:g}s per-call timeout (hard kill)"
+        )
+
+
+class UnsupportedTimeoutKill(RuntimeError):
+    """A hard-kill timeout was requested for a *synchronous* seam that cannot be
+    interrupted on this platform/thread.
+
+    Hard-killing a blocking synchronous call requires POSIX ``SIGALRM`` on the
+    main thread (:func:`signal.setitimer`). On Windows, or off the main thread,
+    that mechanism is unavailable, so a synchronous seam cannot be *guaranteed*
+    to be interrupted -- a genuinely hung call would never return. Rather than
+    silently hang, the driver refuses up front: use an async seam (cancelled via
+    :func:`asyncio.wait_for`, fully portable) or ``on_timeout="graceful"`` (which
+    detects an overrun *after* the call returns; it cannot bound a hung call).
+    """
+
+
+class _GracefulTimeout(Exception):
+    """Internal: a seam overran its deadline under ``on_timeout="graceful"``.
+
+    Caught inside :func:`_drive_loop` to record a synthetic failed step and
+    continue to the next iteration; never escapes the loop.
+    """
+
+    def __init__(self, seam: str, seconds: float) -> None:
+        self.seam = seam
+        self.seconds = seconds
+        super().__init__(f"{seam!r} seam timed out after {seconds:g}s")
+
+
+class _AlarmInterrupt(BaseException):
+    """Internal: ``SIGALRM`` fired inside a guarded synchronous seam call.
+
+    A ``BaseException`` (not ``Exception``) so a seam's ``except Exception`` does
+    not accidentally swallow the timeout interrupt.
+    """
+
+
+@dataclass(frozen=True)
+class TimeoutPolicy:
+    """Per-call timeout for the ``act`` and ``verify`` seams (Issue #42).
+
+    A timeout bounds a *single* ``act`` (or ``verify``) invocation -- distinct
+    from the whole-run :class:`~loop_agent.conditions.Timeout` *stop condition*,
+    which caps cumulative wall-clock at the iteration boundary and never
+    interrupts an in-progress step. Use this to stop one runaway model/tool call
+    without aborting the run.
+
+    Each seam's deadline is its own field if set, else :attr:`default`; a seam
+    left ``None`` (and no ``default``) is unbounded. ``on_timeout`` selects the
+    behaviour on overrun:
+
+    - :data:`TIMEOUT_GRACEFUL` (default) -- abandon the call, record a synthetic
+      ``goal_met=False`` step (observation :data:`ACT_TIMEOUT_OBSERVATION` /
+      :data:`VERIFY_TIMEOUT_OBSERVATION`), and continue to the next iteration, so
+      the stop conditions bound a stream of timeouts (``MaxIterations`` /
+      ``NoProgress`` on the marker / a ``Timeout`` stop).
+    - :data:`TIMEOUT_KILL` -- cancel the call and raise :class:`SeamTimeout` out
+      of the loop.
+
+    **Enforcement & platform limits.** An *async* seam is cancelled via
+    :func:`asyncio.wait_for` at the next await point. A *synchronous* seam is
+    interrupted by POSIX ``SIGALRM`` on the main thread; where that is
+    unavailable (Windows / non-main-thread), a hung sync call cannot be
+    force-stopped: ``graceful`` then detects the overrun only *after* the call
+    returns (best-effort), and ``kill`` raises :class:`UnsupportedTimeoutKill`
+    rather than risk an unkillable hang.
+
+    **Async cancellation is cooperative.** ``asyncio.wait_for`` cancels by
+    raising :class:`asyncio.CancelledError` inside the seam at its next await
+    point. A well-behaved seam re-raises it (so the timeout fires); a seam that
+    *swallows* ``CancelledError`` and returns a value defeats the timeout
+    silently (no :class:`SeamTimeout`), and one that swallows it then awaits
+    something that never completes can hang the loop. Do not catch-and-ignore
+    ``CancelledError`` in a timed seam. (A blocking *synchronous* portion of an
+    ``async def`` seam is likewise uninterruptible until it next awaits.)
+
+    **Per-call budget.** Each ``act`` / ``verify`` invocation gets its own
+    deadline. For an unusual seam that does blocking synchronous work *and then*
+    returns an awaitable, the synchronous portion (``SIGALRM``) and the awaited
+    portion (``wait_for``) are each bounded by the deadline separately -- up to
+    ~2x in total; use a plain ``async def`` for a single tight budget.
+
+    **Gate interaction.** Under ``graceful``, if a :class:`~loop_agent.gate.HumanGate`
+    leased the action (``GATE_PROCEED`` with an ``on_complete``), the lease is
+    confirmed *executed* after the synthetic timeout step is recorded -- the
+    gated action is consumed once and not retried. Under ``kill`` the lease is
+    left in-progress (``SeamTimeout`` propagates before the completion call), so
+    it expires and another process re-runs it (the crash-recovery path).
+
+    **Clock.** The interrupting deadlines use the real wall clock
+    (``SIGALRM``/:func:`signal.setitimer` and :func:`asyncio.wait_for` both
+    ignore the loop's injectable ``time_fn``); only the synchronous post-hoc
+    fallback measures with ``time_fn``. So an injected ``time_fn`` steers the
+    stop-condition clock, not the per-call interruption deadline.
+    """
+
+    default: Optional[float] = None
+    act: Optional[float] = None
+    verify: Optional[float] = None
+    on_timeout: str = TIMEOUT_GRACEFUL
+
+    def __post_init__(self) -> None:
+        for name in ("default", "act", "verify"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            # bool is an int subclass, so `True > 0` would silently mean 1.0s --
+            # almost certainly a mistake. Reject it here for parity with the
+            # bare-number path (`_resolve_timeout`).
+            if isinstance(value, bool):
+                raise TypeError(
+                    f"TimeoutPolicy {name} must be a number of seconds or None, "
+                    "not bool"
+                )
+            if not (value > 0):
+                raise ValueError(
+                    f"TimeoutPolicy {name} must be > 0 (got {value!r}); "
+                    "use None for no per-call timeout on that seam"
+                )
+        if self.on_timeout not in _TIMEOUT_MODES:
+            raise ValueError(
+                f"TimeoutPolicy on_timeout must be one of {_TIMEOUT_MODES}, "
+                f"got {self.on_timeout!r}"
+            )
+
+    @property
+    def act_seconds(self) -> Optional[float]:
+        return self.act if self.act is not None else self.default
+
+    @property
+    def verify_seconds(self) -> Optional[float]:
+        return self.verify if self.verify is not None else self.default
+
+    def _is_noop(self) -> bool:
+        """True when no seam has an effective deadline (fast path)."""
+        return self.act_seconds is None and self.verify_seconds is None
+
+
+# A timeout argument accepts a TimeoutPolicy, a bare number (applied to both act
+# and verify, graceful mode), or None (no per-call timeout).
+TimeoutArg = Union[TimeoutPolicy, float, int, None]
+
+
+def _resolve_timeout(timeout: TimeoutArg) -> Optional[TimeoutPolicy]:
+    """Normalise the ``timeout`` argument to a :class:`TimeoutPolicy` or ``None``.
+
+    ``None`` (or a policy with no effective deadline) returns ``None`` so the
+    driver keeps its exact zero-overhead path. A bare number becomes
+    ``TimeoutPolicy(default=number)`` (graceful, both seams).
+    """
+    if timeout is None:
+        return None
+    if isinstance(timeout, TimeoutPolicy):
+        policy = timeout
+    elif isinstance(timeout, bool):
+        # bool is an int subclass; a True/False "timeout" is almost certainly a
+        # mistake -- reject it loudly rather than treat True as 1.0 seconds.
+        raise TypeError("timeout must be a TimeoutPolicy, a number, or None, not bool")
+    elif isinstance(timeout, (int, float)):
+        policy = TimeoutPolicy(default=float(timeout))
+    else:
+        raise TypeError(
+            "timeout must be a TimeoutPolicy, a number of seconds, or None, "
+            f"got {type(timeout).__name__}"
+        )
+    return None if policy._is_noop() else policy
+
+
+def _alarm_capable() -> bool:
+    """True when POSIX ``SIGALRM`` can interrupt a synchronous seam here.
+
+    Requires :func:`signal.setitimer` (POSIX; absent on Windows) and the main
+    thread (``signal.signal`` only works there). Evaluated per call so a loop
+    driven from a worker thread correctly falls back.
+    """
+    return (
+        hasattr(signal, "setitimer")
+        and threading.current_thread() is threading.main_thread()
+    )
+
+
+def _looks_async(fn: Any) -> bool:
+    """Best-effort: does ``fn`` look like it returns an awaitable?
+
+    Used only on platforms without ``SIGALRM`` to decide, *before* calling, that
+    a hard-kill timeout on an apparently-synchronous seam cannot be honoured
+    (avoiding entry into an uninterruptible blocking call). Detects ``async def``
+    callables directly and through ``functools.partial`` / ``__call__``. A plain
+    callable that *returns* a coroutine is conservatively treated as synchronous
+    -- erring toward a loud :class:`UnsupportedTimeoutKill` rather than a silent
+    hang (use ``async def`` for guaranteed kill).
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return True
+    inner = getattr(fn, "func", None)  # functools.partial
+    if inner is not None and asyncio.iscoroutinefunction(inner):
+        return True
+    call = getattr(type(fn), "__call__", None)
+    if call is not None and asyncio.iscoroutinefunction(call):
+        return True
+    return False
+
+
+def _invoke_under_alarm(
+    fn: Callable[[Any], Any], arg: Any, seconds: float
+) -> "tuple[Any, bool]":
+    """Call ``fn(arg)`` with a POSIX ``SIGALRM`` deadline (main thread only).
+
+    Returns ``(result, timed_out)``. On timeout the alarm raises
+    :class:`_AlarmInterrupt` inside ``fn``; we report ``(None, True)``.
+    ``result`` may be an awaitable (an async seam whose coroutine was constructed
+    synchronously); the caller awaits it separately (the alarm guards only the
+    synchronous portion).
+
+    The previous SIGALRM handler **and** any previously-armed ``ITIMER_REAL`` are
+    restored on exit, so an embedding application's own interval timer is not
+    silently destroyed (its remaining time is re-armed, effectively paused for
+    the duration of this call).
+
+    Not re-entrant: a single process-wide ``ITIMER_REAL`` is used, so a seam that
+    itself sets a SIGALRM-based timeout would disturb this one. A late
+    ``SIGALRM`` delivered in the tiny window just as ``fn`` returns (the classic
+    disarm race) is mapped to ``timed_out`` rather than allowed to escape as an
+    uncaught ``BaseException`` -- a borderline-deadline call is reported as a
+    timeout, never as a loop crash.
+    """
+
+    def _handler(signum: int, frame: Any) -> None:
+        raise _AlarmInterrupt()
+
+    previous = signal.signal(signal.SIGALRM, _handler)
+    # setitimer returns the timer it replaced; keep it to restore the embedder's
+    # own deadline (a (0.0, 0.0) prior means "was disarmed").
+    prev_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        try:
+            result, timed_out = fn(arg), False
+        except _AlarmInterrupt:
+            result, timed_out = None, True
+        # Disarm our timer ASAP to shrink the window in which a late SIGALRM
+        # could be delivered after fn already returned.
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        return result, timed_out
+    except _AlarmInterrupt:
+        # A SIGALRM delivered after fn returned but before we disarmed: the call
+        # reached its deadline at the boundary. Report a timeout instead of
+        # leaking _AlarmInterrupt (a BaseException) out of the loop.
+        return None, True
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+        # Restore the embedder's prior interval timer (re-arm its remaining
+        # time); a (0.0, 0.0) prior disarms, as before.
+        signal.setitimer(signal.ITIMER_REAL, prev_timer[0], prev_timer[1])
+
+
+def _on_timeout(mode: str, seam: str, seconds: float) -> Exception:
+    """Build the exception for an overrun: kill -> SeamTimeout, else graceful."""
+    if mode == TIMEOUT_KILL:
+        return SeamTimeout(seam, seconds)
+    return _GracefulTimeout(seam, seconds)
+
+
+async def _run_seam(
+    fn: Callable[[Any], Any],
+    arg: Any,
+    *,
+    seconds: float,
+    mode: str,
+    seam: str,
+    time_fn: Callable[[], float],
+) -> Any:
+    """Invoke ``fn(arg)`` (a sync or async seam) under a per-call ``seconds`` deadline.
+
+    Returns the seam's resolved result. On overrun raises :class:`SeamTimeout`
+    (``mode == "kill"``) or :class:`_GracefulTimeout` (``"graceful"``). Async
+    results are bounded by :func:`asyncio.wait_for` (real cancellation);
+    synchronous calls by ``SIGALRM`` where available, else best-effort post-hoc
+    detection (``graceful``) or :class:`UnsupportedTimeoutKill` (``kill``).
+    Callers must ensure ``seconds`` is not ``None``.
+    """
+    if _alarm_capable():
+        # Guard the (possibly blocking) synchronous portion with SIGALRM. An
+        # async seam returns its awaitable near-instantly here (no alarm), then
+        # is awaited under wait_for below.
+        result, timed_out = _invoke_under_alarm(fn, arg, seconds)
+        if timed_out:
+            raise _on_timeout(mode, seam, seconds)
+    else:
+        # No SIGALRM (Windows / non-main-thread): a synchronous call cannot be
+        # interrupted. Refuse a hard kill we cannot guarantee *before* entering a
+        # potentially unkillable call; an async seam stays interruptible via
+        # wait_for, so only an apparently-synchronous one is rejected.
+        if mode == TIMEOUT_KILL and not _looks_async(fn):
+            raise UnsupportedTimeoutKill(
+                f"hard-kill timeout for synchronous seam {seam!r} requires POSIX "
+                "SIGALRM on the main thread, unavailable on this platform/thread; "
+                "use an async seam (cancelled via asyncio.wait_for) or "
+                'on_timeout="graceful"'
+            )
+        started = time_fn()
+        result = fn(arg)
+        if not inspect.isawaitable(result):
+            # graceful (kill on a sync seam was excluded above): the call already
+            # ran to completion -- detect an overrun after the fact. A genuinely
+            # hung call never reaches here (documented limitation).
+            if time_fn() - started >= seconds:
+                raise _on_timeout(mode, seam, seconds)
+            return result
+
+    if inspect.isawaitable(result):
+        if driven_synchronously():
+            # run_loop drives this synchronously: an awaitable seam is rejected
+            # exactly as on the no-timeout path (maybe_await), pointing at
+            # async_run_loop instead of attempting wait_for without a loop.
+            close = getattr(result, "close", None)
+            if close is not None:
+                close()
+            raise AsyncSeamInSyncLoop(
+                "run_loop() received an async (awaitable) seam "
+                "(act/verify/gather/condition/gate/on_step/on_complete); "
+                "use `await async_run_loop(...)` for async seams"
+            )
+        try:
+            return await asyncio.wait_for(result, seconds)
+        except asyncio.TimeoutError:
+            raise _on_timeout(mode, seam, seconds)
+    return result
 
 
 class _KeepContext:
@@ -248,6 +621,7 @@ async def async_run_loop(
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
+    timeout: TimeoutArg = None,
     # _strict_sync は run_loop 専用の内部フラグ (公開 API では使わない)。True の間
     # maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
     _strict_sync: bool = False,
@@ -313,6 +687,21 @@ async def async_run_loop(
             *total* run time, not just this leg). ``None`` (the default) starts a
             fresh run; an empty :class:`LoopState` is equivalent to ``None``. The
             seed is copied, so the caller's object is not mutated.
+        timeout: Optional per-call timeout for the ``act`` and ``verify`` seams
+            (Issue #42). A :class:`TimeoutPolicy` (per-seam / ``default`` deadlines
+            and ``on_timeout`` mode), a bare number of seconds (applied to *both*
+            seams, ``graceful`` mode), or ``None`` (no per-call timeout -- the
+            default, zero-overhead path). Distinct from the whole-run
+            :class:`~loop_agent.conditions.Timeout` *stop condition*: this bounds
+            one ``act`` / ``verify`` call, not cumulative wall-clock. On overrun,
+            ``graceful`` records a synthetic ``goal_met=False`` step (observation
+            :data:`ACT_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`)
+            and continues so the stop conditions bound a run of timeouts;
+            ``kill`` raises :class:`SeamTimeout` out of the loop. An async seam is
+            cancelled via :func:`asyncio.wait_for`; a synchronous seam by POSIX
+            ``SIGALRM`` on the main thread -- where unavailable, ``graceful``
+            falls back to best-effort post-hoc detection and ``kill`` raises
+            :class:`UnsupportedTimeoutKill` (it cannot bound a hung sync call).
 
     Returns:
         A :class:`LoopResult`. ``status`` is ``"goal_met"`` (``stop is None``),
@@ -362,6 +751,7 @@ async def async_run_loop(
             gate=gate,
             time_fn=time_fn,
             initial_state=initial_state,
+            timeout=timeout,
         )
     finally:
         reject_awaitables.reset(token)
@@ -377,12 +767,14 @@ async def _drive_loop(
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
+    timeout: TimeoutArg = None,
 ) -> LoopResult:
     """The loop body for :func:`async_run_loop` (sync/async-seam driver).
 
     Separated so :func:`async_run_loop` can scope the strict-sync contextvar
     around it; see that function for the full contract.
     """
+    policy = _resolve_timeout(timeout)
     if isinstance(conditions, AnyOf):
         stop = conditions
     elif isinstance(conditions, (list, tuple)):
@@ -486,10 +878,71 @@ async def _drive_loop(
                 context = review.context
             gate_on_complete = review.on_complete
 
-        outcome = await maybe_await(act(context))
+        # act -- per-call timeout 適用可 (Issue #42)。policy 未設定なら従来どおり
+        # maybe_await 直呼びで追加コストゼロ。graceful timeout は当該 step を failed
+        # として記録し次 iteration へ (kill は SeamTimeout がループ外へ伝播)。
+        if policy is None or policy.act_seconds is None:
+            outcome = await maybe_await(act(context))
+        else:
+            try:
+                outcome = await _run_seam(
+                    act,
+                    context,
+                    seconds=policy.act_seconds,
+                    mode=policy.on_timeout,
+                    seam="act",
+                    time_fn=time_fn,
+                )
+            except _GracefulTimeout:
+                record = StepRecord(
+                    iteration=state.iteration,
+                    observation=ACT_TIMEOUT_OBSERVATION,
+                    tokens=0,
+                    goal_met=False,
+                    detail=f"act timed out after {policy.act_seconds:g}s",
+                )
+                state.history.append(record)
+                state.iteration += 1
+                state.elapsed = time_fn() - start
+                if on_step is not None:
+                    await maybe_await(on_step(record, state))
+                # gate がリースを張っていれば、合成 step 永続化後に完了確定する
+                # (executed なら step 行は必ず存在、の不変条件を保つ)。
+                if gate_on_complete is not None:
+                    await maybe_await(gate_on_complete())
+                continue
         state.tokens_used += outcome.tokens
 
-        verdict = await maybe_await(verify(outcome))
+        # verify -- 同上。act の outcome (tokens 計上済) はそのまま、verify が時間切れ
+        # なら failed step を記録して次 iteration へ。
+        if policy is None or policy.verify_seconds is None:
+            verdict = await maybe_await(verify(outcome))
+        else:
+            try:
+                verdict = await _run_seam(
+                    verify,
+                    outcome,
+                    seconds=policy.verify_seconds,
+                    mode=policy.on_timeout,
+                    seam="verify",
+                    time_fn=time_fn,
+                )
+            except _GracefulTimeout:
+                record = StepRecord(
+                    iteration=state.iteration,
+                    observation=VERIFY_TIMEOUT_OBSERVATION,
+                    tokens=outcome.tokens,
+                    goal_met=False,
+                    detail=f"verify timed out after {policy.verify_seconds:g}s",
+                )
+                state.history.append(record)
+                state.iteration += 1
+                state.elapsed = time_fn() - start
+                if on_step is not None:
+                    await maybe_await(on_step(record, state))
+                if gate_on_complete is not None:
+                    await maybe_await(gate_on_complete())
+                continue
         record = StepRecord(
             iteration=state.iteration,
             observation=outcome.observation,
@@ -531,6 +984,7 @@ def run_loop(
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
+    timeout: TimeoutArg = None,
 ) -> LoopResult:
     """Drive gather -> act -> verify -> repeat until the goal or a cap (sync).
 
@@ -586,6 +1040,7 @@ def run_loop(
         gate=gate,
         time_fn=time_fn,
         initial_state=initial_state,
+        timeout=timeout,
         _strict_sync=True,
     )
     try:

@@ -777,10 +777,11 @@ gather = WorkListGather.from_triage([Candidate(id="hi", priority=9), Candidate(i
 
 | 要素 | 役割 |
 |---|---|
-| `run_loop(*, act, verify, conditions, gather=…, on_step=…, gate=…, time_fn=…, initial_state=…)` | ループドライバ。`LoopResult` を返す。`gate` を渡すと不可逆操作を interrupt、`initial_state` に復元 `LoopState` を渡すと中断地点から**再開**（resume #14） |
+| `run_loop(*, act, verify, conditions, gather=…, on_step=…, gate=…, time_fn=…, initial_state=…, timeout=…)` | ループドライバ。`LoopResult` を返す。`gate` を渡すと不可逆操作を interrupt、`initial_state` に復元 `LoopState` を渡すと中断地点から**再開**（resume #14）、`timeout` で `act`/`verify` の per-call timeout（#42） |
 | `ActOutcome(observation, tokens)` | `act` フックの返り値（行動結果 + 消費トークン） |
 | `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
 | `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
+| `TimeoutPolicy(act=…, verify=…, default=…, on_timeout=…)` | `act`/`verify` の **per-call** timeout（#42）。`run_loop`/`async_run_loop` の `timeout=` に渡す（`TimeoutPolicy` か裸の秒数）。`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復／`"kill"` は `SeamTimeout` を送出。async シームは `asyncio.wait_for`、sync シームは POSIX main thread の `SIGALRM` で実中断（不在環境は graceful=post-hoc、kill=`UnsupportedTimeoutKill`）。whole-run の `Timeout` stop 条件とは別物。詳細 [docs/recipes/timeout-and-kill.md](./docs/recipes/timeout-and-kill.md) |
 | `GoalMet(verifier)` | 検証可能ゴールの達成で**成功**停止（`stop.name="goal_met"`）。`verifier(state)` は `bool` か `GoalCheck(met, detail)` を返す |
 | `NoProgress(window, repeat, key=…)` | 直近 `window` ステップで同一 `key`（既定は observation）が `repeat` 回以上 → 無進捗として**打ち切り**（`stop.name="no_progress"`） |
 | `LoopResult` | `status`(`goal_met`/`stopped`/`paused`) / `stop`(発火条件) / `reason` / `succeeded`(成功=goal_met 自然終了 or GoalMet 条件発火) / `goal_met`(verify フック自然終了のみ) / `paused`(人間ゲートで中断) / `pending`(中断中の不可逆 action) / `iterations` / `tokens_used` / `elapsed` / `history` |
