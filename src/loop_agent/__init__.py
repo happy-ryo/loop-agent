@@ -78,8 +78,13 @@ from .evaluator import (
     admit_evaluator,
     agreement,
 )
+from .errors import (
+    AsyncSeamInSyncLoop,
+    ConfigError,
+    LoopError,
+    StateError,
+)
 from .gate import Decision, HumanGate, run_gated_loop
-from ._async import AsyncSeamInSyncLoop
 from .loop import (
     ActionGate,
     ActOutcome,
@@ -160,6 +165,9 @@ from .waker import LoopWaker, wake_id_for, wakes_for_result
 __all__ = [
     "run_loop",
     "async_run_loop",
+    "LoopError",
+    "ConfigError",
+    "StateError",
     "AsyncSeamInSyncLoop",
     "ActOutcome",
     "VerifyOutcome",

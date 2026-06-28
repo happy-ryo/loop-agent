@@ -215,11 +215,13 @@ db.record_result(result)
 ### verify が timeout する / 永遠に止まらない
 
 - subprocess の `act` / `verify` には**必ず有限の timeout**が掛かります（`[act]`/`[verify]`.`timeout_seconds` > ループ `timeout_seconds` > 既定 3600s）。停止条件は反復境界でのみ評価され、実行中ステップは中断しないので、無制限の subprocess が hang すると全 cap が無効化されます。長い処理には明示 timeout を。
-- 停止条件を 1 つも渡さないと `ValueError`（無限ループ防止）。`max_iterations` か `timeout_seconds` を必ず 1 つ入れること。
+- 停止条件を 1 つも渡さないと `ConfigError`（無限ループ防止）。`max_iterations` か `timeout_seconds` を必ず 1 つ入れること。
 
 ### `act` の例外でループが死なないか不安
 
 `ClaudeCodeAct` / `CodexAct` は timeout 超過・非 0 終了・実行ファイル不在を**例外にせず** `failed=True` の結果として graceful に返します。境界評価の `Timeout` / `MaxIterations` は常に効きます。policy が安全に失敗できる設計です。
+
+設定ミス（不正な引数値・型、停止条件なし 等）は `loop_agent.errors.ConfigError`、実行時の状態違反（解決済みゲートの再決定 等）は `StateError` として送出されます。いずれも基底 `LoopError` を `except` すれば一括で捕捉でき、後方互換のため従来の `ValueError` / `RuntimeError` でも捕捉できます。詳細は [errors.md](./errors.md)。
 
 ---
 

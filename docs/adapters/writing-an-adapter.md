@@ -48,7 +48,9 @@ loop-agent の `act` シームは「1 反復の実行体」を 1 つの関数
    です（`subprocess.TimeoutExpired` と `OSError` は捕まえて `failed` に変換する）。
    唯一の例外は `render_prompt`: `prompt_template` が context に無いフィールドを
    参照していると **eager に `KeyError` を送出** します（実行前の設定ミスは握り潰さず
-   即失敗させる設計。下のスケルトンでも `render_prompt` は `try` の外で呼ぶ）。
+   即失敗させる設計。下のスケルトンでも `render_prompt` は `try` の外で呼ぶ）。この
+   `KeyError` は意図的に `LoopError` 階層の外に置いた唯一の組み込み例外です（`str.format`
+   の意味論を踏襲）。ライブラリの例外階層全体は [../errors.md](../errors.md) を参照。
 
 2. **token を予算に積む。** 応答から処理トークン総数を取り出し
    `ActOutcome.tokens` に載せます。driver がこれを `state.tokens_used` に積むので
@@ -258,7 +260,8 @@ subprocess を使わずに `act` 契約を満たす in-memory 版を用意する
   最後の応答に張り付く（`MaxIterations` 等の境界で安全に止まる）。
 - `str` -> `text`（tokens 0）、`Mapping` -> Result フィールド展開、Result -> そのまま。
 - レンダリング済みプロンプトを `prompts` に記録し、テストから検証できる。
-- `responses=[]` は `ValueError`、未対応の型は `TypeError`。
+- `responses=[]` も未対応の型も `ConfigError`（`LoopError` 階層。後方互換のため
+  それぞれ `ValueError` / `TypeError` も継承する。[../errors.md](../errors.md)）。
 
 ```python
 from loop_agent.adapters import MockClaudeCodeAct
@@ -302,7 +305,7 @@ act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 - [ ] token 解析が CLI の usage 意味論（加算バケット / 部分集合）に従い、二重計上しない。usage 無しは 0。
 - [ ] token は成否に関わらず計上する。
 - [ ] `_build_env` が `os.environ` 継承 + `env=` 上書きマージ（auth は CLI 委譲）。
-- [ ] `MockXxxAct` を提供（`str` / `Mapping` / Result、空は `ValueError`、未対応型は `TypeError`）。
+- [ ] `MockXxxAct` を提供（`str` / `Mapping` / Result、空も未対応型も `ConfigError`）。
 - [ ] `tests/adapters/conftest.py` の `AdapterSpec` に登録し、共通契約テストを通す。
 - [ ] **token 二重計上ガード**のサンプル（部分集合キーを含む usage と期待トークン）を spec に入れる。
 - [ ] 実 subprocess 経路（フェイク実行ファイル）の成功 / timeout / env 継承を 1 度ずつ通す。

@@ -44,6 +44,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol, runtime_checkable
 
+from .errors import ConfigError
+
 # -- wake 種別 (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」) ---------
 #
 # 読み手が文字列リテラルを散在させずに filter / dispatch できるよう定数化する。
@@ -215,7 +217,7 @@ class InMemoryWakeQueue:
         既存行 (進行中の claim や DELIVERED) を壊さない (= 人間/受信側に二重に届けない土台)。
         """
         if not wake.id:
-            raise ValueError("enqueue: Wake.id must be a non-empty string")
+            raise ConfigError("enqueue: Wake.id must be a non-empty string")
         with self._lock:
             if wake.id in self._entries:
                 return False
@@ -257,7 +259,7 @@ class InMemoryWakeQueue:
         :meth:`confirm` で確定する (claim-then-confirm)。
         """
         if lease <= 0:
-            raise ValueError("claim: lease must be > 0")
+            raise ConfigError("claim: lease must be > 0")
         with self._lock:
             self.release_expired(now=now)
             out: list[Wake] = []
@@ -400,7 +402,7 @@ class Transport:
         self.queue: WakeQueue = queue if queue is not None else InMemoryWakeQueue()
         self.backend = backend
         if lease <= 0:
-            raise ValueError("Transport: lease must be > 0")
+            raise ConfigError("Transport: lease must be > 0")
         self._lease = lease
         if time_fn is None:
             import time
@@ -568,7 +570,7 @@ def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
 #
 # - **serialization = JSON** (pickle ではない)。``payload`` は JSON 形 (:meth:`Wake.to_dict`
 #   が前提) で、JSON はプロセス/言語横断で安全・任意コード実行の risk が無い。``payload`` は
-#   JSON 化可能な値のみ (非対応の値は enqueue で ``TypeError``)。
+#   JSON 化可能な値のみ (非対応の値は enqueue で ``ConfigError``)。
 # - **key namespace 規約**。Redis は ``{namespace}:wake:{id}`` / ``{namespace}:recipient:{r}``
 #   等で他用途のキーと衝突を避ける (namespace 既定 ``"loop_agent"``)。SQLite は table 名で
 #   分離する (既定 ``wakes``)。
@@ -587,13 +589,14 @@ def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
 def _dumps_payload(payload: Mapping[str, Any]) -> str:
     """``payload`` を JSON 文字列へ畳む (backend 永続化用)。
 
-    JSON 化不能な値は ``TypeError`` を ``ValueError`` に翻訳して、enqueue の入力検証として
+    JSON 化不能な値は ``TypeError`` を ``ConfigError`` に翻訳して、enqueue の入力検証として
     呼び出し側に分かりやすく返す (pickle を使わない = 任意コード実行 risk を持ち込まない)。
+    元の ``TypeError`` は ``__cause__`` に保全する (``raise ... from exc``)。
     """
     try:
         return json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
     except TypeError as exc:
-        raise ValueError(f"Wake.payload must be JSON-serializable: {exc}") from exc
+        raise ConfigError(f"Wake.payload must be JSON-serializable: {exc}") from exc
 
 
 def _make_wake(id: str, kind: str, recipient: str, run_id: str, payload_json: str) -> Wake:
@@ -613,7 +616,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def _validate_identifier(name: str, *, what: str) -> str:
     """SQL 識別子 (table 名) を検証する (SQL injection 防止: table 名は bind できないため)。"""
     if not _IDENT_RE.match(name):
-        raise ValueError(f"{what} must match {_IDENT_RE.pattern!r}, got {name!r}")
+        raise ConfigError(f"{what} must match {_IDENT_RE.pattern!r}, got {name!r}")
     return name
 
 
@@ -696,7 +699,7 @@ class SqliteWakeQueue:
 
     def enqueue(self, wake: Wake) -> bool:
         if not wake.id:
-            raise ValueError("enqueue: Wake.id must be a non-empty string")
+            raise ConfigError("enqueue: Wake.id must be a non-empty string")
         payload = _dumps_payload(wake.payload)
         with self._tx():
             cur = self._conn.execute(
@@ -729,7 +732,7 @@ class SqliteWakeQueue:
         limit: Optional[int] = None,
     ) -> list[Wake]:
         if lease <= 0:
-            raise ValueError("claim: lease must be > 0")
+            raise ConfigError("claim: lease must be > 0")
         with self._tx():
             self._release_expired_locked(now)
             sql = (
@@ -881,7 +884,7 @@ class RedisWakeQueue:
     増殖を防ぐ (高 cardinality な peer id を宛先にしても leak しない)。
 
     テストや DI のため ``client`` に redis-py 互換クライアントを直接注入できる。省略時は ``url``
-    から ``redis.Redis.from_url`` で生成する (どちらも無い場合は ``ValueError``)。
+    から ``redis.Redis.from_url`` で生成する (どちらも無い場合は ``ConfigError``)。
     """
 
     def __init__(
@@ -897,7 +900,7 @@ class RedisWakeQueue:
         if client is None:
             redis = _import_redis()
             if url is None:
-                raise ValueError("RedisWakeQueue: provide either `client` or `url`")
+                raise ConfigError("RedisWakeQueue: provide either `client` or `url`")
             client = redis.Redis.from_url(url)
         self._r = client
         self._ns = namespace
@@ -977,7 +980,7 @@ class RedisWakeQueue:
 
     def enqueue(self, wake: Wake) -> bool:
         if not wake.id:
-            raise ValueError("enqueue: Wake.id must be a non-empty string")
+            raise ConfigError("enqueue: Wake.id must be a non-empty string")
         payload = _dumps_payload(wake.payload)
         wkey = self._k_wake(wake.id)
         with self._dlock():
@@ -1026,7 +1029,7 @@ class RedisWakeQueue:
         limit: Optional[int] = None,
     ) -> list[Wake]:
         if lease <= 0:
-            raise ValueError("claim: lease must be > 0")
+            raise ConfigError("claim: lease must be > 0")
         with self._dlock():
             self._release_expired_locked(now)
             ids = [_text(x) for x in self._r.zrange(self._k_recipient(recipient), 0, -1)]
@@ -1120,13 +1123,13 @@ def open_wake_queue(backend: str = "memory", **opts: Any) -> WakeQueue:
     """
     if backend == "memory":
         if opts:
-            raise ValueError(f"open_wake_queue('memory') takes no options, got {sorted(opts)}")
+            raise ConfigError(f"open_wake_queue('memory') takes no options, got {sorted(opts)}")
         return InMemoryWakeQueue()
     if backend == "sqlite":
         return SqliteWakeQueue(**opts)
     if backend == "redis":
         return RedisWakeQueue(**opts)
-    raise ValueError(f"unknown backend {backend!r} (expected 'memory' / 'sqlite' / 'redis')")
+    raise ConfigError(f"unknown backend {backend!r} (expected 'memory' / 'sqlite' / 'redis')")
 
 
 __all__ = [

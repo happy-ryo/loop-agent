@@ -47,6 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from ..errors import ConfigError
 from ..store import LoopStore
 
 # 配達層が使う gate_key の prefix。in-loop の不可逆 action ゲート (gate-<iteration>) と
@@ -80,9 +81,9 @@ class Candidate:
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
-            raise ValueError("Candidate.id must be a non-empty string")
+            raise ConfigError("Candidate.id must be a non-empty string")
         if self.effort < 0:
-            raise ValueError("Candidate.effort must be >= 0")
+            raise ConfigError("Candidate.effort must be >= 0")
         # depends_on をタプルに正規化 (list 等で渡されても凍結後は不変タプルに揃える)。
         object.__setattr__(self, "depends_on", tuple(self.depends_on))
 
@@ -209,7 +210,7 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
     同一入力 (順不同) は必ず同一の :class:`Triage` を返す。
 
     Raises:
-        ValueError: 候補 id が重複している場合 (決定的出力に一意 id が必須)。
+        ConfigError: 候補 id が重複している場合 (決定的出力に一意 id が必須)。
     """
     items = list(candidates)
     done_set = set(done)
@@ -217,7 +218,7 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
     by_id: dict[str, Candidate] = {}
     for c in items:
         if c.id in by_id:
-            raise ValueError(f"duplicate candidate id {c.id!r}; ids must be unique")
+            raise ConfigError(f"duplicate candidate id {c.id!r}; ids must be unique")
         by_id[c.id] = c
 
     # 完了済み候補は次反復対象ではないので除外する (依存充足の判定では done を使う)。
@@ -459,15 +460,15 @@ class WorkDiscovery:
         return row["action"] if row is not None else None
 
     def _require_ready_selection(self, cycle: int, selected_id: Any) -> None:
-        """``edit`` の選択 id が提案の ready 候補であることを検証 (なければ ValueError)。"""
+        """``edit`` の選択 id が提案の ready 候補であることを検証 (なければ ConfigError)。"""
         action = self._load_proposal_action(cycle)
         if action is None:
-            raise ValueError(
+            raise ConfigError(
                 f"no proposal for cycle {cycle} (run {self.run_id!r}); propose first"
             )
         ready_ids = {c["id"] for c in action["ready"]}
         if selected_id not in ready_ids:
-            raise ValueError(
+            raise ConfigError(
                 f"edit selection {selected_id!r} is not a ready candidate of "
                 f"cycle {cycle}; ready={sorted(ready_ids)}"
             )
@@ -479,7 +480,7 @@ class WorkDiscovery:
         resume 後に呼んでも同じ採択結果になる (純粋な読み出し・冪等)。決定の写像:
 
         - ``approve`` -> 推奨候補 (recommended) を採択
-        - ``edit``    -> payload が指す ready 候補を採択 (ready 外なら ValueError)
+        - ``edit``    -> payload が指す ready 候補を採択 (ready 外なら ConfigError)
         - ``reject``  -> 採択なし (``candidate=None``)
         - ``respond`` -> 採択なし。応答本文を ``response`` に載せる
         - 未決定 (pending) / 提案なし (absent) -> 採択なし
@@ -511,7 +512,7 @@ class WorkDiscovery:
             candidate = recommended
         elif decision == "edit":
             if payload not in ready_by_id:
-                raise ValueError(
+                raise ConfigError(
                     f"edit selection {payload!r} is not a ready candidate of "
                     f"cycle {cycle}; ready={sorted(ready_by_id)}"
                 )

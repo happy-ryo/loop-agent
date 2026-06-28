@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Mapping, Optional, Sequence, Union
 
+from ..errors import ConfigError
 from ..state import LoopState, StepRecord
 from ._triage import triage
 
@@ -68,7 +69,7 @@ class WorkItem:
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or not self.id:
-            raise ValueError("WorkItem.id must be a non-empty string")
+            raise ConfigError("WorkItem.id must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,7 @@ class ScheduleContext:
 
     custom callable 戦略はこれを受け取り、``selectable`` の中から 1 件 (:class:`WorkItem`
     または その ``id``) を返す。``selectable`` 外を返すと :class:`WorkListGather` が
-    ``ValueError`` で fail loud する (誤って done / exhausted を再選択しないため)。
+    ``ConfigError`` で fail loud する (誤って done / exhausted を再選択しないため)。
 
     **``attempts`` と ``selections`` の違い**: ``attempts[id]`` は *実行された* 試行回数
     (per-item 上限 / done 判定 / ModelLadder 用)。``selections[id]`` はその item が *選ばれた*
@@ -239,7 +240,7 @@ def _default_build_ctx(item: WorkItem, attempt: int, state: LoopState) -> dict[s
     にしてあるのは意図的**: 永続人間ゲート (:class:`~loop_agent.gate.HumanGate` /
     :func:`~loop_agent.gate.run_gated_loop`) と合成したとき、gate が pause すると context が
     提案 action として state.db に保存される (``request_decision`` は JSON ネイティブを要求する)。
-    :class:`WorkItem` 自身を返すと round-trip できず ``ValueError`` になるため、dict を既定に
+    :class:`WorkItem` 自身を返すと round-trip できず ``ConfigError`` になるため、dict を既定に
     する (``payload`` が JSON ネイティブな限り安全)。``WorkItem`` をそのまま欲しい等は ``build_ctx``
     で上書きする。
     """
@@ -292,7 +293,7 @@ class WorkListGather:
             返す skip でも offer は前進し、他 item へ rotate して starve を防ぐ。
 
     Raises:
-        ValueError: item id が重複 / ``strategy`` が未知の文字列 / ``max_attempts_per_item < 1``。
+        ConfigError: item id が重複 / ``strategy`` が未知の文字列 / ``max_attempts_per_item < 1``。
     """
 
     def __init__(
@@ -311,7 +312,7 @@ class WorkListGather:
         by_id: dict[str, WorkItem] = {}
         for it in normalized:
             if it.id in by_id:
-                raise ValueError(f"duplicate WorkItem id {it.id!r}; ids must be unique")
+                raise ConfigError(f"duplicate WorkItem id {it.id!r}; ids must be unique")
             by_id[it.id] = it
         self._items: tuple[WorkItem, ...] = tuple(normalized)
         self._by_id = by_id
@@ -319,7 +320,7 @@ class WorkListGather:
 
         if isinstance(strategy, str):
             if strategy not in _BUILTIN_STRATEGIES:
-                raise ValueError(
+                raise ConfigError(
                     f"unknown strategy {strategy!r}; "
                     f"expected one of {sorted(_BUILTIN_STRATEGIES)} or a callable"
                 )
@@ -330,7 +331,7 @@ class WorkListGather:
             self.strategy_name = getattr(strategy, "__name__", "custom")
 
         if max_attempts_per_item is not None and max_attempts_per_item < 1:
-            raise ValueError("max_attempts_per_item must be >= 1 or None")
+            raise ConfigError("max_attempts_per_item must be >= 1 or None")
         self._max = max_attempts_per_item
         self._done_when = done_when
         self._build_ctx = build_ctx
@@ -375,7 +376,7 @@ class WorkListGather:
         chosen = self._strategy(ctx)
         chosen_id = chosen.id if isinstance(chosen, WorkItem) else chosen
         if chosen_id not in {it.id for it in selectable}:
-            raise ValueError(
+            raise ConfigError(
                 f"strategy {self.strategy_name!r} selected {chosen_id!r}, "
                 f"which is not selectable (done/exhausted/unknown); "
                 f"selectable={[it.id for it in selectable]}"
