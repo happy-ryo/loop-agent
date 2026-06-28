@@ -1,0 +1,38 @@
+# Sample loop-agent task definition (Issue #31).
+#
+# Run it with:   loop-agent run ./examples/task.toml
+# Inspect it:    loop-agent status <run-id>
+# Resume it:     loop-agent resume <run-id> ./examples/task.toml
+# Follow events: loop-agent logs <run-id> --follow
+#
+# act/verify each work in one of two modes: a subprocess `command`, or a
+# `python = "module:attr"` reference to an in-process callable. Pick one per
+# section.
+
+[loop]
+goal = "make the test suite pass"
+# run_id = "demo-run"          # optional; auto-generated when omitted
+
+[conditions]
+# At least one cap is required so the loop is always bounded (report.md R3).
+max_iterations = 20
+token_budget = 500000
+timeout_seconds = 3600
+# no_progress = { window = 5, repeat = 3 }   # optional: stop when stuck
+
+[act]
+# subprocess mode: {prompt}/{goal} -> [loop].goal, {iteration} -> step index.
+command = ["claude", "--print", "{prompt}"]
+cost_per_step = 0              # tokens charged per step (drives token_budget)
+# timeout_seconds = 120        # optional per-step subprocess timeout
+# python = "mypkg.hooks:act"   # OR: in-process callable act(context) -> ActOutcome
+
+[verify]
+# subprocess mode: exit-code 0 == goal met (ground truth, not an LLM judge).
+command = ["pytest", "-q"]
+# timeout_seconds = 120        # optional per-verify subprocess timeout
+# python = "mypkg.hooks:verify" # OR: callable verify(outcome) -> VerifyOutcome
+
+[state]
+# db = "loop-state.db"         # optional; defaults to loop-state.db (holds many runs)
+# events = "events.jsonl"      # optional JSONL event journal (in addition to state.db)
