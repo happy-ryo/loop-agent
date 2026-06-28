@@ -18,6 +18,20 @@ loop-agent の `act` シームは「1 反復の実行体」を 1 つの関数
 > 書けるパターンを、落とし穴ごと正規化したものです。新しいアダプタも
 > 「`ActOutcome` を返す関数」である限り、コア（`run_loop`）を一切変更せずに差し込めます。
 
+> **2 種類のアダプタがある。** この文書が扱うのは外部 CLI を **subprocess 起動する
+> 実行体アダプタ**（`ClaudeCodeAct` / `CodexAct`）で、以下の 4 か条・token 解析・
+> Mock の話はそれ向けです。もう 1 種類、**他の `act` フックを合成するアダプタ** が
+> あり、その正準例が
+> [`ModelLadder`](../../src/loop_agent/adapters/model_ladder.py)（困難タスクで
+> 強いモデルへ自動エスカレーション、Issue #53）です。合成アダプタは subprocess を
+> 起動しないので `build_command` / `runner` / `parse_tokens` を持たず、下の共通契約
+> ハーネス（`ADAPTER_SPECS`）には**載せません**（token / `failed` / graceful 終了の
+> 保証は合成される各段の実行体アダプタが満たし、合成側は段の `ActOutcome` を透過
+> します）。`ModelLadder` は「`act` が `Callable` だから user も書けるパターン」を
+> packagize した例で、stateful な試行カウント・`act` が `verify` の goal 判定を
+> 見られない制約・異種合成（`ClaudeCodeAct` + `CodexAct`）の落とし穴をヘッジして
+> います。新しい合成アダプタを書くなら `ModelLadder` を雛形にしてください。
+
 ---
 
 ## act シームの契約（4 か条）
