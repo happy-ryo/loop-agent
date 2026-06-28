@@ -41,6 +41,17 @@
     進行中 step は中断しない）とは別物。新規 export: `TimeoutPolicy` / `SeamTimeout` /
     `UnsupportedTimeoutKill` / `TIMEOUT_GRACEFUL` / `TIMEOUT_KILL` /
     `ACT_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`。
+- **統一例外階層 `LoopError`**（Issue #43）: ライブラリが送出する全例外を単一基底
+  `LoopError` 配下に整理。`loop_agent.errors` を正準ホームに、`ConfigError`（引数の
+  値/型が不正・設定ミス）、`StateError`（実行時の不変条件/ライフサイクル違反）、
+  `AsyncSeamInSyncLoop`（#40 から再配置）を追加し、`loop_agent` トップレベルから
+  export。これまで `ValueError` / `TypeError` / `RuntimeError` を直接送出していた
+  検証・状態違反箇所を対応する `LoopError` サブ型へ置換した。**後方互換**: 各サブ型は
+  従来の組み込み例外も多重継承する（`ConfigError` は `ValueError`/`TypeError`、
+  `StateError` は `ValueError`/`RuntimeError`、`AsyncSeamInSyncLoop` は `RuntimeError`）
+  ため、既存の `except ValueError` 等はそのまま動作する。`prompt_template` の欠落
+  フィールドが送出する `KeyError`（`str.format` 意味論を踏襲）は意図的に階層外。
+  解説は [`docs/errors.md`](./docs/errors.md)。
 - **multi-item 公平 scheduling `WorkListGather`**（Issue #56）: N 件を 1 本のループで
   公平に回す `gather` フック。公平 scheduling 戦略（`round_robin` / `fewest_attempts` /
   `fifo` / `priority` / custom callable）+ per-item 上限（`max_attempts_per_item` で

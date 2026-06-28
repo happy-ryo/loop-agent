@@ -34,6 +34,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 
+from .errors import ConfigError
 from .evaluator import GroundTruthSignal, Score
 from .memory import EpisodicMemory, Lesson
 from .reflexion import EpisodeRecord, ReflexionState
@@ -242,7 +243,7 @@ class ReflexionStore:
         作成/復元は 1 transaction で atomic に行う。
         """
         if not run_id:
-            raise ValueError("load_or_init: run_id must be a non-empty string")
+            raise ConfigError("load_or_init: run_id must be a non-empty string")
         with self._transaction():
             row = self.conn.execute(
                 "SELECT run_id FROM reflexion_run WHERE run_id = ?", (run_id,)

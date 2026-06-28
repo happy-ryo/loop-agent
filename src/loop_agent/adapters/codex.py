@@ -49,6 +49,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Union
 
+from ..errors import ConfigError
 from ..loop import ActOutcome
 # 結果の形・プロンプト整形・Runner シームはアダプタ共通の土台(base)に集約済み。
 # ``render_prompt`` / ``Runner`` は base から直接参照する(claude_code 経由の
@@ -453,7 +454,7 @@ class MockCodexAct:
 
     def __post_init__(self) -> None:
         if not self.responses:
-            raise ValueError("MockCodexAct requires at least one response")
+            raise ConfigError("MockCodexAct requires at least one response")
         self._responses = [self._coerce(r) for r in self.responses]
 
     @staticmethod
@@ -464,7 +465,7 @@ class MockCodexAct:
             return CodexResult(text=response)
         if isinstance(response, Mapping):
             return CodexResult(**response)
-        raise TypeError(
+        raise ConfigError(
             "MockCodexAct responses must be str, Mapping, or CodexResult, "
             f"got {type(response).__name__}"
         )

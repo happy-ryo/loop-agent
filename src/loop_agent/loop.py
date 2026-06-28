@@ -21,8 +21,9 @@ Two entry points share one control-flow implementation (Issue #40):
 - :func:`run_loop` -- the original synchronous API. It drives the shared
   coroutine to completion *in the caller's own context* (no event loop is
   created), so behaviour for synchronous hooks is byte-for-byte unchanged; it
-  raises a clear ``RuntimeError`` if handed an async hook (use
-  :func:`async_run_loop` for those).
+  raises a clear :class:`~loop_agent.errors.AsyncSeamInSyncLoop` (a ``LoopError``
+  / ``RuntimeError``) if handed an async hook (use :func:`async_run_loop` for
+  those).
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from ._async import (
     reject_awaitables,
 )
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
+from .errors import ConfigError, StateError
 from .state import LoopState, StepRecord
 
 # 人間ゲートの disposition: 提案 action をそのまま実行 / 実行せず記録だけ / 中断。
@@ -890,7 +892,7 @@ async def _drive_loop(
     elif isinstance(conditions, (list, tuple)):
         stop = AnyOf(conditions)
     else:
-        raise TypeError(
+        raise ConfigError(
             "conditions must be an AnyOf or a sequence of stop conditions, "
             f"got {type(conditions).__name__}"
         )
@@ -977,7 +979,7 @@ async def _drive_loop(
                 # "paused") must NOT silently fall through to executing the
                 # action -- for a safety gate that could run an irreversible
                 # side effect instead of pausing. Reject loudly instead.
-                raise ValueError(
+                raise StateError(
                     f"gate returned unknown disposition {review.disposition!r}; "
                     f"expected one of {GATE_PROCEED!r}/{GATE_SKIP!r}/{GATE_PAUSE!r}"
                 )
@@ -1124,8 +1126,9 @@ def run_loop(
     returns an awaitable -- a hook, a ``conditions`` check, ``gate.review``,
     ``on_step``, or ``on_complete`` -- :func:`maybe_await` (and
     :meth:`AnyOf.afirst_triggered`) raise
-    :class:`loop_agent._async.AsyncSeamInSyncLoop` (a ``RuntimeError``) at that
-    point, reliably and regardless of whether the awaitable would have suspended.
+    :class:`loop_agent.errors.AsyncSeamInSyncLoop` (a ``LoopError`` /
+    ``RuntimeError``) at that point, reliably and regardless of whether the
+    awaitable would have suspended.
     (The original sync ``run_loop`` never accepted async seams either, so this is
     not a regression -- it is a clear, consistent error directing you to
     ``await async_run_loop(...)``.) Because the flag is set explicitly per run, it
@@ -1175,4 +1178,4 @@ def run_loop(
         # Unreachable: with strict-sync set, maybe_await never awaits, so the
         # coroutine cannot suspend. Guard defensively rather than hang.
         coro.close()
-        raise RuntimeError("run_loop(): synchronous driver unexpectedly suspended")
+        raise StateError("run_loop(): synchronous driver unexpectedly suspended")

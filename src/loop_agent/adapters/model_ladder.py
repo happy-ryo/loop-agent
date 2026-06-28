@@ -73,6 +73,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence, Union
 
+from ..errors import ConfigError
 from ..loop import ActHook, ActOutcome
 
 __all__ = [
@@ -145,7 +146,7 @@ def after_attempts(n: int) -> EscalationPredicate:
         escalate_on=lambda ec: ec.last_failed and ec.attempts >= 2
     """
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
-        raise ValueError(f"after_attempts(n) requires a positive int, got {n!r}")
+        raise ConfigError(f"after_attempts(n) requires a positive int, got {n!r}")
 
     def _predicate(ec: EscalationContext) -> bool:
         return ec.attempts >= n
@@ -161,11 +162,11 @@ def _resolve_strategy(
     - callable -> そのまま(custom predicate)
     - ``"failure"`` -> :func:`on_failure`
     - 正の int N -> ``after_attempts(N)``
-    その他は分かりやすい :class:`ValueError` を投げる(``True``/``0``/未知の文字列 等)。
+    その他は分かりやすい :class:`~loop_agent.errors.ConfigError` を投げる(``True``/``0``/未知の文字列 等)。
     """
     # bool は int のサブクラスなので、ここで先に弾く(``escalate_on=True`` 等の取り違え)。
     if isinstance(escalate_on, bool):
-        raise ValueError(
+        raise ConfigError(
             f"escalate_on must be 'failure', a positive int, or a predicate; "
             f"got bool {escalate_on!r}"
         )
@@ -176,12 +177,12 @@ def _resolve_strategy(
     if isinstance(escalate_on, str):
         if escalate_on == "failure":
             return on_failure
-        raise ValueError(
+        raise ConfigError(
             f"unknown escalate_on strategy {escalate_on!r}; "
             "use 'failure', a positive int (attempt count), or a predicate "
             "Callable[[EscalationContext], bool]"
         )
-    raise ValueError(
+    raise ConfigError(
         f"escalate_on must be 'failure', a positive int, or a predicate; "
         f"got {type(escalate_on).__name__}"
     )
@@ -242,7 +243,7 @@ class ModelLadder:
 
     def __post_init__(self) -> None:
         if not self.candidates:
-            raise ValueError("ModelLadder requires at least one candidate")
+            raise ConfigError("ModelLadder requires at least one candidate")
         self._should_escalate: EscalationPredicate = _resolve_strategy(self.escalate_on)
 
     @property

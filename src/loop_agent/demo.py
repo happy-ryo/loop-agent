@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Mapping, Optional, Sequence
 
+from .errors import ConfigError
 from .loop import ActOutcome, VerifyOutcome
 from .state import LoopState
 
@@ -155,7 +156,7 @@ class CandidateApplier:
 
     def __post_init__(self) -> None:
         if not self.candidates:
-            raise ValueError("CandidateApplier requires at least one candidate")
+            raise ConfigError("CandidateApplier requires at least one candidate")
 
     def __call__(self, attempt: int) -> ActOutcome:
         index = min(attempt, len(self.candidates) - 1)

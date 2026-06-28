@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from .conditions import MaxIterations, NoProgress, StopCondition, Timeout, TokenBudget
+from .errors import ConfigError
 from .events import JsonlEventSink
 from .loop import ActOutcome, LoopResult, VerifyOutcome
 from .observe import run_observed_loop
@@ -86,14 +87,10 @@ MAX_OBSERVATION_CHARS = 2000
 FOLLOW_POLL_SECONDS = 0.5
 
 
-class ConfigError(Exception):
-    """A user-facing configuration / usage error (bad TOML, missing file, ...).
-
-    :func:`main` catches it, prints the message to stderr, and exits non-zero
-    -- as opposed to an unexpected internal error, which is left to propagate
-    with a traceback.
-    """
-
+# ``ConfigError`` の正準定義は loop_agent.errors にある (Issue #43)。CLI の TOML /
+# 引数パースの設定エラーもこれを使い、:func:`main` が捕捉して stderr に出力し非ゼロ
+# 終了する (想定外の内部エラーは traceback ごと伝播させる)。後方互換のため
+# ``from loop_agent.cli import ConfigError`` は引き続き有効 (上の import で再公開)。
 
 # -- TOML config -------------------------------------------------------------
 

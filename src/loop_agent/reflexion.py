@@ -42,6 +42,7 @@ from .evaluator import (
     HeldOut,
     admit_evaluator,
 )
+from .errors import ConfigError
 from .loop import LoopResult
 from .memory import (
     EpisodicMemory,
@@ -246,7 +247,7 @@ def _normalize_conditions(conditions: OuterConditions) -> AnyOf:
         return conditions
     if isinstance(conditions, (list, tuple)):
         return AnyOf(conditions)
-    raise TypeError(
+    raise ConfigError(
         "convergence must be an AnyOf or a sequence of stop conditions, "
         f"got {type(conditions).__name__}"
     )
@@ -387,25 +388,25 @@ def run_reflexion(
             復元した :class:`ReflexionState` を渡すと、永続化済みの続きから再開できる。
 
     Raises:
-        ValueError: ``epoch_len < 2`` / ``epsilon <= 0`` / ``declared_keys`` 空 /
+        ConfigError: ``epoch_len < 2`` / ``epsilon <= 0`` / ``declared_keys`` 空 /
             ``production_tasks`` 空 / production と held-out の task 名前空間が交差する場合。
     """
     if epoch_len < 2:
-        raise ValueError(
+        raise ConfigError(
             "epoch_len must be >= 2 (epoch_len==1 degenerates to a moving evaluator)"
         )
     if epsilon <= 0:
-        raise ValueError("epsilon must be > 0 (anti-churn margin for evaluator promotion)")
+        raise ConfigError("epsilon must be > 0 (anti-churn margin for evaluator promotion)")
     if not declared_keys:
-        raise ValueError("declared_keys must be non-empty (diverse evaluation)")
+        raise ConfigError("declared_keys must be non-empty (diverse evaluation)")
     if not production_tasks:
-        raise ValueError("production_tasks must be non-empty")
+        raise ConfigError("production_tasks must be non-empty")
     # dual-component 分離: production と held-out の task 名前空間が素であることを検証。
     prod_ids = {task_id(t) for t in production_tasks}
     held_ids = {p.case_id for p in held_out.probes}
     overlap = prod_ids & held_ids
     if overlap:
-        raise ValueError(
+        raise ConfigError(
             "production_tasks and held_out probes must be disjoint "
             f"(dual-component separation); overlapping ids: {sorted(overlap)}"
         )
@@ -422,7 +423,7 @@ def run_reflexion(
             initial_state.evaluator_version
             and initial_state.evaluator_version != evaluator.version
         ):
-            raise ValueError(
+            raise ConfigError(
                 f"resume: persisted evaluator_version {initial_state.evaluator_version!r} does "
                 f"not match supplied evaluator.version {evaluator.version!r}. Outer resume cannot "
                 "reconstruct an evaluator (callables are not serializable); supply the evaluator "
@@ -436,7 +437,7 @@ def run_reflexion(
             initial_state.declared_keys
             and tuple(initial_state.declared_keys) != tuple(declared_keys)
         ):
-            raise ValueError(
+            raise ConfigError(
                 f"resume: persisted declared_keys {tuple(initial_state.declared_keys)!r} do not "
                 f"match supplied {tuple(declared_keys)!r}; the persisted ground-truth aggregate "
                 "history was computed under the old axes and would be stale. Supply the same "

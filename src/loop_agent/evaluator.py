@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+from .errors import ConfigError
+
 
 @dataclass(frozen=True)
 class Score:
@@ -174,10 +176,10 @@ class HeldOut:
 
     def __post_init__(self) -> None:
         if not self.probes:
-            raise ValueError("HeldOut requires at least one probe")
+            raise ConfigError("HeldOut requires at least one probe")
         ids = [p.case_id for p in self.probes]
         if len(set(ids)) != len(ids):
-            raise ValueError("HeldOut probe case_id values must be unique")
+            raise ConfigError("HeldOut probe case_id values must be unique")
 
     @property
     def folds(self) -> tuple[int, ...]:
@@ -264,7 +266,7 @@ def admit_evaluator(
     critical probe を犠牲にする」昇格を構造的に弾く。
     """
     if epsilon <= 0:
-        raise ValueError("admit_evaluator epsilon must be > 0 (anti-churn margin)")
+        raise ConfigError("admit_evaluator epsilon must be > 0 (anti-churn margin)")
 
     # 集約ゲートの測定対象 (回転 fold があればそれ、無ければ全体)。後退チェックは常に全体。
     measure = measure_fold if measure_fold is not None else held_out
