@@ -1,19 +1,19 @@
-"""構造化ループイベントとその sink（report.md S4.5「観測性」/ S5 Phase 2）。
+"""Structured loop events and their sink (report.md S4.5 "observability" / S5 Phase 2).
 
-観測層は loop_begin / loop_step / loop_end の 3 種を *構造化イベント* として
-emit する。各イベントは反復番号・コスト/メトリクス・終了理由を運び、ループの
-一生が事後解析できるだけの情報を残す（report.md S5 Phase 2 成功条件 (b)
-「全終了理由が journal に残り事後解析できる」）。
+The observation layer emits 3 types of *structured events*: loop_begin / loop_step / loop_end.
+Each event carries iteration number, cost/metrics, and exit reason, leaving enough information
+for post-analysis of the entire loop lifetime (report.md S5 Phase 2 success condition (b)
+"all exit reasons are retained in the journal and analyzable post-hoc").
 
-イベントは sink へ流す。sink は ``emit(event) -> None`` だけを持つ最小の口で、
-claude-org の ``journal_append`` と同じ「1 行 1 イベントの追記」を地で行く
-:class:`JsonlEventSink`（journal 風 event sink）、テスト/インメモリ向けの
-:class:`ListSink`、任意の関数へ橋渡しする :class:`CallableSink` を備える。
+Events flow to sinks. A sink is a minimal interface with only ``emit(event) -> None``,
+just like claude-org's ``journal_append`` -- a "one event per line append":
+:class:`JsonlEventSink` (journal-style event sink), :class:`ListSink` for tests/in-memory,
+and :class:`CallableSink` that bridges to arbitrary functions.
 
-この層は **ループコアにのみ依存** する（state.db 永続化詳細には密結合しない、
-report.md S4.6）。時刻はループの注入クロック由来の ``elapsed`` のみを使い、
-イベントは与えられた run に対して決定的になる（:mod:`loop_agent.progress`
-と同じ方針）。
+This layer depends **only on the loop core** (does not tightly couple to state.db persistence details,
+report.md S4.6). Time uses only the injected-clock ``elapsed`` from the loop,
+and events become deterministic with respect to the given run (:mod:`loop_agent.progress`
+uses the same approach).
 """
 
 from __future__ import annotations
@@ -25,20 +25,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
-# イベント種別（discriminator）。読み手が文字列リテラルを散在させずに filter
-# できるよう定数化する。task 指定の loop_begin / loop_step / loop_end に一致。
+# Event type (discriminator). Allows readers to filter without scattering string
+# literals everywhere. Matches loop_begin / loop_step / loop_end task designations.
 LOOP_BEGIN = "loop_begin"
 LOOP_STEP = "loop_step"
 LOOP_END = "loop_end"
 
 
 def _jsonable(value: Any) -> Any:
-    """任意の値を JSON が表現できる形へ best-effort 変換する。
+    """Convert an arbitrary value to a JSON-representable form on a best-effort basis.
 
-    スカラと JSON ネイティブのコンテナはそのまま、それ以外（独自の観測オブジェクト
-    など）は ``repr`` で文字列化し、1 つの変な値がイベント全体を壊さないようにする。
-    :func:`loop_agent.progress._to_jsonable` と同じ方針で、保存される形を予測可能に
-    する（``json.dumps(default=...)`` を eager に適用したもの）。
+    Scalars and JSON-native containers pass through unchanged; everything else (custom observation
+    objects, etc.) is stringified via ``repr``, ensuring one weird value doesn't break the entire
+    event. Same approach as :func:`loop_agent.progress._to_jsonable` for predictable saved form
+    (eagerly applies ``json.dumps(default=...)``).
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -51,12 +51,12 @@ def _jsonable(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class LoopEvent:
-    """1 つの構造化ループイベント。
+    """One structured loop event.
 
-    ``kind`` は :data:`LOOP_BEGIN` / :data:`LOOP_STEP` / :data:`LOOP_END` のいずれか。
-    ``iteration`` は反復番号（begin では 0、step では 0 始まりの完了ステップ番号、
-    end では総反復数）。``elapsed`` はループ開始からの秒数（注入クロック由来で
-    決定的）。``payload`` は kind 固有のフィールド（メトリクス・終了理由など）。
+    ``kind`` is one of :data:`LOOP_BEGIN` / :data:`LOOP_STEP` / :data:`LOOP_END`.
+    ``iteration`` is the iteration number (0 for begin, completed step number starting from 0 for step,
+    total iteration count for end). ``elapsed`` is seconds since loop start (deterministic, from injected clock).
+    ``payload`` is kind-specific fields (metrics, exit reason, etc.).
     """
 
     kind: str
@@ -65,7 +65,7 @@ class LoopEvent:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON 化しやすいフラットな dict へ畳む（sink のシリアライズ用）。"""
+        """Flatten to a JSON-friendly dict (for sink serialization)."""
         return {
             "kind": self.kind,
             "iteration": self.iteration,
@@ -76,26 +76,25 @@ class LoopEvent:
 
 @runtime_checkable
 class EventSink(Protocol):
-    """構造化イベントを受け取る最小の口。
+    """Minimal interface for receiving structured events.
 
-    実装は :class:`LoopEvent` を 1 つ受け取り、自分のやり方で記録する。観測層は
-    emit を best-effort 呼び出しする（sink の例外でループを殺さない、
-    :class:`~loop_agent.observe.LoopObserver` を参照）ので、実装は理想的には
-    例外を投げないことが望ましい。
+    Implementation receives one :class:`LoopEvent` and records it in its own way. The observation layer
+    calls emit on a best-effort basis (doesn't kill the loop on sink exceptions;
+    see :class:`~loop_agent.observe.LoopObserver`), so implementations should ideally not raise exceptions.
     """
 
     def emit(self, event: LoopEvent) -> None:
         ...
 
 
-# sink の emit が失敗したときの扱いを差し替えるためのフック（既定は warn）。
-# 観測層（:mod:`loop_agent.observe`）でもこの型を共有する。
+# Hook to override how emit failures in sinks are handled (default: warn).
+# The observation layer (:mod:`loop_agent.observe`) also shares this type.
 SinkErrorHandler = Callable[[EventSink, LoopEvent, BaseException], None]
 
 
 @dataclass
 class ListSink:
-    """受け取ったイベントをメモリ上の list に貯める sink（テスト/インメモリ向け）。"""
+    """A sink that buffers received events in an in-memory list (for tests / in-memory use)."""
 
     events: list[LoopEvent] = field(default_factory=list)
 
@@ -103,15 +102,15 @@ class ListSink:
         self.events.append(event)
 
     def of_kind(self, kind: str) -> list[LoopEvent]:
-        """指定 kind のイベントだけを書き込み順で返す小さなヘルパ。"""
+        """Return only events of the specified kind, in write order (small helper)."""
         return [e for e in self.events if e.kind == kind]
 
 
 class CallableSink:
-    """任意の ``callable(dict) -> None`` へイベントを橋渡しする sink。
+    """A sink that bridges events to arbitrary ``callable(dict) -> None``.
 
-    ロガーや既存の ``journal_append`` 風関数へそのまま流したいときの最小アダプタ。
-    イベントは :meth:`LoopEvent.to_dict` 済みの dict として渡す。
+    Minimal adapter for flowing to loggers or existing ``journal_append``-style functions.
+    Events are passed as dict via :meth:`LoopEvent.to_dict`.
     """
 
     def __init__(self, fn: Callable[[dict[str, Any]], None]) -> None:
@@ -122,62 +121,62 @@ class CallableSink:
 
 
 class JsonlEventSink:
-    """追記専用の JSON Lines sink（claude-org ``journal_append`` の file 版）。
+    """An append-only JSON Lines sink (file version of claude-org's ``journal_append``).
 
-    1 イベント 1 行で追記し、行ごとに flush するので、外部の観測者（やクラッシュ後の
-    読み手）は進行をそのまま見られる。各行が独立に parse 可能な完全レコードなので、
-    追記が耐久性の単位になる。クラッシュは末尾の部分行 1 つを失うだけで、それ以前の
-    イベントは全て読める（:func:`read_events` がその末尾を許容する）。
+    Appends one event per line and flushes per line, so external observers (or post-crash readers)
+    see progress in real-time. Each line is independently parseable as a complete record, so
+    appending becomes the durability unit. A crash loses only the final partial line; all prior
+    events remain readable (:func:`read_events` tolerates that trailing incomplete line).
 
-    state.db には依存しない。観測を emit 層として独立に保つための、最小で自己完結な
-    journal 風 sink である（report.md S4.6: 観測は emit 層として独立、#11 と並列可）。
+    Does not depend on state.db. Observation remains independent as an emit layer via a minimal,
+    self-contained journal-style sink (report.md S4.6: observation independent as emit layer, #11 runs in parallel).
     """
 
     def __init__(self, path: "str | os.PathLike[str]") -> None:
         self.path = Path(path)
-        # 親ディレクトリを先に作り、最初の追記が「フォルダ無し」で失敗しないように
-        # する（ファイル自体は最初の write で遅延生成）。
+        # Create parent directory first so the first append doesn't fail with "folder doesn't exist"
+        # (the file itself is lazily created on first write).
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event: LoopEvent) -> None:
         line = json.dumps(event.to_dict(), ensure_ascii=False, default=repr)
-        # open-append-flush をレコード毎に行うことでライフサイクルを単純化し
-        # （閉じるハンドル無し）、行を耐久性の単位にする。
+        # Perform open-append-flush per record to simplify lifecycle
+        # (no handle left open) and make lines the durability unit.
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
             fh.flush()
 
 
 def read_events(path: "str | os.PathLike[str]") -> list[dict[str, Any]]:
-    """JSONL イベントファイルを書き込み順に読み戻す。
+    """Read back a JSONL event file in write order.
 
-    空行は飛ばす。許容する唯一の壊れ方は「末尾レコードの途中切れ」――クラッシュで
-    途中まで追記された、改行終端を欠く最終行だけを落とす。改行終端された壊れた行や、
-    末尾以外の壊れた行は本物の不整合として送出し、サイレントなデータ欠落でバグを
-    隠さない。ファイルが無ければ空 list を返す（:func:`loop_agent.progress.read_progress`
-    と同方針で、対象は別フォーマット=イベント列）。
+    Skips blank lines. The only tolerated corruption is "final record mid-write" -- the final line
+    if it lacks a newline-terminator due to a crash. A corrupted line with newline-terminator, or
+    corruption elsewhere, raises as a real consistency error to avoid silent data loss masking bugs.
+    Returns an empty list if the file doesn't exist (same approach as :func:`loop_agent.progress.read_progress`,
+    though the target is a different format: event sequence).
     """
     p = Path(path)
     if not p.exists():
         return []
 
     text = p.read_text(encoding="utf-8")
-    # writer の終端は常に '\n'。終端を欠く末尾だけが「書きかけ（クラッシュ切れ）」の
-    # 署名。終端済みの壊れた最終行は本物の破損として raise する。
+    # Writer always ends with '\n'. A missing terminator on the final line is the
+    # "in-flight (crash truncated)" signature. A corrupted final line WITH terminator raises as genuine corruption.
     final_is_truncated = bool(text) and not text.endswith("\n")
 
     records: list[dict[str, Any]] = []
-    # '\n' のみで分割する（writer の framing そのもの）。``str.splitlines`` は
-    # U+2028 / U+2029 / U+0085 でも切ってしまい、ensure_ascii=False の json.dumps が
-    # 文字列値中にそれらをそのまま出すため、1 レコードが 2 つに裂けて誤って破損扱いに
-    # なりうる。末尾改行が残す '' は strip フィルタで落ちる。
+    # Split only by '\n' (writer's framing itself). ``str.splitlines`` also splits on
+    # U+2028 / U+2029 / U+0085, and ensure_ascii=False in json.dumps emits those characters
+    # in string values as-is, causing one record to split into two and mistakenly treated as corruption.
+    # The '' left by a trailing newline is filtered out by strip.
     lines = [ln for ln in text.split("\n") if ln.strip()]
     for idx, line in enumerate(lines):
         try:
             records.append(json.loads(line))
         except json.JSONDecodeError:
             if idx == len(lines) - 1 and final_is_truncated:
-                break  # 終端を欠く末尾 1 行だけ許容して落とす
+                break  # Tolerate incomplete final line (truncated by crash) and skip it
             raise
     return records
 
@@ -188,16 +187,16 @@ def fan_out(
     *,
     on_error: Optional[SinkErrorHandler] = None,
 ) -> None:
-    """1 イベントを複数 sink へ best-effort で配る。
+    """Distribute one event to multiple sinks on a best-effort basis.
 
-    sink 単位で例外を捕捉し、ループを観測の都合で殺さない（観測は best-effort）。
-    既定では失敗を ``warnings.warn`` で可視化し、サイレントには握り潰さない。
-    ``on_error(sink, event, exc)`` を渡せば挙動を差し替えられる（テストで厳格化する等）。
+    Catches exceptions per-sink so observation failures don't kill the loop (observation is best-effort).
+    By default, failures are surfaced via ``warnings.warn`` and not silently swallowed.
+    Pass ``on_error(sink, event, exc)`` to override behavior (e.g., strict in tests).
     """
     for sink in sinks:
         try:
             sink.emit(event)
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             if on_error is not None:
                 on_error(sink, event, exc)
             else:

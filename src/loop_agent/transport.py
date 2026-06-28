@@ -1,36 +1,41 @@
-"""wake 配送の transport 層: push 一次 / pull fallback / at-most-once (Issue #23)。
+"""Transport layer for wake delivery: push-primary / pull-fallback / at-most-once (Issue #23).
 
-report.md S3.3 / S4.6 / S5 Phase3。ループの **完了 / 次反復 / 判断要求** を別ループや
-窓口 (受信側) に届ける wake 配送の実体をここに新設する。claude-org runtime の broker
-sidecar は runtime 所属で直接再利用できない[^pattern-only]ため、**パターンだけ抽出** して
-loop-agent 側に依存ゼロ (stdlib のみ) で実装する。
+report.md S3.3 / S4.6 / S5 Phase3. Instantiates the wake delivery mechanism that delivers
+**completion / next iteration / decision request** to other loops or recipient endpoints.
+The claude-org runtime broker sidecar cannot be directly reused as it belongs to the runtime[^pattern-only],
+so we **extract the pattern only** and implement it in loop-agent with zero dependencies (stdlib only).
 
-抽出したパターン (出典 ``knowledge/curated/broker-transport.md`` / backend 契約):
+Extracted patterns (source: ``knowledge/curated/broker-transport.md`` / backend contract):
 
-- **push 一次 / pull fallback** (report.md S3.3)。push (in-band 注入) は *即応 accelerator*、
-  pull poll が *正準配送路* (backend 中立・割り込み hazard 無し)。push が失効/不通でも
-  受信側が役割 cadence で能動 poll すれば配送は途切れない。本層はこの非対称を素直に写し、
-  「backend 不通でも pull fallback で配送継続」(report.md S5 Phase3 成功条件 b) を成立させる。
-- **三状態 claim-then-confirm による at-most-once** (broker lost-message-window 知見)。
-  単一の ``delivered`` boolean は「配達済みフラグは立つが受信側に届いていない」喪失窓を持つ。
-  これを ``UNDELIVERED -> CLAIMED(lease, owner) -> DELIVERED`` の daemon 所有三状態 +
-  claim-then-confirm で塞ぐ: claim で行を lease 占有して返し、受信側が処理し切ってから confirm で
-  DELIVERED 化する。confirm 前に lease が失効した行は UNDELIVERED へ戻す (再 eligible)。
-  確定 (DELIVERED) は ``owner`` 一致 + lease 未失効を要求する fencing で守られ、確定済みは
-  二度と再配達しない (at-most-once)。同一 recipient を複数 worker で並行 poll する場合は
-  worker ごとに distinct な ``owner`` を渡すこと (owner fencing が二重確定を弾く前提)。
-- **role 別 cadence** (broker pull-first 知見)。push が失効する pull 環境では「待機」は idle 待機
-  ではなく *能動 poll* に翻訳する。受信契機を役割別に非対称設計する (dispatcher 3m / worker
-  bounded / secretary turn-prologue)。:data:`CADENCE_SECONDS` / :func:`due_to_poll` がその最小形。
+- **push-primary / pull-fallback** (report.md S3.3). push (in-band injection) is an *immediate accelerator*,
+  and pull polling is the *canonical delivery path* (backend-neutral, no interrupt hazards).
+  Even if push expires or becomes unavailable, the delivery does not break if the recipient
+  actively polls on role cadence. This layer mirrors this asymmetry directly to establish
+  "delivery continues via pull fallback even when backend is unavailable" (report.md S5 Phase3 success condition b).
+- **At-most-once via three-state claim-then-confirm** (broker lost-message-window insight).
+  A single ``delivered`` boolean has a loss window of "flag is set but not reached the recipient".
+  We seal this with ``UNDELIVERED -> CLAIMED(lease, owner) -> DELIVERED`` daemon-owned three states +
+  claim-then-confirm: claim returns with lease occupation of the row, confirm marks it DELIVERED
+  after the recipient has finished processing. If lease expires before confirm, the row reverts to
+  UNDELIVERED (re-eligible). Confirmation (DELIVERED) is guarded by fencing requiring ``owner`` match
+  and non-expired lease; confirmed messages are never re-delivered (at-most-once). When multiple
+  workers poll the same recipient in parallel, pass a distinct ``owner`` per worker (owner fencing
+  prevents double confirmation).
+- **Role-based cadence** (broker pull-first insight). In pull environments where push expires,
+  "waiting" is translated not as idle waiting but as *active polling*. Receive triggers are
+  designed asymmetrically by role (dispatcher 3m / worker bounded / secretary turn-prologue).
+  :data:`CADENCE_SECONDS` / :func:`due_to_poll` provide the minimal form.
 
-設計の境界 (report.md S6「transport の runtime 依存」):
+Design boundaries (report.md S6 "transport runtime dependency"):
 
-- runtime 非依存・自己完結。``pane`` / ``tmux`` / ``renga`` / ``broker`` CLI に一切依存しない。
-  push backend は :class:`PushBackend` Protocol の注入で差し替え可能にし (best-effort ``bool``
-  契約は ``tools/peer_notify.py`` から踏襲)、配送の正本 (queue) は backend と独立に持つ。
-- 受信側は **idempotent handler 前提**。wake は :attr:`Wake.id` で同一性を持ち、二重 enqueue は
-  no-op、push/pull の継ぎ目で稀に二重配送が起きても受信側は id で de-dup できる (report.md の
-  「残余窓は at-least-once + 冪等表示で許容、idle-wake では喪失 > 重複表示」方針)。
+- Runtime-independent, self-contained. No dependency on ``pane`` / ``tmux`` / ``renga`` / ``broker`` CLI.
+  push backend is replaceable via :class:`PushBackend` Protocol injection (best-effort ``bool``
+  contract inherited from ``tools/peer_notify.py``), and the delivery canonical store (queue)
+  is held independently of the backend.
+- Recipient assumes **idempotent handler**. wake carries identity via :attr:`Wake.id`;
+  double enqueue is no-op, and even if rare double delivery occurs at push/pull boundary,
+  the recipient can de-dup by id (report.md philosophy: "tolerate residual loss window as
+  at-least-once + idempotent representation; loss > duplication for idle-wake").
 """
 
 from __future__ import annotations
@@ -39,16 +44,16 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, runtime_checkable
 
-# -- wake 種別 (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」) ---------
+# -- Wake kinds (report.md S5 Phase3 "deliver completion/next-iteration/decision-request wakes") ---------
 #
-# 読み手が文字列リテラルを散在させずに filter / dispatch できるよう定数化する。
-WAKE_LOOP_DONE = "loop_done"  # ループが終了した (goal_met / stopped)。
-WAKE_NEXT_ITERATION = "next_iteration"  # 次反復へ進む / 次タスクを起こす。
-WAKE_DECISION_REQUEST = "decision_request"  # 不可逆 action の人間判断を要求 (人間ゲート)。
+# Constant-ize so readers can filter / dispatch without scattered string literals.
+WAKE_LOOP_DONE = "loop_done"  # Loop has completed (goal_met / stopped).
+WAKE_NEXT_ITERATION = "next_iteration"  # Proceed to next iteration / wake next task.
+WAKE_DECISION_REQUEST = "decision_request"  # Request human judgment for irreversible action (human gate).
 
 WAKE_KINDS = (WAKE_LOOP_DONE, WAKE_NEXT_ITERATION, WAKE_DECISION_REQUEST)
 
-# 受信側の配送状態 (三状態)。daemon (= 本 queue) が所有する。
+# Recipient-side delivery state (three-state). Owned by daemon (= this queue).
 UNDELIVERED = "undelivered"
 CLAIMED = "claimed"
 DELIVERED = "delivered"
@@ -56,13 +61,13 @@ DELIVERED = "delivered"
 
 @dataclass(frozen=True)
 class Wake:
-    """配送する 1 件の wake。
+    """A single wake to be delivered.
 
-    ``id`` は **配送の同一性** であり at-most-once / de-dup の鍵。ループ wake では
-    ``f"{run_id}:{kind}:{iteration}"`` のような決定的 id を与えると、resume での再配送や
-    push/pull の継ぎ目での二重配送を受信側が id で de-dup できる (同一 id の二重 enqueue は
-    no-op になる)。``recipient`` は宛先 (role 名や peer id)。``payload`` は kind 固有の
-    補足情報 (終了理由・gate_key 等)。
+    ``id`` is **delivery identity** and the key for at-most-once / de-dup. For loop wakes,
+    providing a deterministic id like ``f"{run_id}:{kind}:{iteration}"`` allows the recipient
+    to de-dup by id for re-delivery on resume and double delivery at push/pull boundary
+    (double enqueue of the same id becomes no-op). ``recipient`` is the destination (role name or peer id).
+    ``payload`` is kind-specific supplementary information (completion reason, gate_key, etc.).
     """
 
     id: str
@@ -72,13 +77,13 @@ class Wake:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON 化しやすいフラットな dict へ畳む (sink / backend のシリアライズ用)。
+        """Fold into a flat dict that is easy to JSON-ify (for sink / backend serialization).
 
-        ``payload`` を先に展開し、正準フィールド (``id`` / ``kind`` / ``recipient`` /
-        ``run_id``) を **後勝ち** で上書きする。これにより payload に同名キーが紛れ込んでも、
-        de-dup / routing の正本である正準フィールドが必ず保たれる (payload 由来の ``id`` が
-        queue の de-dup 鍵と食い違って別宛先へ送られる、といった事故を防ぐ)。同名 payload キーは
-        正準値に隠れる (予約名は正準が勝つ、という契約)。
+        Expand ``payload`` first, then overwrite canonical fields (``id`` / ``kind`` / ``recipient`` /
+        ``run_id``) with **canonical taking precedence**. This ensures canonical fields remain authoritative
+        even if same-named keys leak into payload, preventing accidents like payload-derived ``id``
+        diverging from the queue's de-dup key and being sent to the wrong recipient.
+        Same-named payload keys are shadowed by canonical values (reserved names go canonical, by contract).
         """
         return {
             **dict(self.payload),
@@ -91,13 +96,13 @@ class Wake:
 
 @runtime_checkable
 class PushBackend(Protocol):
-    """push (一次・即応 accelerator) の最小の口。
+    """Minimal interface for push (primary / immediate accelerator).
 
-    ``push(wake) -> bool`` は **best-effort** (``tools/peer_notify.py`` の bool 契約を踏襲):
-    確定配送できたときだけ ``True``、それ以外 (backend 不通・タイムアウト・宛先不在 等) は
-    ``False`` を返す。例外を投げてもよい (:class:`Transport` が握って ``False`` 扱いにする) が、
-    理想的には投げず ``False`` を返すこと。``True`` を返せなかった wake は queue に残り、
-    受信側の pull poll が拾う (= pull fallback)。
+    ``push(wake) -> bool`` is **best-effort** (following bool contract from ``tools/peer_notify.py``):
+    return ``True`` only when delivery is confirmed; return ``False`` for anything else
+    (backend unavailable, timeout, recipient absent, etc.). Exceptions are permitted
+    (:class:`Transport` catches and treats as ``False``), but ideally return ``False`` instead.
+    Wakes that don't return ``True`` remain in queue and are picked up by recipient's pull poll (= pull fallback).
     """
 
     def push(self, wake: Wake) -> bool:
@@ -105,7 +110,7 @@ class PushBackend(Protocol):
 
 
 class CallablePushBackend:
-    """任意の ``callable(Wake) -> bool`` を :class:`PushBackend` に適合させる薄いアダプタ。"""
+    """Thin adapter that adapts any ``callable(Wake) -> bool`` to :class:`PushBackend`."""
 
     def __init__(self, fn: Callable[[Wake], bool]) -> None:
         self._fn = fn
@@ -115,11 +120,12 @@ class CallablePushBackend:
 
 
 class NullPushBackend:
-    """常に push 失敗する backend (= backend 不通の明示モデル)。
+    """Backend that always fails on push (= explicit model of backend unavailability).
 
-    push 一次を持たない / backend がダウンしている構成を表す。すべての wake は queue に
-    残り pull fallback だけで配送される。「backend 不通でも pull fallback で配送継続」の
-    既定構成であり、テストの基準にもなる。
+    Represents a configuration with no push-primary / backend down. All wakes remain in queue
+    and are delivered only via pull fallback. This is the default configuration for
+    "delivery continues via pull fallback even when backend is unavailable" and also serves
+    as the test baseline.
     """
 
     def push(self, wake: Wake) -> bool:
@@ -128,7 +134,7 @@ class NullPushBackend:
 
 @dataclass
 class _Entry:
-    """queue 内の 1 wake の配送状態 (三状態 + lease 所有権)。"""
+    """Delivery state of one wake in queue (three-state + lease ownership)."""
 
     wake: Wake
     seq: int
@@ -139,11 +145,11 @@ class _Entry:
 
 @runtime_checkable
 class WakeQueue(Protocol):
-    """配送の正本 (durable spine)。三状態 claim-then-confirm を提供する。
+    """Canonical store for delivery (durable spine). Provides three-state claim-then-confirm.
 
-    :class:`Transport` は backend (push) とは独立にこの queue を正本として持つ。push が
-    確定配送できなくても wake は queue に残り、受信側の :meth:`claim` -> :meth:`confirm` で
-    pull 配送される。
+    :class:`Transport` holds this queue as canonical independently of backend (push).
+    Even if push cannot confirm delivery, wakes remain in queue and are delivered via
+    pull through recipient's :meth:`claim` -> :meth:`confirm`.
     """
 
     def enqueue(self, wake: Wake) -> bool:
@@ -171,43 +177,45 @@ class WakeQueue(Protocol):
 
 
 class InMemoryWakeQueue:
-    """:class:`WakeQueue` のインメモリ実装 (三状態 claim-then-confirm)。
+    """In-memory implementation of :class:`WakeQueue` (three-state claim-then-confirm).
 
-    ループ自身のプロセス内で wake を保持する既定の queue。``state.db`` 永続化を別途
-    被せたいときは同じ :class:`WakeQueue` Protocol を SQLite で実装すればよい (本 PoC は
-    インメモリで at-most-once / fallback のセマンティクスを実証する)。
+    Default queue that holds wakes within the loop's own process. To layer persistent
+    ``state.db`` on top, simply implement the same :class:`WakeQueue` Protocol with SQLite
+    (this PoC demonstrates at-most-once / fallback semantics in-memory).
 
-    状態遷移 (daemon 所有・行レベル所有権で single-drainer 性を担保):
+    State transitions (daemon-owned, row-level ownership ensures single-drainer):
 
-    - ``enqueue`` : 同一 ``id`` が既にあれば no-op (二重 enqueue 冪等 = de-dup の土台)。
-    - ``claim``   : 期限切れ lease を回収してから、宛先の ``UNDELIVERED`` を seq 順に
-      ``CLAIMED`` (owner + lease_expiry) にして返す。
-    - ``confirm`` : ``CLAIMED`` かつ **owner が claim 時のまま** で、かつ lease 未失効なら
-      ``DELIVERED`` (terminal) にする。lease 失効後に別 owner が再 claim した行への stale な
-      confirm は owner 不一致で弾く (fencing) ので、喪失窓で「届いていないのに DELIVERED」化
-      しない (前提: 並行 poll は distinct owner を使う。:meth:`~loop_agent.transport.Transport.poll` 参照)。
-    - ``release_expired`` : lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻す (再 eligible)。
-    - ``mark_delivered`` : push が確定配送した wake を直接 ``DELIVERED`` (terminal) にする。
-      任意の非 terminal 状態から冪等に遷移できる (push と pull の継ぎ目を吸収)。
+    - ``enqueue`` : If same ``id`` exists, no-op (double-enqueue idempotent = de-dup foundation).
+    - ``claim``   : First collect expired leases, then transition recipient's ``UNDELIVERED``
+      to ``CLAIMED`` (owner + lease_expiry) in seq order and return them.
+    - ``confirm`` : Mark as ``DELIVERED`` (terminal) if ``CLAIMED`` and **owner still matches claim time**
+      and lease is not expired. Stale confirms to rows whose lease expired and were re-claimed
+      by another owner are rejected by owner mismatch (fencing), preventing loss-window
+      "DELIVERED without actually reaching recipient" (precondition: parallel polls use distinct owner;
+      see :meth:`~loop_agent.transport.Transport.poll`).
+    - ``release_expired`` : Revert ``CLAIMED`` with expired lease back to ``UNDELIVERED`` (re-eligible).
+    - ``mark_delivered`` : Directly mark push-confirmed wake as ``DELIVERED`` (terminal).
+      Transitions idempotently from any non-terminal state (absorbs push/pull boundary).
 
-    **スレッド安全**: 同一 recipient を複数 worker (スレッド) で並行 poll しても二重 claim が
-    起きないよう、状態を変える操作 (enqueue/claim/confirm/release_expired/mark_delivered) と
-    読み出しを 1 つの再入可能ロックで直列化する (check-and-set を atomic にする)。``claim`` は
-    内部で ``release_expired`` を呼ぶため :class:`threading.RLock` (再入可) を使う。これにより
-    並行 poller の owner fencing と at-most-once claim が実際に成立する。
+    **Thread-safe**: To prevent double claims when multiple workers (threads) poll the same recipient
+    in parallel, all state-mutating operations (enqueue/claim/confirm/release_expired/mark_delivered)
+    and reads are serialized with a single reentrant lock (making check-and-set atomic).
+    ``claim`` internally calls ``release_expired``, so we use :class:`threading.RLock` (reentrant).
+    This ensures owner fencing and at-most-once claims work correctly across concurrent pollers.
     """
 
     def __init__(self) -> None:
         self._entries: dict[str, _Entry] = {}
         self._seq = 0
-        # 状態遷移を直列化する再入可能ロック (claim -> release_expired の再入のため RLock)。
+        # Reentrant lock to serialize state transitions (RLock for claim -> release_expired reentrancy).
         self._lock = threading.RLock()
 
     def enqueue(self, wake: Wake) -> bool:
-        """wake を ``UNDELIVERED`` で登録する。同一 ``id`` が既にあれば no-op で ``False``。
+        """Register wake as ``UNDELIVERED``. If same ``id`` exists, no-op and return ``False``.
 
-        二重 enqueue を冪等にすることで、deliver の再試行や resume での再配送指示が
-        既存行 (進行中の claim や DELIVERED) を壊さない (= 人間/受信側に二重に届けない土台)。
+        Making double enqueue idempotent ensures retry of deliver or re-delivery instruction
+        on resume doesn't corrupt existing rows (in-progress claims or DELIVERED)
+        (= foundation for not double-delivering to humans / recipients).
         """
         if not wake.id:
             raise ValueError("enqueue: Wake.id must be a non-empty string")
@@ -219,12 +227,12 @@ class InMemoryWakeQueue:
             return True
 
     def release_expired(self, *, now: float) -> int:
-        """lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻し、戻した件数を返す。
+        """Revert ``CLAIMED`` with expired lease to ``UNDELIVERED``, return count reverted.
 
-        confirm 前に受信側が死ぬ (claim と confirm の間で crash) と CLAIMED のまま滞留する。
-        lease 失効でこれを再 eligible に戻すことで、配送は止まらず再 claim される
-        (at-least-once 側に倒す: idle-wake では喪失 > 重複)。``owner`` を ``None`` に戻し、
-        古い owner の遅延 confirm を確実に弾く。
+        If recipient dies before confirm (crash between claim and confirm), row stalls as CLAIMED.
+        Lease expiry reverts it to re-eligible so delivery doesn't stop and row is re-claimed
+        (tilts toward at-least-once: loss > duplication for idle-wake). Resets ``owner`` to ``None``
+        to reliably reject stale confirms from old owner.
         """
         with self._lock:
             released = 0
@@ -244,12 +252,12 @@ class InMemoryWakeQueue:
         owner: str,
         limit: Optional[int] = None,
     ) -> list[Wake]:
-        """``recipient`` 宛の ``UNDELIVERED`` wake を lease 占有して返す (pull の claim)。
+        """Claim and return ``UNDELIVERED`` wakes for ``recipient`` with lease occupation (pull claim).
 
-        まず期限切れ lease を回収 (:meth:`release_expired`) してから、宛先一致の
-        ``UNDELIVERED`` を **登録順 (seq)** に最大 ``limit`` 件 ``CLAIMED`` にする。各行に
-        ``owner`` と ``now + lease`` の期限を刻む。返した wake は呼び出し側が処理し切ってから
-        :meth:`confirm` で確定する (claim-then-confirm)。
+        First collect expired leases (:meth:`release_expired`), then transition up to ``limit``
+        matching-recipient ``UNDELIVERED`` rows to ``CLAIMED`` in **registration order (seq)**.
+        Stamp each row with ``owner`` and expiry time ``now + lease``. Returned wakes must be
+        fully processed by caller before :meth:`confirm` confirms them (claim-then-confirm).
         """
         if lease <= 0:
             raise ValueError("claim: lease must be > 0")
@@ -267,12 +275,12 @@ class InMemoryWakeQueue:
             return out
 
     def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
-        """claim 済み wake を ``DELIVERED`` (terminal) に確定する。
+        """Confirm claimed wake as ``DELIVERED`` (terminal).
 
-        ``CLAIMED`` かつ現在の ``owner`` が claim 時の owner と一致し、かつ lease 未失効の
-        ときだけ確定して ``True`` を返す。それ以外 (既に DELIVERED / owner 不一致 = lease
-        失効後に別者が再 claim / lease 失効済み / 不在) は ``False``。この owner + 失効チェックが
-        fencing として効き、喪失窓で stale な claim 者が誤って DELIVERED 化するのを防ぐ。
+        Return ``True`` and confirm only if ``CLAIMED`` and current ``owner`` matches claim-time owner
+        and lease is not expired. Otherwise (already DELIVERED / owner mismatch = re-claimed by another
+        after expiry / lease expired / absent) return ``False``. This owner + expiry check acts as fencing
+        to prevent stale claimers from erroneously marking as DELIVERED in loss windows.
         """
         with self._lock:
             e = self._entries.get(wake_id)
@@ -283,41 +291,41 @@ class InMemoryWakeQueue:
             if e.owner != owner:
                 return False
             if e.lease_expiry <= now:
-                # lease 失効: この claim はもう有効でない。release_expired で UNDELIVERED へ
-                # 戻る (まだ戻っていなくても) ので、ここで DELIVERED 化はしない。
+                # Lease expired: this claim is no longer valid. release_expired will (or would have)
+                # reverted to UNDELIVERED, so we don't mark as DELIVERED here.
                 return False
             e.state = DELIVERED
             e.owner = None
             return True
 
     def mark_delivered(self, wake_id: str) -> bool:
-        """``UNDELIVERED`` の wake を直接 ``DELIVERED`` (terminal) にする (push 確定配送の確定)。
+        """Directly mark ``UNDELIVERED`` wake as ``DELIVERED`` (terminal) (confirm push delivery).
 
-        push backend が ``True`` (確定配送) を返したときに使う。**``UNDELIVERED`` のときだけ**
-        遷移し、遷移できたら ``True``、それ以外 (既に ``DELIVERED`` / ``CLAIMED`` / 不在) は
-        ``False`` を返す。
+        Use when push backend returns ``True`` (confirmed delivery). Transitions **only if UNDELIVERED**;
+        return ``True`` if transitioned, ``False`` otherwise (already DELIVERED / CLAIMED / absent).
 
-        ``CLAIMED`` を **奪わない** のが要点: push の I/O 中 (queue ロック外) に別の poller が
-        同じ wake を claim しうる。そこで無条件に DELIVERED 化すると active claim の owner を
-        消し、その poller が confirm 前にクラッシュしても lease 失効で再 eligible に戻れず
-        **wake を喪失** する (claim-then-confirm の crash recovery 破壊)。push と pull が同じ
-        wake を競合した場合は **pull claim を配送の主体** とし、push 側は既配送の重複として
-        受信側の id de-dup に委ねる (at-least-once。喪失 > 重複の方針)。push が DELIVERED 化
-        できた行は UNDELIVERED でないため pull は claim しない (継ぎ目を吸収)。
+        **Never steal CLAIMED** — this is the key point. During push I/O (outside queue lock),
+        another poller may claim the same wake. Unconditionally marking DELIVERED would erase
+        the owner of the active claim; if that poller crashes before confirm, lease expiry won't
+        revert to re-eligible and the wake is **lost** (breaking claim-then-confirm crash recovery).
+        When push and pull compete for the same wake, **make pull claim the delivery primary**;
+        treat push side as duplicate of already-delivered and defer to recipient's id de-dup
+        (at-least-once; loss > duplication policy). Rows where push successfully marked DELIVERED
+        are no longer UNDELIVERED so pull won't claim them (absorbing the boundary).
         """
         with self._lock:
             e = self._entries.get(wake_id)
             if e is None:
                 return False
             if e.state != UNDELIVERED:
-                # 既に DELIVERED、または別 poller が claim 済み (CLAIMED)。claim は奪わない。
+                # Already DELIVERED, or another poller claimed (CLAIMED). Never steal the claim.
                 return False
             e.state = DELIVERED
             e.owner = None
             return True
 
     def pending(self, recipient: Optional[str] = None) -> list[Wake]:
-        """未確定 (``UNDELIVERED`` / ``CLAIMED``) の wake を登録順に返す (任意で宛先で絞る)。"""
+        """Return unconfirmed (``UNDELIVERED`` / ``CLAIMED``) wakes in registration order (optionally filtered by recipient)."""
         with self._lock:
             out: list[Wake] = []
             for e in sorted(self._entries.values(), key=lambda x: x.seq):
@@ -329,41 +337,41 @@ class InMemoryWakeQueue:
             return out
 
     def state_of(self, wake_id: str) -> Optional[str]:
-        """``wake_id`` の現在の配送状態を返す (無ければ ``None``)。テスト/内省用。"""
+        """Return current delivery state of ``wake_id`` (``None`` if absent). For testing / introspection."""
         with self._lock:
             e = self._entries.get(wake_id)
             return e.state if e is not None else None
 
 
-# 役割別 poll cadence (秒)。report.md S3.2 / broker pull-first 知見の非対称設計。
-# push が失効する pull 環境では「待機」を idle 待機ではなく能動 poll に翻訳する。
+# Role-based poll cadence (seconds). report.md S3.2 / asymmetric design from broker pull-first insight.
+# In pull environments where push expires, translate "waiting" not as idle waiting but as active polling.
 #
-# - dispatcher : 監視 /loop 3m 相当 = 180s 間隔で能動 poll。
-# - worker     : 完了報告後の bounded review-watch 相当 = 短間隔 poll。
-# - secretary  : 人間対話主体で blocking poll 不可 -> ターン冒頭で毎回 poll (0 = 常に due)。
+# - dispatcher : Monitoring /loop 3m equivalent = active poll at 180s intervals.
+# - worker     : Bounded review-watch after completion report equivalent = short-interval poll.
+# - secretary  : Human-interaction primary, blocking poll infeasible -> poll every turn prologue (0 = always due).
 CADENCE_SECONDS: dict[str, float] = {
     "dispatcher": 180.0,
     "worker": 60.0,
     "secretary": 0.0,
 }
 
-# 未知 role の既定 cadence (保守的に worker 相当)。
+# Default cadence for unknown roles (conservatively equivalent to worker).
 DEFAULT_CADENCE_SECONDS = 60.0
 
 
 def cadence_for(role: str) -> float:
-    """``role`` の poll 間隔 (秒) を返す。未知 role は :data:`DEFAULT_CADENCE_SECONDS`。"""
+    """Return poll interval (seconds) for ``role``. Unknown role returns :data:`DEFAULT_CADENCE_SECONDS`."""
     return CADENCE_SECONDS.get(role, DEFAULT_CADENCE_SECONDS)
 
 
 def due_to_poll(role: str, last_poll: Optional[float], now: float) -> bool:
-    """``role`` が ``now`` 時点で能動 poll すべきかを返す。
+    """Return whether ``role`` should actively poll at ``now``.
 
-    ``last_poll`` が ``None`` (一度も poll していない) なら常に due。それ以外は
-    ``now - last_poll >= cadence_for(role)`` で判定する。cadence が ``0`` (secretary:
-    ターン冒頭で毎回 poll) の role は常に due になる。受信側の poll ループが「自分の番か」を
-    判断する最小ヘルパで、idle 待機を能動 poll に翻訳するパターンの核 (報告 prose の「待機」を
-    pull 環境で能動 poll ループへ写す)。
+    If ``last_poll`` is ``None`` (never polled), always due. Otherwise check
+    ``now - last_poll >= cadence_for(role)``. Role with cadence ``0`` (secretary:
+    poll every turn prologue) is always due. Minimal helper for recipient poll loop to
+    determine "is it my turn", core of the pattern that translates idle waiting to
+    active polling (maps "waiting" prose from report into active polling loop for pull environments).
     """
     if last_poll is None:
         return True
@@ -371,17 +379,16 @@ def due_to_poll(role: str, last_poll: Optional[float], now: float) -> bool:
 
 
 class Transport:
-    """push 一次 / pull fallback の wake 配送オーケストレータ。
+    """Orchestrator for push-primary / pull-fallback wake delivery.
 
-    1 つの :class:`WakeQueue` (配送の正本) と任意の :class:`PushBackend` (一次・即応
-    accelerator) を束ねる。:meth:`deliver` は **まず queue に durable に積んでから** push を
-    試み、push が確定配送できたら DELIVERED 化、できなければ ``UNDELIVERED`` のまま残して
-    pull fallback に委ねる。受信側は :meth:`poll` で自分宛の wake を claim-then-confirm で
-    引き取る。
+    Bundles one :class:`WakeQueue` (delivery canonical store) with any :class:`PushBackend`
+    (primary / immediate accelerator). :meth:`deliver` **first durably enqueues in queue** then
+    attempts push; if push confirms delivery, mark DELIVERED; if not, leave as ``UNDELIVERED``
+    and defer to pull fallback. Recipient pulls own wakes via :meth:`poll` using claim-then-confirm.
 
-    この「正本は queue・push は accelerator」構造により、backend 不通でも
-    (:class:`NullPushBackend` でも push が常時失敗でも) 配送は pull で継続する
-    (report.md S5 Phase3 成功条件 b)。
+    This "queue is canonical, push is accelerator" structure ensures delivery continues via pull
+    even when backend is unavailable (even with :class:`NullPushBackend` or constant push failure)
+    (report.md S5 Phase3 success condition b).
     """
 
     def __init__(
@@ -403,50 +410,49 @@ class Transport:
             time_fn = time.monotonic
         self._time_fn = time_fn
 
-    # -- 送信側 (deliver) ----------------------------------------------------
+    # -- Sender side (deliver) -----------------------------------------------
 
     def deliver(self, wake: Wake) -> str:
-        """1 件の wake を配送する。``"push"`` (一次で確定) か ``"queued"`` (pull 待ち) を返す。
+        """Deliver one wake. Return ``"push"`` (confirmed primary) or ``"queued"`` (awaiting pull).
 
-        手順 (正本優先): まず queue へ durable に enqueue する (push が落ちても喪失しない)。
-        backend があれば push を best-effort で試み、確定配送 (``True``) なら DELIVERED 化して
-        ``"push"`` を返す。backend 不在 / push 失敗 / push 例外なら ``UNDELIVERED`` のまま残し
-        ``"queued"`` を返す — 受信側の :meth:`poll` が pull で拾う (= fallback)。
+        Procedure (canonical-first): First durably enqueue in queue (won't lose if push fails).
+        If backend exists, attempt push best-effort; if confirmed delivery (``True``), mark DELIVERED
+        and return ``"push"``. If backend absent / push fails / push raises, leave as ``UNDELIVERED``
+        and return ``"queued"`` — recipient's :meth:`poll` picks it up via pull (= fallback).
 
-        同一 ``id`` の再 deliver は enqueue が no-op になり、**進行中の配送を乱さない**。
-        push を (再) 試行するのは「今回新規に積まれた」か「まだ ``UNDELIVERED`` (誰も claim
-        していない)」wake に限る:
+        Re-delivering same ``id`` makes enqueue no-op, **not disrupting in-flight delivery**.
+        Push is (re)attempted only for "newly enqueued this time" or "still ``UNDELIVERED`` (unclaimed)" wakes:
 
-        - 既に ``DELIVERED``: 配送確定済み。push も pull も重ねない (``"push"`` を返す)。
-        - 既に ``CLAIMED``: 受信側が pull で claim 済み (confirm 待ち)。ここで push を重ねて
-          :meth:`~WakeQueue.mark_delivered` すると、owner の lease を奪って claim-then-confirm の
-          **失効再配送保護を壊す** (owner が confirm 前にクラッシュした wake が再 eligible に
-          戻らなくなる)。active claim はそのまま尊重し、配送は pull に委ねる (``"queued"``)。
-        - ``UNDELIVERED`` / 内省不可 queue の ``None``: active claim が無いので push 再試行は
-          安全 (backend 復旧後に ``queued`` から ``push`` へ昇格できる)。
+        - Already ``DELIVERED``: delivery confirmed. Don't overlay push or pull (return ``"push"``).
+        - Already ``CLAIMED``: recipient already claimed via pull (awaiting confirm). Overlaying push with
+          :meth:`~WakeQueue.mark_delivered` here steals the owner's lease and **breaks expiry-based
+          redelivery protection** of claim-then-confirm (if owner crashes before confirm, wake won't revert
+          to re-eligible). Respect active claim as-is, defer delivery to pull (return ``"queued"``).
+        - ``UNDELIVERED`` / non-introspectable queue's ``None``: no active claim, so push retry is safe
+          (can escalate from ``"queued"`` to ``"push"`` after backend recovery).
         """
         newly = self.queue.enqueue(wake)
         if not newly:
             state = _state_of(self.queue, wake.id)
             if state == DELIVERED:
-                return "push"  # 既に配送確定。再送しない。
+                return "push"  # Already delivery confirmed. Don't re-send.
             if state == CLAIMED:
-                # 進行中の pull claim を尊重する (push で横取り確定しない)。
+                # Respect ongoing pull claim (don't hijack with push confirmation).
                 return "queued"
-            # state は UNDELIVERED か None: active claim 無し。push 再試行は安全。
+            # state is UNDELIVERED or None: no active claim. push retry is safe.
         if self.backend is not None and self._try_push(wake):
             self.queue.mark_delivered(wake.id)
             return "push"
         return "queued"
 
     def _try_push(self, wake: Wake) -> bool:
-        """backend.push を best-effort で呼ぶ。例外は握って ``False`` (= 未配送) 扱い。"""
+        """Call backend.push best-effort. Catch exceptions and treat as ``False`` (= undelivered)."""
         try:
             return bool(self.backend.push(wake))  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001 - push は best-effort。失敗は pull fallback に委ねる。
+        except Exception:  # noqa: BLE001 - push is best-effort; failures defer to pull fallback.
             return False
 
-    # -- 受信側 (poll) -------------------------------------------------------
+    # -- Recipient side (poll) -----------------------------------------------
 
     def poll(
         self,
@@ -456,24 +462,24 @@ class Transport:
         limit: Optional[int] = None,
         confirm: bool = False,
     ) -> list[Wake]:
-        """``recipient`` 宛の未配送 wake を pull で claim する (claim-then-confirm の claim)。
+        """Claim undelivered wakes for ``recipient`` via pull (claim phase of claim-then-confirm).
 
-        ``UNDELIVERED`` な wake を lease 占有 (claim) して返す。**確定はしない** (既定
-        ``confirm=False``): 呼び出し側が wake を **処理し切ってから** :meth:`confirm_wakes` を
-        呼んで ``DELIVERED`` 化する責務を負う。処理中にクラッシュした (= confirm 前に死んだ) 場合は
-        lease 失効でその wake が再 eligible に戻り再配送される (at-least-once: idle-wake では
-        喪失 > 重複)。この claim-then-confirm が crash recovery の肝なので **既定は確定しない**。
-        確定漏れを避けたい一般ケースは :meth:`poll_and_handle` (handler 成功後に wake 単位で
-        confirm する crash-safe な受信ループ) を使うのが推奨。
+        Claim and return ``UNDELIVERED`` wakes with lease occupation. **Does not confirm** (default
+        ``confirm=False``): caller bears responsibility to **fully process the wake** then call
+        :meth:`confirm_wakes` to mark ``DELIVERED``. If processing crashes (dies before confirm),
+        lease expiry reverts wake to re-eligible and it is re-delivered (at-least-once: loss > duplication
+        for idle-wake). Since claim-then-confirm is the crux of crash recovery, **default is no confirm**.
+        For common case wanting to avoid confirm omission, use :meth:`poll_and_handle` (crash-safe
+        receive loop that confirms per wake after handler succeeds).
 
-        ``confirm=True`` を明示すると、claim した wake を **返す前に即 confirm** する (戻り値の
-        受領 = 配送完了とみなせる、handler が決して失敗しない / プロセス内自己完結な単純ケース
-        専用)。この場合 poll が返った後に処理がクラッシュしても wake は既に ``DELIVERED`` で
-        再配送されない (= その経路だけ at-most-once で喪失しうる) ことに注意。
+        If ``confirm=True`` explicitly, immediately confirm claimed wakes **before returning** (receiving
+        return value = delivery complete; intended only for simple cases where handler never fails /
+        process-internal self-contained). Note: if processing crashes after poll returns, wakes are
+        already ``DELIVERED`` and won't re-deliver (= that path tilts to at-most-once with loss risk).
 
-        ``owner`` は claim の所有者識別 (省略時は ``recipient``)。同一受信者を複数 worker で
-        並行 poll する場合は worker ごとに **distinct な owner** を渡すこと。三状態の owner
-        fencing が「lease 失効後に別 worker が再 claim した wake への stale な confirm」を弾く。
+        ``owner`` is claim ownership identifier (default to ``recipient`` if omitted). When polling the
+        same recipient in parallel across multiple workers, pass **distinct owner per worker**. Three-state
+        owner fencing rejects stale confirms to wakes re-claimed by another worker after lease expiry.
         """
         own = owner if owner is not None else recipient
         now = self._time_fn()
@@ -493,19 +499,19 @@ class Transport:
         owner: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> list[Wake]:
-        """claim -> handler(wake) -> confirm を wake 単位で行う crash-safe な受信ループ (推奨)。
+        """Crash-safe receive loop (recommended): claim -> handler(wake) -> confirm per wake.
 
-        各 wake を claim し、``handler(wake)`` が **例外なく返ったものだけ** confirm して
-        ``DELIVERED`` 化する。これにより「受信したが処理前に死んだ」喪失窓が無い: handler が
-        raise した wake (および以降の未処理 wake) は confirm されず、lease 失効後に再配送される
-        (at-least-once。受信側は :attr:`Wake.id` で de-dup する idempotent handler 前提)。
+        Claim each wake, confirm and mark ``DELIVERED`` **only for wakes handler returns without exception**.
+        This eliminates loss window "received but died before processing": wakes where handler raises
+        (and all subsequent unprocessed wakes) are not confirmed and re-delivered after lease expiry
+        (at-least-once; assumes idempotent handler with :attr:`Wake.id` de-dup on recipient side).
 
-        正常に処理・確定できた wake の list を返す。``handler`` の例外は **握り潰さず伝播** する
-        (呼び出し側が失敗を観測できる。未確定 wake は再配送で拾われる)。confirm は handler 成功
-        *後* の現在時刻で行うので、handler が lease を超えて長引いた wake は fencing で弾かれ
-        (確定されず) 再配送に回る — 長い処理には十分大きい ``lease`` を設定すること。
+        Return list of wakes successfully processed and confirmed. Handler exceptions **propagate uncaught**
+        (caller observes failure; unconfirmed wakes are picked up on re-delivery). Confirm uses current
+        time *after* handler success, so wakes where handler runs longer than lease are rejected by
+        fencing (not confirmed) and re-delivered — set sufficiently large ``lease`` for long processing.
 
-        ``owner`` / ``limit`` の意味は :meth:`poll` と同じ (省略時 owner=recipient)。
+        ``owner`` / ``limit`` have same meaning as :meth:`poll` (default owner=recipient if omitted).
         """
         own = owner if owner is not None else recipient
         claimed = self.queue.claim(
@@ -513,17 +519,18 @@ class Transport:
         )
         handled: list[Wake] = []
         for w in claimed:
-            handler(w)  # raise すれば未 confirm のまま伝播 -> lease 失効で再配送。
+            handler(w)  # If handler raises, leave unconfirmed and propagate -> re-deliver after lease expiry.
             if self.queue.confirm(w.id, owner=own, now=self._time_fn()):
                 handled.append(w)
         return handled
 
     def confirm_wakes(self, wakes: Iterable[Wake], *, owner: str) -> int:
-        """claim 済み wake 群を確定する (:meth:`poll` を ``confirm=False`` で使ったときの確定 API)。
+        """Confirm batch of claimed wakes (confirmation API when using :meth:`poll` with ``confirm=False``).
 
-        確定できた (この ``owner`` が lease を保持していた) 件数を返す。``owner`` は claim 時に
-        渡した値と同じものを渡すこと (省略時 owner=recipient で poll したなら recipient)。
-        lease 失効後に呼ぶと owner/失効 fencing で弾かれ、その wake は再配送対象として queue に残る。
+        Return count successfully confirmed (where this ``owner`` holds the lease). Pass the same
+        ``owner`` value as at claim time (if polled with default owner=recipient, pass recipient).
+        If called after lease expiry, owner/expiry fencing rejects it and wake remains in queue as
+        re-delivery candidate.
         """
         now = self._time_fn()
         confirmed = 0
@@ -533,16 +540,16 @@ class Transport:
         return confirmed
 
     def pending(self, recipient: Optional[str] = None) -> list[Wake]:
-        """未確定 (未配送) の wake を返す (queue へ委譲)。テスト/監視用。"""
+        """Return unconfirmed (undelivered) wakes (delegates to queue). For testing / monitoring."""
         return self.queue.pending(recipient)
 
 
 def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
-    """queue の配送状態を引く (``state_of`` は :class:`WakeQueue` Protocol の一員)。
+    """Fetch delivery state from queue (``state_of`` is a member of :class:`WakeQueue` Protocol).
 
-    Protocol は構造的で実行時強制されないため、``state_of`` を欠く非準拠 queue でも
-    :meth:`Transport.deliver` を落とさないよう getattr で防御する (欠落時は ``None`` =
-    「状態不明」扱いにし、push 重複防止の早期 return を諦めるだけで配送自体は継続する)。
+    Since Protocol is structural and not enforced at runtime, defend with getattr so non-compliant
+    queues lacking ``state_of`` don't crash :meth:`Transport.deliver` (absence returns ``None`` =
+    "state unknown"; only forfeits early-return push dedup prevention, delivery itself continues).
     """
     fn = getattr(queue, "state_of", None)
     if fn is None:
@@ -551,16 +558,16 @@ def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
 
 
 __all__ = [
-    # wake 種別
+    # Wake kinds
     "WAKE_LOOP_DONE",
     "WAKE_NEXT_ITERATION",
     "WAKE_DECISION_REQUEST",
     "WAKE_KINDS",
-    # 配送状態
+    # Delivery state
     "UNDELIVERED",
     "CLAIMED",
     "DELIVERED",
-    # 型
+    # Types
     "Wake",
     "PushBackend",
     "CallablePushBackend",
@@ -568,7 +575,7 @@ __all__ = [
     "WakeQueue",
     "InMemoryWakeQueue",
     "Transport",
-    # role 別 cadence
+    # Role-based cadence
     "CADENCE_SECONDS",
     "DEFAULT_CADENCE_SECONDS",
     "cadence_for",

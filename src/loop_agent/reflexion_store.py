@@ -1,30 +1,29 @@
-"""外側 Reflexion ループの状態 SoT: epoch/lesson/評価器 version を state.db に永続化 (Issue #29).
+"""Source of truth (SoT) for outer Reflexion loop state: persists epoch/lesson/evaluator version to state.db (Issue #29).
 
-MVP 内側 resume (:meth:`loop_agent.store.LoopStore.load_or_init` / Issue #14) と store lease
-機構 (Issue #21) を土台に、外側 :func:`loop_agent.reflexion.run_reflexion` の **試行間の学習状態**
-(epoch 進行・episodic memory の lesson・固定評価器の version) を SQLite に永続化し、再起動後も
-**学習の続きから resume** できるようにする (report.md S4.4/S5 Phase3 follow-up)。
+Building on the MVP inner resume (:meth:`loop_agent.store.LoopStore.load_or_init` / Issue #14) and store lease
+mechanism (Issue #21), this module persists the **inter-trial learning state** of the outer
+:func:`loop_agent.reflexion.run_reflexion` (epoch progress, episodic memory lessons, and fixed evaluator version)
+to SQLite, enabling **resumption from the point of interruption** even after restart (report.md S4.4/S5 Phase3 follow-up).
 
-設計の境界 (store.py の最小スキーマ思想を継ぐ):
+Design boundaries (following the minimal schema philosophy of store.py):
 
-- **内側スキーマと独立・additive**: 既存の ``run / step / event / stop_reason / pending_decision``
-  には一切触れず、``reflexion_run / reflexion_episode / reflexion_lesson / reflexion_evaluator``
-  の 4 表を ``IF NOT EXISTS`` で **非破壊に追加** する。古い DB を開いても既存データは無傷で、
-  本クラスの生成時に不足テーブルだけが作られる (:meth:`ReflexionStore.__init__`)。
-- **settled state を SoT にする**: :func:`~loop_agent.reflexion.run_reflexion` の ``persist`` フック
-  (epoch 境界処理の *後* に発火) から :meth:`ReflexionStore.persist_episode` を呼び、1 episode 分の
-  「episode 行 + memory の全 lesson 行 + reflexion_run のスカラ + 評価器 version 登録」を **1 つの
-  transaction** に束ねる (内側 :meth:`LoopStore.record_step` と同じ atomic 境界の方針)。途中クラッシュ
-  すれば episode は丸ごと無かったことになり、resume は直前の確定 episode から再開する。
-- **評価器 version registry + fail-loud**: 各 epoch で固定された評価器の version を
-  ``reflexion_evaluator`` に追記 (audit)、現行 version を ``reflexion_run`` に持つ。resume 時、
-  復元 ``evaluator_version`` と渡された ``evaluator.version`` が食い違えば
-  :func:`~loop_agent.reflexion.run_reflexion` が **loud に弾く** (callable は直列化できないので
-  別評価器に silently 差し替えない。PR #28 で確立した安全核を継ぐ)。本モジュールは version を
-  忠実に往復させるだけで、採択基準・二信号モデルには一切踏み込まない。
+- **Independence from inner schema, additive only**: Leaves existing ``run / step / event / stop_reason / pending_decision``
+  untouched and **non-destructively adds** 4 tables (``reflexion_run / reflexion_episode / reflexion_lesson / reflexion_evaluator``)
+  via ``IF NOT EXISTS``. Opening an old DB preserves existing data; only missing tables are created at class instantiation
+  (:meth:`ReflexionStore.__init__`).
+- **Settled state as SoT**: Calls :meth:`ReflexionStore.persist_episode` from the ``persist`` hook of
+  :func:`~loop_agent.reflexion.run_reflexion` (fires *after* epoch boundary processing), bundling one episode's
+  "episode row + all memory lesson rows + reflexion_run scalars + evaluator version registration" into **a single
+  transaction** (same atomic-boundary policy as inner :meth:`LoopStore.record_step`). Crash mid-persist means the
+  episode is as-if it never happened; resume continues from the previous confirmed episode.
+- **Evaluator version registry + fail-loud**: Appends the evaluator version fixed at each epoch to ``reflexion_evaluator``
+  (audit), maintaining the current version in ``reflexion_run``. On resume, if the restored ``evaluator_version`` differs
+  from the passed ``evaluator.version``, :func:`~loop_agent.reflexion.run_reflexion` **fails loudly** (callables cannot
+  be serialized, so silent replacement with another evaluator is avoided; follows the safety core established in PR #28).
+  This module simply shuttles versions faithfully; it does not opine on adoption criteria or dual-signal models.
 
-memory の容量ポリシー (cap / per_lesson_chars / render_byte_cap) も ``reflexion_run`` に保存し、
-復元時に同じ上限の :class:`EpisodicMemory` を組み直す (eviction 挙動が resume をまたいで一致する)。
+Memory capacity policy (cap / per_lesson_chars / render_byte_cap) is also stored in ``reflexion_run``;
+at restore, an :class:`EpisodicMemory` is reconstructed with the same limits (eviction behavior matches across resume boundaries).
 """
 
 from __future__ import annotations
@@ -39,19 +38,20 @@ from .memory import EpisodicMemory, Lesson
 from .reflexion import EpisodeRecord, ReflexionState
 from .store import DbSource, _init_connection, connect
 
-if TYPE_CHECKING:  # 型注釈のためだけ (実行時 import cycle を避ける)
+if TYPE_CHECKING:  # for type annotations only (avoid runtime import cycle)
     from .reflexion import ReflexiveResult
 
-# 外側ループ用の追加スキーマ。内側 4 表とは独立した自己完結の 4 表。すべて ``IF NOT EXISTS`` で
-# 冪等・非破壊 (古い DB に対しても既存データを壊さず不足分だけ作る)。
+# Additional schema for the outer loop: self-contained 4 tables independent of the inner 4 tables.
+# All use ``IF NOT EXISTS`` for idempotency and non-destructiveness (creates only missing tables
+# without damaging existing data in old DBs).
 #
-# - reflexion_run      : 外側 run 1 本 1 行。settled なスカラ状態 (episode/epoch/評価器 version/
-#                        best/予算カウンタ/declared_keys/memory 容量) の正本。resume の seed。
-# - reflexion_episode  : 確定した各 episode 1 行 (audit + 復元元)。UNIQUE(run_id, episode) で
-#                        再実行に冪等。signal/lesson は JSON で保存。
-# - reflexion_lesson   : episodic memory の **現在の全 lesson** (persist 毎に全置換)。eviction で
-#                        消えた lesson が DB に残らないよう delete+insert する。position で順序保持。
-# - reflexion_evaluator: epoch で固定された評価器 version の追記レジストリ (version registry の audit)。
+# - reflexion_run      : one row per outer run. Source of truth for settled scalar state (episode/epoch/evaluator version/
+#                        best/budget counter/declared_keys/memory capacity). Seed for resume.
+# - reflexion_episode  : one row per confirmed episode (audit + restore source). UNIQUE(run_id, episode) for
+#                        idempotent re-execution. signal/lesson stored as JSON.
+# - reflexion_lesson   : **current full set of lessons** from episodic memory (fully replaced per persist).
+#                        Uses delete+insert to ensure evicted lessons don't linger in DB. position maintains order.
+# - reflexion_evaluator: append-only registry of evaluator versions fixed at each epoch (audit of version registry).
 _REFLEXION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS reflexion_run (
   run_id               TEXT PRIMARY KEY,
@@ -116,11 +116,11 @@ CREATE TABLE IF NOT EXISTS reflexion_evaluator (
 
 
 def _encode_signal(signal: GroundTruthSignal) -> str:
-    """:class:`GroundTruthSignal` を strictly-valid JSON に符号化する (round-trip 用)。
+    """Encode :class:`GroundTruthSignal` to strictly-valid JSON (for round-trip).
 
-    ``allow_nan=False`` で非有限スコア (NaN/Infinity) を **loud に弾く**: 復元できない値を
-    silently 潰すと resume 後の集約・収束判定が狂うため、永続化時点で落とす方を選ぶ
-    (observation の best-effort 永続化とは方針が異なる — これは制御に載る値)。
+    ``allow_nan=False`` **loudly rejects** non-finite scores (NaN/Infinity): if unrestorable values are
+    silently dropped, post-resume aggregation and convergence checks would be incorrect, so we fail fast
+    at persist time instead (differs from observation's best-effort persistence — this is a control-path value).
     """
     return json.dumps(
         {
@@ -139,7 +139,7 @@ def _encode_signal(signal: GroundTruthSignal) -> str:
 
 
 def _decode_signal(blob: str) -> GroundTruthSignal:
-    """:func:`_encode_signal` の逆。``components`` は素の dict で戻す (Score の比較は dict で成立)。"""
+    """Inverse of :func:`_encode_signal`. Returns ``components`` as a plain dict (Score comparison works with dicts)."""
     d = json.loads(blob)
     s = d["score"]
     return GroundTruthSignal(
@@ -180,35 +180,35 @@ def _decode_lesson(blob: Optional[str]) -> Optional[Lesson]:
 
 
 class ReflexionStore:
-    """外側 Reflexion 状態の writer/reader (内側 :class:`~loop_agent.store.LoopStore` の対)。
+    """Writer/reader for outer Reflexion state (counterpart to inner :class:`~loop_agent.store.LoopStore`).
 
-    ``conn`` は :func:`~loop_agent.store.connect` が返した接続でも、素の ``sqlite3.connect()``
-    で開いた借用接続でもよい。後者でも動くよう、生成時に :func:`~loop_agent.store._init_connection`
-    を防御的に呼んで PRAGMA (row_factory=Row / isolation_level=None / foreign_keys=ON / WAL) と
-    内側スキーマを冪等適用し (:class:`~loop_agent.store.LoopStore` と同方針)、続けて外側用スキーマ
-    (:data:`_REFLEXION_SCHEMA`) を非破壊に追加する (古い DB には不足テーブルだけが作られ、既存の
-    内側データは無傷)。``row_factory`` を立てないと全 read が列名アクセスで壊れ、``foreign_keys``
-    を立てないと ``ON DELETE CASCADE`` が効かないため、この正規化は必須。すべての書き込みは
-    :meth:`_transaction` 配下で atomic に行う。
+    ``conn`` can be either a connection returned by :func:`~loop_agent.store.connect` or a borrowed
+    connection from plain ``sqlite3.connect()``. To work with borrowed connections, at instantiation
+    we defensively call :func:`~loop_agent.store._init_connection` to idempotently apply PRAGMA settings
+    (row_factory=Row / isolation_level=None / foreign_keys=ON / WAL) and inner schema (same policy as
+    :class:`~loop_agent.store.LoopStore`), then non-destructively add the outer schema (:data:`_REFLEXION_SCHEMA`)
+    (old DBs get only missing tables; existing inner data stays intact). Without ``row_factory``, all reads
+    break on column name access; without ``foreign_keys``, ``ON DELETE CASCADE`` doesn't work, so this
+    normalization is mandatory. All writes are atomic under :meth:`_transaction`.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
-        # 借用 raw 接続でも resume の read が壊れないよう PRAGMA + row_factory を冪等適用してから
-        # additive スキーマ (IF NOT EXISTS) を足す。_init_connection / executescript はいずれも
-        # 暗黙 COMMIT を伴うが、生成時点で開いている transaction は無い前提なので安全。
+        # Idempotently apply PRAGMA + row_factory even for borrowed raw connections so resume reads don't break,
+        # then add the additive schema (IF NOT EXISTS). Both _init_connection and executescript perform implicit
+        # COMMIT, which is safe since no transaction is open at instantiation time.
         _init_connection(conn)
         conn.executescript(_REFLEXION_SCHEMA)
 
-    # -- transaction 制御 (LoopStore.transaction と同じ参加プロトコル) ----------
+    # -- transaction control (same participation protocol as LoopStore.transaction) ----------
 
     @contextmanager
     def _transaction(self) -> Iterator["ReflexionStore"]:
-        """``BEGIN IMMEDIATE`` -> yield -> ``COMMIT`` (例外時 ``ROLLBACK``)。
+        """``BEGIN IMMEDIATE`` -> yield -> ``COMMIT`` (``ROLLBACK`` on exception).
 
-        既に外側 transaction 内ならそれに参加する (sqlite はネスト BEGIN を許さない)。
-        ``BEGIN IMMEDIATE`` で最初から write ロックを取り、load_or_init の read→write 昇格で
-        WAL の ``SQLITE_BUSY_SNAPSHOT`` を踏まないようにする (内側 store と同方針)。
+        Participates in existing outer transaction if already open (SQLite doesn't allow nested BEGIN).
+        Uses ``BEGIN IMMEDIATE`` to acquire write lock from the start, avoiding WAL's ``SQLITE_BUSY_SNAPSHOT``
+        during read-to-write promotion in load_or_init (same policy as inner store).
         """
         if self.conn.in_transaction:
             yield self
@@ -222,24 +222,24 @@ class ReflexionStore:
         else:
             self.conn.commit()
 
-    # -- run ライフサイクル --------------------------------------------------
+    # -- run lifecycle --------------------------------------------------
 
     def load_or_init(
         self, run_id: str, *, memory: Optional[EpisodicMemory] = None
     ) -> ReflexionState:
-        """``run_id`` の外側 run 行を確保し、その時点の :class:`ReflexionState` を返す。
+        """Provision the outer run row for ``run_id`` and return its current :class:`ReflexionState`.
 
-        - 新規 ``run_id``: ``reflexion_run`` 行を作成し、空の :class:`ReflexionState` を返す。
-          ``memory`` を渡すとその容量ポリシーを保存し、**その live オブジェクト** を state の
-          memory にする (``None`` なら既定 :class:`EpisodicMemory`)。fresh run は
-          ``run_reflexion(initial_state=..., memory=...)`` に渡しても空なので通常 start と同義。
-        - 既存 ``run_id``: ``reflexion_run`` のスカラ + ``reflexion_episode`` + ``reflexion_lesson``
-          から :class:`ReflexionState` を **復元** して返す。これを
-          ``run_reflexion(initial_state=state, memory=state.memory, persist=...)`` に渡すと
-          中断地点から **resume** できる (#29)。復元 ``evaluator_version`` / ``declared_keys`` が
-          渡された評価器 / 軸と食い違えば run_reflexion が loud に弾く (整合の継ぎ目を壊さない)。
+        - New ``run_id``: creates a ``reflexion_run`` row and returns an empty :class:`ReflexionState`.
+          If ``memory`` is provided, stores its capacity policy and uses **that live object** as the state's
+          memory (``None`` defaults to :class:`EpisodicMemory`). A fresh run passed to
+          ``run_reflexion(initial_state=..., memory=...)`` is empty, so start and initialization are equivalent.
+        - Existing ``run_id``: **reconstructs** :class:`ReflexionState` from ``reflexion_run`` scalars
+          + ``reflexion_episode`` + ``reflexion_lesson`` rows. Passing it to
+          ``run_reflexion(initial_state=state, memory=state.memory, persist=...)`` enables **resumption**
+          from the interruption point (#29). If restored ``evaluator_version`` / ``declared_keys`` differ from
+          the passed evaluator / axes, run_reflexion fails loudly (preserves coherence at the seam).
 
-        作成/復元は 1 transaction で atomic に行う。
+        Creation/restoration is atomic in a single transaction.
         """
         if not run_id:
             raise ValueError("load_or_init: run_id must be a non-empty string")
@@ -259,7 +259,7 @@ class ReflexionStore:
             return self._reconstruct_state(run_id)
 
     def _reconstruct_state(self, run_id: str) -> ReflexionState:
-        """永続化済みの行から :class:`ReflexionState` を組み立てる (resume の復元)。"""
+        """Assemble :class:`ReflexionState` from persisted rows (resume restoration)."""
         run = self.conn.execute(
             "SELECT episode, epoch, evaluator_version, best_gt_aggregate, reflections, "
             "evaluator_updates, declared_keys, mem_cap, mem_per_lesson_chars, "
@@ -290,7 +290,7 @@ class ReflexionStore:
                 detail=e["detail"],
             )
             episodes.append(record)
-            # gt_aggregate_history は **ground_truth_backed な** episode のみ (driver と同じ規則)。
+            # gt_aggregate_history includes **only ground_truth_backed** episodes (same rule as driver).
             if signal.ground_truth_backed:
                 gt_aggregate_history.append(e["gt_aggregate"])
 
@@ -304,8 +304,8 @@ class ReflexionStore:
             "WHERE run_id = ? ORDER BY position",
             (run_id,),
         ):
-            # admit を経ずに直接 list を復元する (検証・eviction・dedup は保存時に済んでいる。
-            # admit を通すと cap 超過分が再 evict されて保存内容と食い違いうる)。
+            # Restore list directly without going through admit (validation, eviction, dedup are already done at persist time.
+            # Going through admit would re-evict excess lessons, causing divergence from saved content).
             memory._lessons.append(
                 Lesson(
                     text=lrow["text"],
@@ -329,21 +329,21 @@ class ReflexionStore:
             memory=memory,
         )
 
-    # -- per-episode 永続化 --------------------------------------------------
+    # -- per-episode persistence --------------------------------------------------
 
     def persist_episode(
         self, run_id: str, record: EpisodeRecord, state: ReflexionState
     ) -> None:
-        """確定した 1 episode を atomic に永続化する (run_reflexion の ``persist`` フック互換)。
+        """Atomically persist a confirmed episode (compatible with run_reflexion's ``persist`` hook).
 
-        1 transaction で「episode 行の upsert + memory 全 lesson の全置換 + reflexion_run スカラの
-        更新 + 評価器 version の登録」を束ねる。``state`` は **境界処理後の settled state** を渡す
-        こと (run_reflexion はそうしている) — そうすれば persist された epoch / evaluator_version /
-        evaluator_updates が post-boundary になり resume が通し実行と一致する。
+        Bundles "episode row upsert + full memory lesson replacement + reflexion_run scalar update +
+        evaluator version registration" into one transaction. ``state`` should be **settled state after boundary processing**
+        (run_reflexion does this) — this way, persisted epoch / evaluator_version / evaluator_updates are
+        post-boundary, making resume consistent with straight-through execution.
 
-        ``UNIQUE(run_id, episode)`` 衝突時は ``DO UPDATE`` で上書きするので、同一 episode の再
-        永続化 (resume 後の再走) に冪等。memory は eviction で件数が減りうるため、append ではなく
-        **delete+insert で全置換** する (DB が memory の現在像と完全一致する)。
+        On ``UNIQUE(run_id, episode)`` collision, ``DO UPDATE`` overwrites, so re-persisting the same episode
+        (re-run after resume) is idempotent. Memory may shrink from eviction, so we **fully replace via delete+insert**
+        rather than append (DB exactly mirrors memory's current state).
         """
         signal_json = _encode_signal(record.signal)
         lesson_json = None if record.lesson is None else _encode_lesson(record.lesson)
@@ -378,10 +378,10 @@ class ReflexionStore:
                 ),
             )
             self._flush_settled(run_id, state)
-            # 新規 episode が確定した = run は running。前回 stopped/paused を record_result で記録
-            # した後に resume した場合、終端メタデータ (status/stop_name/reason/ended_at) を
-            # running へ戻す。さもないと get_run が advance 済みの run を stale な stopped /
-            # 古い ended_at で報告し、reflexion_run が lifecycle の SoT でなくなる。
+            # New episode confirmed = run is running. If previously record_result logged stopped/paused
+            # and then resumed, reset terminal metadata (status/stop_name/reason/ended_at) to running.
+            # Otherwise get_run reports an advanced run as stale stopped with old ended_at, breaking reflexion_run
+            # as the SoT for lifecycle.
             self.conn.execute(
                 "UPDATE reflexion_run SET status = 'running', stop_name = NULL, "
                 "reason = '', ended_at = NULL WHERE run_id = ?",
@@ -389,20 +389,20 @@ class ReflexionStore:
             )
 
     def _flush_settled(self, run_id: str, state: ReflexionState) -> None:
-        """settled な state (memory 全像 + 評価器 version + reflexion_run スカラ) を書き出す。
+        """Flush settled state (full memory snapshot + evaluator version + reflexion_run scalars).
 
-        ``persist_episode`` (episode 確定時) と ``record_result`` (終端確定時) の両方から呼ぶ
-        共通核。**呼び出し側が transaction を保持していること** が前提 (atomic 境界は caller が張る)。
-        memory は eviction で件数が減りうるため append ではなく **delete+insert で全置換** し、DB を
-        memory の現在像と完全一致させる。両者から呼ぶことで、resume の末尾境界 recovery が episode を
-        1 つも完了させずに stop へ落ちた場合 (例: ``EvaluatorUpdateBudget`` を recovery の昇格が即
-        踏む) でも、``record_result`` 経由で recovery 後の epoch / evaluator_version / evaluator_updates
-        が確実に永続化される (返り値と DB が乖離せず、再 resume で昇格を二度踏まない)。
+        Common core called from both ``persist_episode`` (on episode confirmation) and ``record_result``
+        (on terminal confirmation). **Assumes caller holds the transaction** (atomic boundary is caller's responsibility).
+        Memory may shrink from eviction, so we **fully replace via delete+insert** rather than append, making DB
+        exactly mirror memory's current state. Calling from both ensures that if resume's tail-boundary recovery
+        stops without completing an episode (e.g., immediately hitting ``EvaluatorUpdateBudget`` in recovery's promotion),
+        ``record_result`` still reliably persists post-recovery epoch / evaluator_version / evaluator_updates
+        (return value and DB stay in sync, avoiding double-hitting promotions on re-resume).
         """
         best = state.best_gt_aggregate
         best_db = None if best == float("-inf") else best
         declared_json = json.dumps(list(state.declared_keys))
-        # memory の現在像で lesson 表を全置換 (eviction された lesson を残さない)。
+        # Fully replace lesson table with memory's current snapshot (don't leave evicted lessons behind).
         self.conn.execute("DELETE FROM reflexion_lesson WHERE run_id = ?", (run_id,))
         for position, lesson in enumerate(state.memory.lessons()):
             self.conn.execute(
@@ -418,14 +418,14 @@ class ReflexionStore:
                     lesson.support,
                 ),
             )
-        # 評価器 version registry: 現行 version を追記 (audit。冪等)。
+        # Evaluator version registry: append current version (audit, idempotent).
         if state.evaluator_version:
             self.conn.execute(
                 "INSERT OR IGNORE INTO reflexion_evaluator "
                 "(run_id, version, epoch) VALUES (?, ?, ?)",
                 (run_id, state.evaluator_version, state.epoch),
             )
-        # settled スカラを reflexion_run に書く (resume seed の正本)。
+        # Write settled scalars to reflexion_run (source of truth for resume seed).
         self.conn.execute(
             "UPDATE reflexion_run SET episode = ?, epoch = ?, evaluator_version = ?, "
             "best_gt_aggregate = ?, reflections = ?, evaluator_updates = ?, "
@@ -445,14 +445,14 @@ class ReflexionStore:
         )
 
     def record_result(self, run_id: str, result: "ReflexiveResult") -> None:
-        """外側ループ終了時の **settled state + 最終ステータス** を確定する (DBReflexionLog の終端配線)。
+        """Lock in **settled state + final status** at outer loop termination (wiring for DBReflexionLog terminus).
 
-        ``status`` (``converged`` / ``stopped`` / ``paused``) と発火条件 / 理由を記録し、加えて
-        ``result.state`` の settled スカラ + memory + 評価器 version を :meth:`_flush_settled` で
-        書き直す (内側 :meth:`~loop_agent.store.LoopStore.record_result` が最終集計を畳むのと同方針)。
-        これにより、resume の末尾境界 recovery が episode を 1 つも完了させずに停止した場合でも、
-        recovery 後の状態が DB に確実に反映され、返り値と DB が一致する。``paused`` は終端ではない
-        ので ``ended_at`` を立てない (resume で続行できる)。
+        Records ``status`` (``converged`` / ``stopped`` / ``paused``) and its trigger / reason; also
+        re-flushes settled scalars + memory + evaluator version from ``result.state`` via :meth:`_flush_settled`
+        (mirrors how inner :meth:`~loop_agent.store.LoopStore.record_result` folds final tally). This ensures that
+        if resume's tail-boundary recovery stops without completing an episode, post-recovery state is reliably
+        reflected in DB with return value and DB in sync. ``paused`` is not terminal, so ``ended_at`` is not set
+        (resume can continue).
         """
         stop_name = result.stop.name if result.stop is not None else None
         ended = result.status != "paused"
@@ -466,17 +466,17 @@ class ReflexionStore:
                 (result.status, stop_name, result.reason, int(ended), run_id),
             )
 
-    # -- 読み出し ------------------------------------------------------------
+    # -- reading ---------------------------------------------------------------
 
     def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
-        """``reflexion_run`` 行を dict で返す (無ければ ``None``)。"""
+        """Return ``reflexion_run`` row as dict, or ``None`` if absent."""
         row = self.conn.execute(
             "SELECT * FROM reflexion_run WHERE run_id = ?", (run_id,)
         ).fetchone()
         return dict(row) if row is not None else None
 
     def read_episodes(self, run_id: str) -> list[dict[str, Any]]:
-        """``run_id`` の episode 行を episode 順に dict のリストで返す (signal/lesson は復号)。"""
+        """Return episode rows for ``run_id`` as list of dicts in episode order (signal/lesson decoded)."""
         rows = self.conn.execute(
             "SELECT * FROM reflexion_episode WHERE run_id = ? ORDER BY episode",
             (run_id,),
@@ -492,7 +492,7 @@ class ReflexionStore:
         return episodes
 
     def read_evaluator_versions(self, run_id: str) -> list[dict[str, Any]]:
-        """``run_id`` で固定された評価器 version の登録履歴を登録順に返す (version registry)。"""
+        """Return registration history of evaluator versions fixed at ``run_id`` in registration order (version registry)."""
         rows = self.conn.execute(
             "SELECT version, epoch, first_seen_at FROM reflexion_evaluator "
             "WHERE run_id = ? ORDER BY id",
@@ -502,22 +502,22 @@ class ReflexionStore:
 
 
 class DBReflexionLog:
-    """DB-backed の外側 Reflexion 進捗記録。内側 :class:`~loop_agent.store.DBProgressLog` の対。
+    """DB-backed progress log for outer Reflexion (counterpart to inner :class:`~loop_agent.store.DBProgressLog`).
 
-    ``db`` にはファイルパス (内部で :func:`~loop_agent.store.connect` し所有権を持って
-    :meth:`close` で閉じる) か既存の ``sqlite3.Connection`` (借用。close では閉じない) を渡せる。
-    生成時に ``load_or_init(run_id)`` を呼んで :attr:`state` (新規なら空・既存なら復元した途中状態)
-    を保持する。これが **resume の入口**:
+    ``db`` accepts either a file path (internally opened via :func:`~loop_agent.store.connect`, owned and closed
+    in :meth:`close`) or an existing ``sqlite3.Connection`` (borrowed; not closed in close). At instantiation,
+    calls ``load_or_init(run_id)`` to populate :attr:`state` (empty if new, or restored mid-run state if existing).
+    This is the **resume entry point**:
 
         log = DBReflexionLog("outer.db", "run-1")
         result = run_reflexion(
             ..., initial_state=log.state, memory=log.memory, persist=log.on_episode,
         )
-        log.record_result(result)   # 任意 (終端メタデータの audit)
+        log.record_result(result)   # optional (audit terminal metadata)
 
-    と配線すれば、中断した外側ループを epoch 進行・採用 lesson・評価器 version ごと途中から継続
-    できる (新規 run では ``state`` が空なので fresh start と同義 = 同じ配線でよい)。``memory`` を
-    渡すと fresh run の memory 容量ポリシーを指定できる (resume では DB の保存値が優先)。
+    With this wiring, an interrupted outer loop resumes from mid-point with epoch progress, adopted lessons,
+    and evaluator version preserved (for new runs, ``state`` is empty, so fresh start applies; same wiring works).
+    Pass ``memory`` to specify memory capacity policy for fresh runs (on resume, DB's saved value takes precedence).
     """
 
     def __init__(
@@ -535,24 +535,25 @@ class DBReflexionLog:
             self._owns_conn = True
         self.run_id = run_id
         self.store = ReflexionStore(self.conn)
-        # 復元した (新規なら空の) ReflexionState を resume の seed として保持する。
+        # Hold the restored (or empty if new) ReflexionState as resume seed.
         self.state = self.store.load_or_init(run_id, memory=memory)
 
     @property
     def memory(self) -> EpisodicMemory:
-        """resume seed の live memory (``run_reflexion(memory=...)`` にそのまま渡す)。"""
+        """Live memory from resume seed (pass directly to ``run_reflexion(memory=...)``).
+        """
         return self.state.memory
 
     def on_episode(self, record: EpisodeRecord, state: ReflexionState) -> None:
-        """確定 episode を永続化する。``run_reflexion(persist=...)`` に渡す。"""
+        """Persist confirmed episode. Pass to ``run_reflexion(persist=...)``."""
         self.store.persist_episode(self.run_id, record, state)
 
     def record_result(self, result: "ReflexiveResult") -> None:
-        """外側ループ終了時の最終ステータスを確定する (任意)。"""
+        """Lock in final status at outer loop termination (optional)."""
         self.store.record_result(self.run_id, result)
 
     def close(self) -> None:
-        """自分で開いた接続のみ閉じる (借用接続は呼び出し側の責務)。"""
+        """Close only self-opened connections (caller's responsibility for borrowed connections)."""
         if self._owns_conn:
             self.conn.close()
 

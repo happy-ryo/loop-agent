@@ -1,27 +1,29 @@
-"""Claude Code (headless ``claude --print``) を ``act`` フックに繋ぐアダプタ。
+"""Adapter connecting Claude Code (headless ``claude --print``) to the ``act`` hook.
 
-:class:`ClaudeCodeAct` は反復ごとに ``claude --print <prompt>`` を subprocess で
-1 回起動し、その応答を :class:`ActOutcome` に詰めて返す。これにより
-``run_loop`` の 1 行(``act=ClaudeCodeAct(...)``)で「Claude Code 経由でループを
-回す」ことができる(report.md S4.4 の act シーム / Issue #32)。
+:class:`ClaudeCodeAct` launches ``claude --print <prompt>`` as a subprocess once per
+iteration, packages the response into :class:`ActOutcome`, and returns it. This allows
+a single line in ``run_loop`` (``act=ClaudeCodeAct(...)``) to "run the loop via
+Claude Code" (report.md S4.4 act seam / Issue #32).
 
-設計上の約束(loop コアの性質を壊さないため):
+Design commitments (to avoid breaking loop core semantics):
 
-- **例外でループを殺さない**: timeout 超過・非 0 終了・実行ファイル不在は、例外を
-  送出せず ``failed=True`` の :class:`ClaudeCodeResult` を観測に載せた
-  :class:`ActOutcome` として graceful に返す。検証(verify)側がこの ``failed`` を
-  見て続行/終了を決められる。境界で評価される ``Timeout`` / ``MaxIterations`` は
-  常に効く(report.md S4.4 の while-guard 設計)。
-- **token を予算に積む**: 応答(``--output-format json`` の ``usage``、無ければ
-  stdout/stderr のフォールバック解析)からトークン数を取り出し、
-  ``ActOutcome.tokens`` に載せる。driver がこれを ``state.tokens_used`` に積むので、
-  :class:`~loop_agent.conditions.TokenBudget` がそのまま効く。
-- **auth は claude CLI に委譲**: 子プロセスは既定で起動側の ``os.environ`` を継承
-  する。これにより「既存の claude CLI セッション(~/.claude のログイン)」が第一義に
-  使われ、``ANTHROPIC_API_KEY`` が環境にあれば CLI 側のフォールバックとして働く。
-  ``env`` を渡すとこの環境へ上書きマージする(秘匿値の注入はこの経路で行う)。
+- **Do not kill the loop on exceptions**: Timeout exceeded, non-zero exit, or missing
+  executable are handled gracefully by returning a :class:`ActOutcome` with a failed
+  :class:`ClaudeCodeResult` carrying ``failed=True``, rather than raising an exception.
+  The verify side can inspect this ``failed`` flag to decide whether to continue or
+  abort. Boundary conditions ``Timeout`` / ``MaxIterations`` always take effect
+  (report.md S4.4 while-guard design).
+- **Accumulate tokens to budget**: Extract token count from the response
+  (``--output-format json`` ``usage``, or fall back to stdout/stderr parsing),
+  and place it in ``ActOutcome.tokens``. The driver adds this to
+  ``state.tokens_used``, so :class:`~loop_agent.conditions.TokenBudget` works
+  as-is.
+- **Delegate auth to claude CLI**: The child process inherits ``os.environ`` by default,
+  allowing any existing claude CLI session (~/.claude login) to take precedence. If
+  ``ANTHROPIC_API_KEY`` is in the environment, the CLI falls back to it. Passing
+  ``env`` merges it as overrides (secrecy values are injected this way).
 
-subprocess を使わないテスト/デモ用には :class:`MockClaudeCodeAct` を使う。
+For tests/demos that avoid subprocess, use :class:`MockClaudeCodeAct`.
 """
 
 from __future__ import annotations
@@ -35,24 +37,24 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 from ..loop import ActOutcome
 
-# subprocess.run 互換の実行関数シーム(テストで差し替えるための注入点)。
-# capture_output / text / timeout / env / cwd を受け取り、
-# ``returncode`` / ``stdout`` / ``stderr`` を持つオブジェクトを返す。
+# subprocess.run-compatible execution function seam (injection point for test mocking).
+# Accepts capture_output / text / timeout / env / cwd; returns an object with
+# ``returncode`` / ``stdout`` / ``stderr``.
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
-# Mock の各応答に許す形。str はそのまま応答テキスト、dict は ClaudeCodeResult の
-# フィールド、ClaudeCodeResult はそのまま使う。
+# Permitted response shape for each Mock response. str becomes response text as-is,
+# dict expands as ClaudeCodeResult fields, ClaudeCodeResult is used as-is.
 MockResponse = Union[str, Mapping[str, Any], "ClaudeCodeResult"]
 
 
 @dataclass
 class ClaudeCodeResult:
-    """1 回の Claude Code 呼び出しの構造化結果(``ActOutcome.observation`` に載る)。
+    """Structured result of a single Claude Code invocation (placed in ``ActOutcome.observation``).
 
-    ``ActOutcome`` 自体は ``failed`` を持たないため、成否や生出力といった
-    「verify が判断に使いたい情報」はこの観測オブジェクトに集約する。
-    ``str(result)`` は応答テキスト(``text``)を返すので、テキストとして直接
-    扱う既存コードとも素直に繋がる。
+    Since ``ActOutcome`` itself lacks a ``failed`` field, information such as success/failure
+    and raw output -- needed by verify for decision-making -- is consolidated in this
+    observation object. ``str(result)`` returns the response text (``text``), so it
+    integrates seamlessly with existing code that treats it as text directly.
     """
 
     text: str = ""
@@ -64,19 +66,19 @@ class ClaudeCodeResult:
     stderr: str = ""
     command: tuple[str, ...] = ()
 
-    def __str__(self) -> str:  # テキストとして使われたとき応答本文を返す。
+    def __str__(self) -> str:  # Return the response body when used as text.
         return self.text
 
 
 def _format_fields(context: Any) -> dict[str, Any]:
-    """``prompt_template.format(**...)`` に渡す名前付きフィールドを context から作る。
+    """Build named fields from context to pass to ``prompt_template.format(**...)``.
 
-    - Mapping -> そのままのキー(``{"prompt": ...}`` など)
-    - dataclass(例: :class:`~loop_agent.state.LoopState`)-> 各フィールド名
-      (``iteration`` / ``tokens_used`` / ``elapsed`` ... をテンプレートに埋められる)
-    - str -> ``{"prompt": <その文字列>}``(プロンプト直渡しの最短経路)
-    - それ以外で ``__dict__`` を持つ -> その属性
-    - 最後の保険 -> ``{"prompt": <context>}``
+    - Mapping -> keys as-is (e.g., ``{"prompt": ...}``)
+    - dataclass (e.g., :class:`~loop_agent.state.LoopState`) -> each field name
+      (``iteration`` / ``tokens_used`` / ``elapsed`` ... can be embedded in template)
+    - str -> ``{"prompt": <that string>}`` (direct prompt passthrough, shortest path)
+    - anything with ``__dict__`` -> those attributes
+    - fallback -> ``{"prompt": <context>}``
     """
     if isinstance(context, Mapping):
         return dict(context)
@@ -90,16 +92,16 @@ def _format_fields(context: Any) -> dict[str, Any]:
 
 
 def render_prompt(template: str, context: Any) -> str:
-    """``template`` を context のフィールドで埋めて最終プロンプト文字列を返す。
+    """Fill ``template`` with context fields and return the final prompt string.
 
-    テンプレートが context に無いフィールドを参照していた場合は、何が無くて何が
-    使えるのかを示す :class:`KeyError` を送出する(既定の ``"{prompt}"`` に対して
-    ``prompt`` を渡し忘れた、といった取り違えをすぐ気付けるようにする)。
+    If the template references a field not present in context, raise :class:`KeyError`
+    indicating what is missing and what is available. This helps catch mistakes like
+    forgetting to pass ``prompt`` to the default ``"{prompt}"`` template early.
     """
     field_map = _format_fields(context)
     try:
         return template.format(**field_map)
-    except KeyError as exc:  # .format は欠落キーを KeyError(key) で投げる。
+    except KeyError as exc:  # .format raises KeyError(key) for missing keys.
         missing = exc.args[0] if exc.args else exc
         raise KeyError(
             f"prompt_template {template!r} references {missing!r}, "
@@ -110,12 +112,12 @@ def render_prompt(template: str, context: Any) -> str:
 
 
 def _sum_token_fields(usage: Mapping[str, Any]) -> int:
-    """``usage`` マップから ``*tokens*`` を名前に含む整数値を合計する。
+    """Sum integer values containing ``*tokens*`` in their name from the ``usage`` map.
 
-    ``input_tokens`` / ``output_tokens`` / ``cache_creation_input_tokens`` /
-    ``cache_read_input_tokens`` を漏れなく拾い、将来増えるトークン種別にも追従する。
-    予算(:class:`~loop_agent.conditions.TokenBudget`)は「処理した総トークン」で
-    切りたいので、種別を区別せず総和を取る。
+    Captures ``input_tokens`` / ``output_tokens`` / ``cache_creation_input_tokens`` /
+    ``cache_read_input_tokens`` without omission and adapts to future token types. Since
+    the budget (:class:`~loop_agent.conditions.TokenBudget`) counts "total tokens
+    processed," we sum all types without distinction.
     """
     return sum(
         value
@@ -127,12 +129,13 @@ def _sum_token_fields(usage: Mapping[str, Any]) -> int:
 
 
 def _try_json(text: str) -> Any:
-    """``text`` 全体、もしくは(stream-json 用に)各行を JSON として読む試み。
+    """Attempt to parse ``text`` as JSON, either as a whole or (for stream-json) line-by-line.
 
-    - まず全体を 1 つの JSON として読む(``--output-format json`` の単一結果)。
-    - 失敗したら行単位で走査し、``usage`` を持つ最後のオブジェクトを返す
-      (``--output-format stream-json`` の最終 result 行を拾うため)。
-    どれも JSON でなければ ``None``。
+    - First try to parse the entire text as a single JSON object
+      (``--output-format json`` single result).
+    - On failure, scan line-by-line and return the last object with a ``usage`` field
+      (to capture the final result line in ``--output-format stream-json``).
+    Return ``None`` if none parse as JSON.
     """
     stripped = text.strip()
     if not stripped:
@@ -155,9 +158,10 @@ def _try_json(text: str) -> Any:
     return found
 
 
-# usage が構造化 JSON で取れなかったとき用の、人間可読/部分出力向けフォールバック。
-# 代表的なキーを 1 つずつ(最初の出現のみ)拾って合算する。stream-json の途中行や
-# modelUsage の内訳まで貪欲に拾うと二重計上しうるため、敢えて各キー先頭一致に絞る。
+# Fallback for human-readable / partial output when usage is not available as structured JSON.
+# Pick each representative key (first occurrence only) and sum them. To avoid double-counting
+# when greedily picking intermediate lines in stream-json or details in modelUsage, we
+# deliberately restrict to first match per key.
 _TOKEN_FIELD_RES = tuple(
     re.compile(rf'"{key}"\s*:\s*(\d+)')
     for key in (
@@ -170,17 +174,18 @@ _TOKEN_FIELD_RES = tuple(
 
 
 def parse_tokens(stdout: str, stderr: str = "") -> int:
-    """``claude`` の出力からトークン総数を取り出す(取れなければ 0)。
+    """Extract total token count from ``claude`` output (return 0 if not found).
 
-    優先順位:
+    Priority:
 
-    1. stdout を JSON として読み、``usage`` オブジェクトのトークン値を合算する
-       (``--output-format json`` / ``stream-json``)。``modelUsage`` 等の内訳は
-       読まず、トップレベル ``usage`` のみを見るので二重計上しない。
-    2. JSON にならない場合は stdout -> stderr の順に、代表トークンキーの最初の
-       出現を正規表現で拾って合算する(debug 出力やテキスト混在への保険)。
+    1. Parse stdout as JSON and sum token values from the ``usage`` object
+       (``--output-format json`` / ``stream-json``). Only inspect top-level ``usage``,
+       not ``modelUsage`` details, to avoid double-counting.
+    2. If not JSON, scan stdout then stderr in order, using regex to find the first
+       occurrence of each representative token key and sum them (fallback for debug
+       output or mixed text).
 
-    いずれも見つからなければ ``0`` を返す(テキスト出力で usage が無いのは正常)。
+    Return ``0`` if neither finds anything (absence of usage in text output is normal).
     """
     obj = _try_json(stdout)
     if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
@@ -202,11 +207,11 @@ def parse_tokens(stdout: str, stderr: str = "") -> int:
 
 
 def _parse_result(stdout: str, stderr: str) -> tuple[str, int, bool]:
-    """応答テキスト・トークン数・(CLI が報告する)エラーフラグを取り出す。
+    """Extract response text, token count, and error flag (as reported by CLI).
 
-    ``--output-format json`` の結果なら ``result`` を本文、``is_error`` を
-    エラー判定、``usage`` をトークン源として使う。JSON でなければ stdout を本文と
-    し、トークンは :func:`parse_tokens` のフォールバックで拾う。
+    For ``--output-format json`` results, use ``result`` for text, ``is_error`` for
+    the error flag, and ``usage`` for tokens. Otherwise, treat stdout as text and
+    extract tokens via :func:`parse_tokens` fallback.
     """
     obj = _try_json(stdout)
     if isinstance(obj, dict):
@@ -222,29 +227,32 @@ def _parse_result(stdout: str, stderr: str) -> tuple[str, int, bool]:
 
 @dataclass
 class ClaudeCodeAct:
-    """Claude Code を headless 起動する ``act`` フック。
+    """``act`` hook for headless Claude Code invocation.
 
     Args:
-        allowed_tools: ``--allowed-tools`` に渡すツール名列(例 ``["Read", "Edit"]``)。
-            ``None`` なら付けない(CLI 既定に従う)。
-        timeout: 1 回の呼び出しに課す上限秒。超過は子プロセスを kill し、
-            ``failed=True`` の結果で graceful に返す(例外を投げない)。
-        prompt_template: 最終プロンプトを組み立てる ``str.format`` テンプレート。
-            既定 ``"{prompt}"`` は context(gather の戻り値)に ``prompt`` がある前提。
-            ``LoopState`` をそのまま context にするなら ``"... iter={iteration}"`` の
-            ように state のフィールドを埋め込める。
-        model: ``--model``(``opus`` / ``sonnet`` などのエイリアスも可)。``None`` で既定。
-        permission_mode: ``--permission-mode``
-            (``default`` / ``acceptEdits`` / ``bypassPermissions`` など)。``None`` で既定。
-        env: 子プロセス環境への上書きマージ。``None`` なら ``os.environ`` をそのまま継承
-            (既存 claude セッション + ``ANTHROPIC_API_KEY`` フォールバックが効く)。
-        output_format: ``--output-format``。既定 ``"json"``(usage を含む単一結果が
-            得られトークン解析が確実)。``"text"`` にすると本文のみ(tokens は 0 になりがち)。
-        claude_bin: 実行ファイル名/パス(既定 ``"claude"``)。テストで差し替え可。
-        extra_args: 上記以外に渡したい追加フラグ(プロンプトの手前に挿入)。
-        cwd: 子プロセスの作業ディレクトリ。``None`` で現在のディレクトリ。
-        runner: ``subprocess.run`` 互換の実行関数(テスト用の注入点)。``None`` で
-            ``subprocess.run`` を使う。
+        allowed_tools: List of tool names to pass to ``--allowed-tools``
+            (e.g., ``["Read", "Edit"]``). Omitted if ``None`` (use CLI default).
+        timeout: Maximum seconds per invocation. On timeout, kill the child process
+            and return gracefully with ``failed=True`` (no exception).
+        prompt_template: ``str.format`` template to build the final prompt. The default
+            ``"{prompt}"`` assumes context (from gather) has a ``prompt`` field.
+            Pass ``LoopState`` directly as context to embed state fields like
+            ``"... iter={iteration}"`` in the template.
+        model: ``--model`` (aliases like ``opus`` / ``sonnet`` also work). ``None``
+            uses CLI default.
+        permission_mode: ``--permission-mode`` (``default`` / ``acceptEdits`` /
+            ``bypassPermissions``, etc.). ``None`` uses CLI default.
+        env: Override dict to merge into child process environment. ``None`` inherits
+            ``os.environ`` as-is (existing claude session + ``ANTHROPIC_API_KEY``
+            fallback remain active).
+        output_format: ``--output-format``. Default ``"json"`` (single result with
+            usage, token parsing is reliable). ``"text"`` gives body only (tokens
+            often become 0).
+        claude_bin: Executable name/path (default ``"claude"``). Can be overridden in tests.
+        extra_args: Additional flags to pass before the prompt.
+        cwd: Child process working directory. ``None`` uses the current directory.
+        runner: ``subprocess.run``-compatible execution function (test injection point).
+            ``None`` uses ``subprocess.run`` directly.
     """
 
     allowed_tools: Optional[Sequence[str]] = None
@@ -260,7 +268,7 @@ class ClaudeCodeAct:
     runner: Optional[Runner] = None
 
     def build_command(self, prompt: str) -> list[str]:
-        """この呼び出しで実行する ``claude`` コマンド(引数列)を組み立てる。"""
+        """Build the ``claude`` command (argument list) to execute for this invocation."""
         cmd: list[str] = [self.claude_bin, "--print"]
         if self.output_format:
             cmd += ["--output-format", self.output_format]
@@ -269,20 +277,21 @@ class ClaudeCodeAct:
         if self.permission_mode:
             cmd += ["--permission-mode", self.permission_mode]
         if self.allowed_tools:
-            # CLI はカンマ/空白区切りを受け付ける。ツール指定に空白を含む
-            # (例 "Bash(git *)")場合でも 1 トークンに保つためカンマで連結する。
+            # CLI accepts comma or space-separated values. When tool names contain spaces
+            # (e.g. "Bash(git *)"), we join with commas to keep it as a single token.
             cmd += ["--allowed-tools", ",".join(self.allowed_tools)]
         cmd += list(self.extra_args)
-        # プロンプトは必ず "--" の後ろに置く。``--allowed-tools <tools...>`` のような
-        # 可変長(variadic)オプションや、extra_args 経由の ``--add-dir`` 等は、直後の
-        # トークンを「次の値」として貪欲に飲み込むため、区切り無しでプロンプトを末尾に
-        # 足すと CLI がプロンプトを失い(空リクエスト or timeout までハング)してしまう。
-        # POSIX 慣例の "--" でオプション解析を打ち切り、プロンプトを位置引数に確定させる。
+        # Prompt must always come after "--". Variadic options like
+        # ``--allowed-tools <tools...>`` or ``--add-dir`` from extra_args greedily
+        # consume the following token as their value. Without a separator, appending
+        # the prompt at the end causes the CLI to lose it (empty request or hang until
+        # timeout). Use the POSIX convention "--" to end option parsing and fix the
+        # prompt as a positional argument.
         cmd += ["--", prompt]
         return cmd
 
     def _build_env(self) -> dict[str, str]:
-        """子プロセスに渡す環境。``os.environ`` を継承し ``env`` で上書きマージ。"""
+        """Build the environment to pass to the child process. Inherit ``os.environ`` and merge ``env`` as overrides."""
         base = dict(os.environ)
         if self.env:
             base.update(self.env)
@@ -303,7 +312,7 @@ class ClaudeCodeAct:
                 cwd=self.cwd,
             )
         except subprocess.TimeoutExpired:
-            # 子は kill 済み。例外でループを殺さず failed として返す。
+            # Child is killed. Return gracefully with failed, don't raise to kill the loop.
             result = ClaudeCodeResult(
                 failed=True,
                 error=f"timeout ({self.timeout:g}s)",
@@ -311,9 +320,9 @@ class ClaudeCodeAct:
             )
             return ActOutcome(observation=result, tokens=0)
         except OSError as exc:
-            # claude 実行ファイルが見つからない / 実行権限が無い等の起動失敗
-            # (FileNotFoundError / PermissionError は OSError)。これも graceful に
-            # failed で返す(境界の MaxIterations 等で必ず止まる)。
+            # Launch failure: claude executable not found / no execute permission / etc.
+            # (FileNotFoundError / PermissionError are OSError subclasses). Return gracefully
+            # with failed (boundary conditions like MaxIterations ensure loop stops).
             result = ClaudeCodeResult(
                 failed=True,
                 error=f"could not launch {self.claude_bin!r}: {exc}",
@@ -340,26 +349,26 @@ class ClaudeCodeAct:
             stderr=stderr,
             command=tuple(command),
         )
-        # tokens は成否に関わらず計上する(失敗試行も実際にトークンを消費しうる)。
+        # Account tokens regardless of success (failed attempts can consume tokens).
         return ActOutcome(observation=result, tokens=tokens)
 
 
 @dataclass
 class MockClaudeCodeAct:
-    """subprocess を使わない in-memory な ``ClaudeCodeAct`` 代替(テスト/デモ用)。
+    """In-memory ``ClaudeCodeAct`` substitute without subprocess (for tests/demos).
 
-    ``responses`` の各要素を順に返す。要素は次のいずれか:
+    Returns each element of ``responses`` in sequence. Each element can be:
 
-    - ``str`` -> その文字列を ``text``(成功・tokens 0)とする
-    - ``Mapping`` -> :class:`ClaudeCodeResult` のフィールドとして展開
-      (例 ``{"text": "...", "tokens": 1200}`` や ``{"failed": True, "error": "..."}``)
-    - :class:`ClaudeCodeResult` -> そのまま使う
+    - ``str`` -> use that string as ``text`` (success, tokens = 0)
+    - ``Mapping`` -> unpack as :class:`ClaudeCodeResult` fields
+      (e.g., ``{"text": "...", "tokens": 1200}`` or ``{"failed": True, "error": "..."}``)
+    - :class:`ClaudeCodeResult` -> use as-is
 
-    応答を使い切ったら最後の応答に張り付く(``CandidateApplier`` と同じ「現状の
-    最善手を返し続ける」挙動。``MaxIterations`` 等の境界で安全に止まる)。
-    レンダリング済みプロンプトは :attr:`prompts` に記録され、テストから検証できる。
-    ``prompt_template`` は :class:`ClaudeCodeAct` と同じ意味で、プレースホルダ挙動を
-    subprocess 無しで再現する。
+    Once responses are exhausted, stick to the last one (same "keep returning the
+    best current option" behavior as ``CandidateApplier``; boundary conditions like
+    ``MaxIterations`` ensure safe stopping). Rendered prompts are recorded in
+    :attr:`prompts` for test verification. ``prompt_template`` has the same meaning
+    as in :class:`ClaudeCodeAct`, reproducing placeholder behavior without subprocess.
     """
 
     responses: Sequence[MockResponse]
