@@ -4,6 +4,154 @@
 
 > Loop Engineering とは、人間がエージェントに一手ずつプロンプトを打つのをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する「システム（=ループ）そのもの」を設計する**実践。`prompt engineering → context engineering → loop engineering` という3層スタックの最上位（制御層）に位置する。
 
+## Embeddable Loop Engine for Agents
+
+> **Embeddable Loop Engine for Agents — Bring your own `gather` / `act` / `verify`. We provide the loop.**
+> （どこの宿主にも組み込める、エージェント用のループエンジン。policy はあなたが持ち、ループは私たちが回す。）
+>
+> **Designed to be driven by coding agents — describe your loop in prose, let your agent assemble it.**
+> （第一の使い手は人間でなく coding agent。「こういうループを回したい」と書けば、エージェントがシームを組み立てる。）
+
+loop-agent は **Claude Code 専用ライブラリではない**。特定の宿主に縛られず、任意のエージェント / アプリに `pip install` で組み込める。提供するのは `gather → act → verify → repeat` のオーケストレーション本体と安全装置だけで、**policy（何を選び・どう実行し・何を成功とするか）は全部呼び出し側に置く**。だから loop-agent は自分の domain を何も知らないまま、user app の中に小さく住んで「安全にループだけ回すエンジン」として機能する。これが "Embeddable" の本物の意味。
+
+### 設計原則
+
+- **依存最小**: ループコアは Python stdlib のみ。OTel（観測）/ SQLite（状態 SoT）/ `tomli`（3.10 の TOML 読み）等はすべて optional で、未導入でも no-op に degrade する。ランタイムを引きずらない。
+- **Protocol ベースの抽象境界**: `gather` / `act` / `verify` / `conditions` / `gate`、さらに `Transport` / `PushBackend` / `WakeQueue` / `WorkDiscovery` がすべて差し替え可能な注入点。
+- **runtime 非依存**: tmux / broker / pty / Slack / Web のどれにも縛られない。`act` を subprocess（`claude --print` 等）にするか in-process callable にするかは呼び出し側の自由。
+- **安全装置はライブラリ側**: 暴走防止（合成 stop 条件で必ず止まる）/ 限定人間ゲート / Reflexion の安全核（二信号モデル・epoch 昇格ゲート）はコアが提供する。policy を間違えてもループは上限で停止する。
+
+### 組み込み先の例（Claude Code に限らない）
+
+自前 Python スクリプト / 既存の CLI ツール / Web アプリ / MCP サーバー / cron 常駐 / Slack bot / 自社 IDE / 別の AI フレームワーク — どれの内側にも後付けで組み込める。
+
+### 立ち位置（取り込む側 vs 組み込まれる側）
+
+LangGraph / AutoGen / OpenAI Agents SDK が「アプリを自分の枠組みに**取り込む**」フレームワークなのに対し、loop-agent は既存アプリの中に**組み込まれる**ループエンジン。あなたのアーキテクチャを置き換えず、その内側に `while not goal: gather → act → verify` を一つ足すだけ。
+
+### シーム一覧
+
+ループが「持つ」のはオーケストレーション本体だけ。policy は全部この 5 つのシームに注入する:
+
+| シーム | 型 | あなたが決めること |
+|---|---|---|
+| `gather` | `Callable[[state], ctx]` | 次に何をやるか（候補選定・triage・キュー戦略） |
+| `act` | `Callable[[ctx], ActOutcome]` | どう実行するか（モデル選択・LLM provider・subprocess・ローカル fn） |
+| `verify` | `Callable[[ActOutcome], VerifyOutcome]` | 何を「成功」とするか（pytest / AST / regex / 何でも。技術的には何でも差せるが成功判定は **ground truth 推奨**） |
+| `conditions` | `list[StopCondition]`（`MaxIterations` 等の stop 条件。`AnyOf` で OR 合成） | いつ止めるか（回数 / 予算 / 目標 / 時間） |
+| `gate` | `ActionGate`（`HumanGate` 等。`review(context, state)` 実装。対象選定は `on=Callable[[action], bool]`） | 何に人間承認を要求するか（commit / push / 任意） |
+
+> **verify は ground truth で書く（推奨）**: 何でも差せるのがシームの本質だが、成功判定を LLM-as-judge に委ねるとループは「成功したフリ」に収束しやすい（report.md R1）。pytest の exit-code / AST / 文字列スキャンなど機械的に判定できるものを使う。具体例は [docs/recipes/](./docs/recipes/)。
+
+```python
+while not goal_met and conditions_ok:
+    ctx = gather(state)        # 何を      (gather)
+    outcome = act(ctx)         # どう実行  (act)
+    v = verify(outcome)        # 何が成功  (verify)
+    state.update(v)
+```
+
+このループ本体だけが loop-agent。5 つのシームを書けば、それがあなたの domain の loop になる。
+
+## クイックスタート（動線 A〜E）
+
+入り口は 5 つ。**初めてなら動線 E（coding-agent driven）が最短** — 自然言語で「こういうループを回したい」と書けば、Claude Code のような coding agent が上のシームを Python / TOML に落として実行まで持っていく。手で組みたいなら A から読む。
+
+| 動線 | 想定する使い手 | 形 |
+|---|---|---|
+| **A: 最短デモ** | 自分で書くエンジニア | 5 行 Python（`run_loop` を直接呼ぶ） |
+| **B: Claude Code 統合** | 自分で書くエンジニア | `ClaudeCodeAct` を `act` に差し込む 1 行 |
+| **C: PoC 実走例** | 動く証拠が欲しい人 | Self-translation PoC の生ログを embeddability の実証として読む |
+| **D: 応用パターン** | 経験者 | ModelLadder / Reflexion 合成 / WorkListGather — シームで**自分でも書ける**正準例 |
+| **E: coding-agent driven（推奨）** | 意図を持つ全ユーザー | prose intent → coding agent が harness を組む → 実行 |
+
+- Claude Code ユーザー向けの 30 分動線（E primary + 監視 / resume / トラブルシュート）: **[docs/quickstart.md](./docs/quickstart.md)**
+- 動線 E の具体 recipe（flaky test 安定化 / 翻訳 / リファクタ）: **[docs/recipes/](./docs/recipes/)**
+- Reflexion を使うべきか・blind retry で足りるかの判断: **[docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md)**
+
+### 動線 A: 最短デモ（5 行 Python）
+
+`act`（行動）と `verify`（検証 = ground truth）と止め方（`conditions`）を渡して `run_loop` を呼ぶだけ。詳細と完全な例は下の [使い方](#使い方)。
+
+```python
+from loop_agent import run_loop, ActOutcome, VerifyOutcome, MaxIterations
+
+n = {"v": 0}
+result = run_loop(
+    act=lambda ctx: ActOutcome(observation=(n.update(v=n["v"] + 1) or f"step {n['v']}")),
+    verify=lambda o: VerifyOutcome(goal_met=n["v"] >= 3),
+    conditions=[MaxIterations(5)],   # ゴール未達でも必ず止まる
+)
+print(result.status, result.reason)   # goal_met / goal met
+```
+
+### 動線 B: Claude Code 統合（1 行）
+
+`act` に `ClaudeCodeAct` を差し込むと、反復ごとに headless の `claude --print` が 1 回起動してループの実行体になる。詳細は下の [Claude Code 経由でループを回す（headless adapter）](#claude-code-経由でループを回すheadless-adapter)。Codex を使うなら `act` を `CodexAct` に差し替える（`act` の interface は同型。ただし引数は Codex 固有 — `allowed_tools` ではなく `model="gpt-5.5"` / `effort` / `sandbox` / `allowed_args`）。
+
+```python
+from loop_agent import run_loop, MaxIterations, TokenBudget, VerifyOutcome
+from loop_agent.adapters import ClaudeCodeAct
+
+result = run_loop(
+    act=ClaudeCodeAct(allowed_tools=["Read", "Edit"], model="haiku"),
+    verify=lambda o: VerifyOutcome(goal_met=(not o.observation.failed) and "DONE" in o.observation.text),
+    gather=lambda s: {"prompt": f"次の修正を 1 つ書け（試行 {s.iteration}）"},
+    conditions=[MaxIterations(10), TokenBudget(200_000)],
+)
+```
+
+### 動線 C: PoC 実走例（embeddability の実証）
+
+**Self-translation PoC** では、loop-agent の*自分自身*のループエンジンを loop-agent の*自分自身*のソースに向け、`ClaudeCodeAct(haiku)` を `act` に据えて `src/loop_agent/` の 10 ファイルの日本語 docstring / コメントを英訳した — **コード・公開 API・型・テスト名は一切変えず**、`pytest` 全件 green を維持して。Run 1（no-Reflexion）は **10/10 ファイル・13 反復・約 33 分・559 件 green 維持**。これは「組み込まれたループエンジンが自分自身を改変しても挙動不変を保てる」ことの実証であり、同時に「実走するから現実の落とし穴が見つかる」例でもある（`ClaudeCodeAct` の token 計上が `cache_read` を累積し `TokenBudget` を誤発火させる bug を発見 → [docs/quickstart.md のトラブルシュート](./docs/quickstart.md) に回避策）。PoC の設計・全結果は [docs/recipes/translation.md](./docs/recipes/translation.md) に要約。
+
+### 動線 D: 応用パターン（シームで自分でも書ける正準例）
+
+これらは **loop-agent の新機能ではなく、`act` / `gather` シームで user が今日でも書けるパターン**。よく書くことになるので「正しく組まれた書き方」を示す（一部は将来 `adapters/` に reference 実装として packagize 予定）。
+
+**ModelLadder（困難タスクで強いモデルへエスカレーション）** — `act` は `Callable` なので、試行回数を見てモデルを上げる act を自分で書ける:
+
+```python
+def escalating_act(ctx):
+    attempts = my_harness.attempts_for(ctx)        # per-candidate の試行回数は呼び出し側が持つ
+    if attempts == 0: return ClaudeCodeAct(model="haiku")(ctx)
+    if attempts == 1: return ClaudeCodeAct(model="sonnet")(ctx)
+    return ClaudeCodeAct(model="opus")(ctx)         # CodexAct と混ぜた異種チェーンも可
+
+result = run_loop(act=escalating_act, ...)
+```
+
+**WorkListGather（multi-item ループの公平 scheduling）** — N ファイル / N bug を回すとき、素朴な「先頭未完を返す `gather`」は 1 件が `MaxIterations` を独占して他を starve させる。試行回数最小から選ぶ round-robin を `gather` に書けば公平になる（Self-translation PoC でこの形を実走）:
+
+```python
+def gather(state):
+    rem = [f for f in files if f not in done]
+    return min(rem, key=lambda f: (attempts[f], files.index(f)))   # 公平 scheduling
+```
+
+**Reflexion 合成** — `run_reflexion` は実装済み。escalating act と重ねれば「lessons 蓄積 + モデル昇格」の二段防御になる。ただし **Reflexion が効くのは systematic failure のタスクだけ**で、stochastic な取りこぼしには blind retry と差が出ない（[docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md) に判断基準と PoC 実証）。
+
+### 動線 E: coding-agent driven（推奨）
+
+「Bring your own `gather` / `act` / `verify`」をもう一段抽象化すると、**policy を書く主体は人間でなく coding agent** になる:
+
+```
+intent（人間の自然言語）
+  ↓
+coding agent（Claude Code / Cursor / Codex 等）が
+  - gather / act / verify / conditions / gate を Python（or TOML）で書く
+  - run_loop を起動する
+  - 結果（LoopObserver の JSONL）を観察し、必要なら policy を書き直す
+  ↓
+loop-agent runtime（薄い loop core・不変）
+  ↓
+results
+```
+
+Self-translation PoC は実はこの構造そのもの: 人間が intent を発し、coding agent（Claude Code）が harness / verify を author し、loop-agent runtime が実行し、結果を見て次の判断（Run 2 起動・bug 起票）をした。自然言語 intent で駆動できるので、**コードを書かない user にも届く**。
+
+→ 具体的な進め方は **[docs/quickstart.md](./docs/quickstart.md)**、prose intent から組む recipe は **[docs/recipes/](./docs/recipes/)**。
+
 ## 現在のステータス
 
 **MVP → 本格（Phase 3）移行フェーズ**。設計レポートに加え、`gather → act → verify → repeat` の最小ループコア（`src/loop_agent/`）を実装済み。MVP の基盤として**ループ状態の SoT（loop 用最小 SQLite スキーマ + transaction 永続化）**・**中断 → 再開（resume）**・**限定人間ゲート**を導入し、Phase 3 として内側 ReAct の外に**外側 Reflexion ループ + RQGM epoch 安全核**を載せた（report.md §5 Phase 2/3）。残りの本格（transport / work-discovery / dashboard・外側ループの永続化）は今後（report.md §5 Phase 3 / Issue #4）。
