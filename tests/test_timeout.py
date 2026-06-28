@@ -610,6 +610,25 @@ def test_sigalrm_restores_prior_itimer():
         signal.signal(signal.SIGALRM, prev_handler)
 
 
+@_alarm_only
+def test_sync_seam_own_exception_propagates_and_disarms_under_alarm():
+    """A guarded sync seam raising its own exception propagates it AND leaves our
+    SIGALRM timer disarmed (teardown runs on the exception path too)."""
+
+    def boom(_ctx):
+        raise ValueError("seam boom")
+
+    with pytest.raises(ValueError, match="seam boom"):
+        run_loop(
+            act=boom,
+            verify=never_done,
+            conditions=[MaxIterations(5)],
+            timeout=TimeoutPolicy(act=5.0, on_timeout=TIMEOUT_KILL),
+        )
+    remaining, _interval = signal.getitimer(signal.ITIMER_REAL)
+    assert remaining == 0.0  # our 5s timer was disarmed, not left armed
+
+
 # -- single budget: a sync prefix that overruns trips before awaiting --------
 
 

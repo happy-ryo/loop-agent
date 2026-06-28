@@ -306,11 +306,14 @@ def _invoke_under_alarm(
     the duration of this call).
 
     Not re-entrant: a single process-wide ``ITIMER_REAL`` is used, so a seam that
-    itself sets a SIGALRM-based timeout would disturb this one. A late
-    ``SIGALRM`` delivered in the tiny window just as ``fn`` returns (the classic
-    disarm race) is mapped to ``timed_out`` rather than allowed to escape as an
-    uncaught ``BaseException`` -- a borderline-deadline call is reported as a
-    timeout, never as a loop crash.
+    itself sets a SIGALRM-based timeout would disturb this one. Teardown order
+    matters and is honoured on **every** exit path (timeout, normal return, or a
+    seam's own exception): our timer is disarmed *first*, while our handler is
+    still installed, so a boundary-race ``SIGALRM`` is absorbed here as
+    :class:`_AlarmInterrupt` rather than misrouted to the about-to-be-restored
+    previous/default handler (which could terminate the process or mask the
+    seam's exception); only then are the handler and the embedder's prior timer
+    restored.
     """
 
     def _handler(signum: int, frame: Any) -> None:
@@ -322,19 +325,21 @@ def _invoke_under_alarm(
     prev_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
         try:
-            result, timed_out = fn(arg), False
+            return fn(arg), False
         except _AlarmInterrupt:
-            result, timed_out = None, True
-        # Disarm our timer ASAP to shrink the window in which a late SIGALRM
-        # could be delivered after fn already returned.
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        return result, timed_out
-    except _AlarmInterrupt:
-        # A SIGALRM delivered after fn returned but before we disarmed: the call
-        # reached its deadline at the boundary. Report a timeout instead of
-        # leaking _AlarmInterrupt (a BaseException) out of the loop.
-        return None, True
+            return None, True
     finally:
+        # Disarm OUR timer before restoring the previous handler, on all exit
+        # paths (including a seam raising its own exception, which skips the body
+        # above). Loop so a pending SIGALRM delivered right as we disarm -- which
+        # raises _AlarmInterrupt via our still-installed handler -- is absorbed
+        # and the disarm retried, never escaping or hitting the restored handler.
+        while True:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                break
+            except _AlarmInterrupt:
+                continue
         signal.signal(signal.SIGALRM, previous)
         # Restore the embedder's prior interval timer (re-arm its remaining
         # time); a (0.0, 0.0) prior disarms, as before.
