@@ -641,16 +641,52 @@ def test_no_alarm_sync_prefix_overrun_trips_before_await(monkeypatch):
     assert result.tokens_used == 0  # the returned awaitable was never awaited
 
 
-# -- cooperative-cancellation footgun (documented limitation) ---------------
+# -- seam's OWN TimeoutError is preserved, not conflated with ours ----------
 
 
-def test_async_kill_defeated_when_seam_swallows_cancellederror():
-    """A seam that swallows CancelledError defeats kill silently (no SeamTimeout).
+def test_seam_own_timeout_error_propagates_kill():
+    """An asyncio.TimeoutError raised BY the seam (before our deadline) must
+    propagate as-is, not be converted into SeamTimeout."""
 
-    Documents the cooperative-cancellation contract in TimeoutPolicy's docstring:
-    asyncio.wait_for cancels by raising CancelledError at the next await point; a
-    seam that catches it and returns a value is NOT killed.
-    """
+    async def act_raises_timeout(_ctx):
+        raise asyncio.TimeoutError("inner network timeout")
+
+    with pytest.raises(asyncio.TimeoutError, match="inner"):
+        asyncio.run(
+            async_run_loop(
+                act=act_raises_timeout,
+                verify=afast_verify,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=5.0, on_timeout=TIMEOUT_KILL),
+            )
+        )
+
+
+def test_seam_own_timeout_error_propagates_graceful():
+    """Even in graceful mode, the seam's own TimeoutError surfaces (the loop does
+    NOT swallow it as a synthetic timeout step and continue)."""
+
+    async def verify_raises_timeout(_outcome):
+        raise asyncio.TimeoutError("inner")
+
+    with pytest.raises(asyncio.TimeoutError, match="inner"):
+        asyncio.run(
+            async_run_loop(
+                act=acting(tokens=1),
+                verify=verify_raises_timeout,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(verify=5.0, on_timeout=TIMEOUT_GRACEFUL),
+            )
+        )
+
+
+# -- cooperative cancellation: kill wins even if the seam swallows CancelledError --
+
+
+def test_async_kill_wins_over_cancellederror_swallow():
+    """A seam that swallows CancelledError and returns is still killed: the
+    timeout is decided by the task being PENDING at the deadline, so SeamTimeout
+    is raised rather than the swallowed value being returned."""
 
     async def swallowing_act(_ctx):
         try:
@@ -659,14 +695,12 @@ def test_async_kill_defeated_when_seam_swallows_cancellederror():
             return ActOutcome(observation="swallowed", tokens=1)
         return ActOutcome(tokens=1)
 
-    result = asyncio.run(
-        async_run_loop(
-            act=swallowing_act,
-            verify=done_after(1),
-            conditions=[MaxIterations(5)],
-            timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
+    with pytest.raises(SeamTimeout):
+        asyncio.run(
+            async_run_loop(
+                act=swallowing_act,
+                verify=done_after(1),
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
+            )
         )
-    )
-    # Kill was defeated: the loop completed normally with the seam's return value.
-    assert result.succeeded is True
-    assert result.history[-1].observation == "swallowed"

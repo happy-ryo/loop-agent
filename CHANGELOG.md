@@ -28,10 +28,12 @@
     縛れない）、`kill` は呼び出し前に `UnsupportedTimeoutKill` を送出（縛れない hard kill
     を黙ってハングさせない）。per-call の締切は実 wall-clock 基準（`time_fn` は stop 条件
     用クロックのみに作用。post-hoc fallback だけ `time_fn` で計測）。
-  - **既知制限**: async の cancel は協調的（`CancelledError` を握り潰す seam は timeout を
-    無効化しうる）。`SIGALRM` は再入不可（呼び出し終了時に組み込み先の `ITIMER_REAL` は
-    復元する）。「同期ブロッキング→awaitable を返す」変則 seam は同期区間と await 区間で
-    締切が別々に効き合計最大 ~2 倍。詳細は [`docs/recipes/timeout-and-kill.md`](./docs/recipes/timeout-and-kill.md)。
+  - **既知制限**: async の cancel は協調的（締切時の task pending で判定するため
+    `CancelledError` 握り潰し seam でも kill は効き、seam 自身の `asyncio.TimeoutError` は
+    別物として伝播する。ただし握り潰した上で完了しない await は cancel cleanup でハング
+    しうる）。`SIGALRM` は再入不可（呼び出し終了時に組み込み先の `ITIMER_REAL` は復元）。
+    per-call 締切は同期区間＋await 区間で単一 budget（remaining を繰り越し）。詳細は
+    [`docs/recipes/timeout-and-kill.md`](./docs/recipes/timeout-and-kill.md)。
   - 既存の whole-run `Timeout` *stop 条件*（iteration 境界で累積 wall-clock を上限化、
     進行中 step は中断しない）とは別物。新規 export: `TimeoutPolicy` / `SeamTimeout` /
     `UnsupportedTimeoutKill` / `TIMEOUT_GRACEFUL` / `TIMEOUT_KILL` /

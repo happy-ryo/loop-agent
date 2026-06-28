@@ -152,14 +152,14 @@ class TimeoutPolicy:
     returns (best-effort), and ``kill`` raises :class:`UnsupportedTimeoutKill`
     rather than risk an unkillable hang.
 
-    **Async cancellation is cooperative.** ``asyncio.wait_for`` cancels by
-    raising :class:`asyncio.CancelledError` inside the seam at its next await
-    point. A well-behaved seam re-raises it (so the timeout fires); a seam that
-    *swallows* ``CancelledError`` and returns a value defeats the timeout
-    silently (no :class:`SeamTimeout`), and one that swallows it then awaits
-    something that never completes can hang the loop. Do not catch-and-ignore
-    ``CancelledError`` in a timed seam. (A blocking *synchronous* portion of an
-    ``async def`` seam is likewise uninterruptible until it next awaits.)
+    **Async cancellation is cooperative.** On timeout the seam's task is
+    cancelled (:class:`asyncio.CancelledError` is raised inside it at its next
+    await point) and a per-call timeout is reported regardless of how it reacts.
+    A seam that *swallows* ``CancelledError`` and then awaits something that
+    never completes can still hang the loop during cancellation cleanup, so do
+    not catch-and-ignore ``CancelledError`` in a timed seam. A blocking
+    *synchronous* portion of an ``async def`` seam is likewise uninterruptible
+    until it next awaits (the deadline is enforced at the await boundary).
 
     **Per-call budget.** Each ``act`` / ``verify`` invocation gets one deadline
     that spans its whole execution. For an unusual seam that does blocking
@@ -418,17 +418,35 @@ async def _run_seam(
         # Carry the single per-call budget into the await: subtract the time the
         # synchronous prefix already consumed. If it already exhausted the
         # deadline, trip now instead of giving the awaitable a fresh budget
-        # (a blocking sync prefix is not interruptible by wait_for anyway).
+        # (a blocking sync prefix is not interruptible anyway).
         remaining = seconds - (time_fn() - started)
         if remaining <= 0:
             close = getattr(result, "close", None)
             if close is not None:
                 close()
             raise _on_timeout(mode, seam, seconds)
-        try:
-            return await asyncio.wait_for(result, remaining)
-        except asyncio.TimeoutError:
+        # Drive the awaitable as a task and decide by whether it is still PENDING
+        # at the deadline -- distinguishing OUR per-call timeout from a
+        # `TimeoutError` the seam itself raises (e.g. an inner `asyncio.wait_for`
+        # around a network/tool call). `asyncio.wait_for` cannot tell these apart
+        # (both surface as `asyncio.TimeoutError`); `asyncio.wait` membership can.
+        task = asyncio.ensure_future(result)
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+        if not done:
+            # Our deadline expired while the seam was still running.
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # The seam's reaction to cancellation is moot -- we report a
+                # per-call timeout. A seam that swallows CancelledError and then
+                # awaits something that never completes can still hang here; do
+                # not catch-and-ignore CancelledError in a timed seam.
+                pass
             raise _on_timeout(mode, seam, seconds)
+        # The seam finished within the deadline: return its value, or re-raise
+        # its OWN exception (including an asyncio.TimeoutError it raised itself).
+        return task.result()
     return result
 
 
