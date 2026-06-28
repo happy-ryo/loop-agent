@@ -1,16 +1,18 @@
-"""Codex adapter (``loop_agent.adapters.codex``) の検証 (Issue #49)。
+"""Codex adapter (``loop_agent.adapters.codex``) の **固有** 検証 (Issue #49)。
 
-ClaudeCodeAct (PR #47) と完全同型。ここで確かめる命題:
+``act`` シーム 4 か条と ``ActResult`` の形(成功時の結果形 / ``failed`` セマンティクス /
+timeout・起動失敗の graceful / 予算計上 / Mock 契約 / auth 環境継承 / stdin 安全性)は
+全アダプタ横断の共通ハーネス ``tests/adapters/test_contract.py`` に移譲済み(stdin の
+DEVNULL 固定もそこで ``expects_devnull`` 経由で検証する)。ここには **Codex 固有** の
+挙動だけを残す:
 
-1. subprocess 成功時、応答テキストとトークンを載せた ``ActOutcome`` を返す。
-2. timeout 超過は例外ではなく ``failed=True`` の結果で graceful に返り、ループを
-   殺さない(境界の ``MaxIterations`` 等が効く)。
-3. token usage を JSONL ``turn.completed`` の ``usage`` / 正規表現フォールバックで
-   解析し、``state.tokens_used`` に積んで ``TokenBudget`` を効かせられる。Codex の
-   ``cached_input_tokens`` / ``reasoning_output_tokens`` は部分集合なので二重計上しない。
-4. :class:`MockCodexAct` が subprocess 無しで同じ ``act`` 契約を満たす。
-5. ``prompt_template`` のプレースホルダが context のフィールドで埋まる。
-6. プロンプトは ``--`` 区切りの後ろの位置引数に確定し、stdin は DEVNULL に固定される。
+1. ``build_command`` のフラグ組み立て(``codex exec`` / ``--json`` / ``-m`` / ``-c`` 等)。
+2. ``--json`` JSONL の応答本文抽出(item.completed / 直接 agent_message / delta /
+   last_agent_message、dotted/snake_case の揺れ)と ``error`` / ``*.failed`` の判定。
+3. token usage 解析(Codex は ``input+output`` のみ。cached/reasoning の部分集合を
+   二重計上しない / ``total_tokens`` フォールバック)。
+4. ``cwd`` の引き渡しと ``render_prompt`` 整形。
+5. 実 subprocess 経路(フェイク codex 実行ファイル)。
 """
 
 from __future__ import annotations
@@ -23,10 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from loop_agent import MaxIterations, TokenBudget, VerifyOutcome, run_loop
-
-# CodexAct / CodexResult / MockCodexAct はパッケージ公開 API から。
-from loop_agent.adapters import CodexAct, CodexResult, MockCodexAct, render_prompt
+from loop_agent.adapters import CodexAct, MockCodexAct, render_prompt
 
 # parse_tokens は codex サブモジュールから直接取る。``adapters.__init__`` が公開する
 # ``parse_tokens`` は claude_code 由来(全 *tokens* を合算)で、Codex の部分集合
@@ -50,15 +49,6 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
     return _runner
 
 
-def _timeout_runner(timeout_value: float = 600.0):
-    """常に :class:`subprocess.TimeoutExpired` を送出する runner。"""
-
-    def _runner(command, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_value)
-
-    return _runner
-
-
 # 実際の ``codex exec --json`` イベント列を模した JSONL。トークンは
 # input(100) + output(40) = 140 のみが総量(cached 60 / reasoning 10 は部分集合)。
 JSONL_OK = "\n".join(
@@ -72,22 +62,7 @@ JSONL_OK = "\n".join(
 )
 
 
-# -- 1. subprocess 成功時の ActOutcome ------------------------------------
-
-
-def test_success_returns_actoutcome_with_text_and_tokens():
-    runner = _completed(stdout=JSONL_OK, returncode=0)
-    act = CodexAct(runner=runner)
-
-    outcome = act({"prompt": "fix the bug"})
-
-    assert outcome.tokens == 140  # input 100 + output 40(部分集合は加えない)
-    result = outcome.observation
-    assert isinstance(result, CodexResult)
-    assert result.failed is False
-    assert result.text == "done fixing"
-    assert result.returncode == 0
-    assert str(result) == "done fixing"  # __str__ は本文を返す
+# -- 1. build_command(Codex 固有フラグ) ------------------------------------
 
 
 def test_build_command_includes_all_flags():
@@ -121,14 +96,7 @@ def test_build_command_minimal_omits_optional_flags():
     assert cmd[-2:] == ["--", "p"]
 
 
-def test_nonzero_exit_is_failed():
-    runner = _completed(stdout="", stderr="boom", returncode=2)
-    act = CodexAct(runner=runner)
-
-    result = act({"prompt": "x"}).observation
-    assert result.failed is True
-    assert result.returncode == 2
-    assert "boom" in result.error
+# -- 2. 応答本文抽出(JSONL スキーマの揺れ)と error/*.failed 判定 -----------
 
 
 def test_text_from_direct_agent_message_event():
@@ -188,19 +156,6 @@ def test_text_from_task_complete_last_agent_message():
     assert result.tokens == 6
 
 
-def test_snake_case_failed_event_marks_failed():
-    # snake_case の *_failed(turn_failed)もエラーとして拾う。
-    stream = "\n".join(
-        [
-            '{"type":"turn_failed","message":"boom"}',
-            '{"type":"turn_completed","usage":{"input_tokens":1,"output_tokens":0}}',
-        ]
-    )
-    result = CodexAct(runner=_completed(stdout=stream, returncode=0)).__call__({"prompt": "x"}).observation
-    assert result.failed is True
-    assert result.error == "boom"
-
-
 def test_consolidated_message_preferred_over_deltas():
     # delta と完全本文が両方あれば完全本文(item.completed)を優先する。
     stream = "\n".join(
@@ -212,6 +167,19 @@ def test_consolidated_message_preferred_over_deltas():
     )
     result = CodexAct(runner=_completed(stdout=stream)).__call__({"prompt": "x"}).observation
     assert result.text == "complete answer"
+
+
+def test_snake_case_failed_event_marks_failed():
+    # snake_case の *_failed(turn_failed)もエラーとして拾う。
+    stream = "\n".join(
+        [
+            '{"type":"turn_failed","message":"boom"}',
+            '{"type":"turn_completed","usage":{"input_tokens":1,"output_tokens":0}}',
+        ]
+    )
+    result = CodexAct(runner=_completed(stdout=stream, returncode=0)).__call__({"prompt": "x"}).observation
+    assert result.failed is True
+    assert result.error == "boom"
 
 
 def test_error_event_marks_failed_even_on_zero_exit():
@@ -272,15 +240,6 @@ def test_error_message_fallback_to_exit_code_when_all_empty():
     assert result.error == "exit=3"
 
 
-def test_stdin_is_devnull_and_command_passed():
-    runner = _completed(stdout=JSONL_OK)
-    act = CodexAct(runner=runner)
-    act({"prompt": "hi"})
-    sent_command, kwargs = runner.calls[-1]
-    assert kwargs["stdin"] == subprocess.DEVNULL  # codex の stdin 誤読/ハング防止
-    assert sent_command[-2:] == ["--", "hi"]
-
-
 def test_cwd_is_passed_to_subprocess():
     runner = _completed(stdout=JSONL_OK)
     act = CodexAct(cwd="/tmp/work", runner=runner)
@@ -289,46 +248,7 @@ def test_cwd_is_passed_to_subprocess():
     assert kwargs["cwd"] == "/tmp/work"
 
 
-# -- 2. timeout は graceful(例外を投げない)--------------------------------
-
-
-def test_timeout_returns_failed_without_raising():
-    act = CodexAct(timeout=0.01, runner=_timeout_runner(0.01))
-
-    outcome = act({"prompt": "long task"})  # 例外が漏れないこと自体が検証点
-
-    assert outcome.tokens == 0
-    result = outcome.observation
-    assert result.failed is True
-    assert "timeout" in result.error
-
-
-def test_timeout_does_not_kill_the_loop():
-    # timeout が続いても run_loop は MaxIterations で必ず止まる。
-    act = CodexAct(timeout=0.01, runner=_timeout_runner(0.01))
-
-    def verify(outcome):
-        return VerifyOutcome(goal_met=not outcome.observation.failed)
-
-    result = run_loop(
-        act=act,
-        verify=verify,
-        gather=lambda state: {"prompt": "keep trying"},
-        conditions=[MaxIterations(3)],
-    )
-    assert result.status == "stopped"
-    assert result.stop.name == "max_iterations"
-    assert result.iterations == 3
-
-
-def test_missing_executable_is_graceful():
-    act = CodexAct(codex_bin="codex-does-not-exist-xyz")
-    outcome = act({"prompt": "x"})
-    assert outcome.observation.failed is True
-    assert "could not launch" in outcome.observation.error
-
-
-# -- 3. token usage パース --------------------------------------------------
+# -- 3. token usage パース(Codex は input+output のみ; 部分集合を除外) -------
 
 
 def test_parse_tokens_from_jsonl_usage():
@@ -389,80 +309,7 @@ def test_parse_tokens_fallback_prefers_stdout_and_does_not_sum_across_sources():
     assert parse_tokens("", stderr) == 40
 
 
-def test_tokens_accumulate_into_token_budget():
-    # 1 反復 1200 tokens。予算 2000 なら 2 反復目を始めず止まる
-    # (TokenBudget は境界評価: 1200 -> 2400 で次の guard が発火)。
-    mock = MockCodexAct(responses=[{"text": "step", "tokens": 1200}])
-
-    result = run_loop(
-        act=mock,
-        verify=lambda o: VerifyOutcome(goal_met=False),
-        gather=lambda s: {"prompt": "go"},
-        conditions=[TokenBudget(2000), MaxIterations(100)],
-    )
-    assert result.stop.name == "token_budget"
-    assert result.tokens_used == 2400  # 2 反復計上後に境界で停止
-    assert result.iterations == 2
-
-
-# -- 4. MockCodexAct -------------------------------------------------------
-
-
-def test_mock_cycles_then_sticks_to_last():
-    mock = MockCodexAct(responses=["first", {"text": "second", "tokens": 5}])
-    a = mock({"prompt": "p1"})
-    b = mock({"prompt": "p2"})
-    c = mock({"prompt": "p3"})  # 使い切ったら最後に張り付く
-
-    assert a.observation.text == "first"
-    assert b.observation.text == "second" and b.tokens == 5
-    assert c.observation.text == "second"
-    assert mock.prompts == ["p1", "p2", "p3"]
-
-
-def test_mock_failed_response_drives_verify():
-    mock = MockCodexAct(responses=[{"failed": True, "error": "nope"}])
-    outcome = mock({"prompt": "x"})
-    assert outcome.observation.failed is True
-    assert outcome.observation.error == "nope"
-
-
-def test_mock_requires_at_least_one_response():
-    with pytest.raises(ValueError):
-        MockCodexAct(responses=[])
-
-
-def test_mock_rejects_unsupported_response_type():
-    with pytest.raises(TypeError):
-        MockCodexAct(responses=[object()])
-
-
-def test_mock_reaches_goal_through_run_loop():
-    mock = MockCodexAct(responses=["work", "work", "done"])
-
-    def verify(outcome):
-        met = outcome.observation.text == "done"
-        return VerifyOutcome(goal_met=met)
-
-    result = run_loop(
-        act=mock,
-        verify=verify,
-        gather=lambda s: {"prompt": "iterate"},
-        conditions=[MaxIterations(10)],
-    )
-    assert result.goal_met is True
-    assert result.iterations == 3
-
-
-# -- 5. prompt placeholder -------------------------------------------------
-
-
-def test_placeholder_reaches_the_command():
-    runner = _completed(stdout=JSONL_OK)
-    act = CodexAct(prompt_template="fix iter {iteration}", runner=runner)
-    act({"iteration": 7})
-    sent_command = runner.calls[-1][0]
-    assert sent_command[-1] == "fix iter 7"
+# -- 4. render_prompt / Mock のプレースホルダ整形 ----------------------------
 
 
 def test_mock_renders_prompt_template():
@@ -479,7 +326,7 @@ def test_render_prompt_missing_field_raises_helpful_error():
     assert "iteration" in msg  # 使えるフィールドを示す
 
 
-# -- 実 subprocess 経路(フェイク codex 実行ファイル)----------------------
+# -- 5. 実 subprocess 経路(フェイク codex 実行ファイル) -------------------
 
 
 def _write_fake_codex(tmp_path: Path, body: str) -> str:

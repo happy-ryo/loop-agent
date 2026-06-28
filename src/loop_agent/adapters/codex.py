@@ -50,9 +50,20 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Union
 
 from ..loop import ActOutcome
-# render_prompt はアダプタ共通の汎用ユーティリティ(context のフィールドで
-# prompt_template を埋める)。同一サブパッケージから再利用し重複を避ける。
-from .claude_code import Runner, render_prompt
+# 結果の形・プロンプト整形・Runner シームはアダプタ共通の土台(base)に集約済み。
+# ``render_prompt`` / ``Runner`` は base から直接参照する(claude_code 経由の
+# re-import を避け、依存をフラットに保つ)。``render_prompt`` は本モジュール名前空間
+# にも再公開して既存の ``adapters.codex.render_prompt`` 参照を壊さない(後方互換)。
+from .base import ActResultBase, Runner, render_prompt
+
+__all__ = [
+    "CodexAct",
+    "CodexResult",
+    "MockCodexAct",
+    "Runner",
+    "parse_tokens",
+    "render_prompt",
+]
 
 # Mock の各応答に許す形。str はそのまま応答テキスト、dict は CodexResult の
 # フィールド、CodexResult はそのまま使う。
@@ -60,26 +71,16 @@ MockResponse = Union[str, Mapping[str, Any], "CodexResult"]
 
 
 @dataclass
-class CodexResult:
+class CodexResult(ActResultBase):
     """1 回の Codex 呼び出しの構造化結果(``ActOutcome.observation`` に載る)。
 
-    ``ActOutcome`` 自体は ``failed`` を持たないため、成否や生出力といった
-    「verify が判断に使いたい情報」はこの観測オブジェクトに集約する。
-    ``str(result)`` は応答テキスト(``text``)を返すので、テキストとして直接
-    扱う既存コードとも素直に繋がる(:class:`ClaudeCodeResult` と同型)。
+    :class:`~loop_agent.adapters.base.ActResultBase` を継承し 8 フィールド
+    (``text`` / ``tokens`` / ``failed`` / ``returncode`` / ``error`` / ``stdout`` /
+    ``stderr`` / ``command``)と ``__str__`` をそのまま受け継ぐ。``str(result)`` は
+    応答テキスト(``text``)を返すので、テキストとして直接扱う既存コードとも素直に
+    繋がる(:class:`~loop_agent.adapters.claude_code.ClaudeCodeResult` と同型で
+    :class:`~loop_agent.adapters.base.ActResult` 契約に適合)。
     """
-
-    text: str = ""
-    tokens: int = 0
-    failed: bool = False
-    returncode: Optional[int] = None
-    error: str = ""
-    stdout: str = ""
-    stderr: str = ""
-    command: tuple[str, ...] = ()
-
-    def __str__(self) -> str:  # テキストとして使われたとき応答本文を返す。
-        return self.text
 
 
 def _iter_json_events(text: str) -> "list[dict[str, Any]]":

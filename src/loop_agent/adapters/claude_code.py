@@ -30,15 +30,25 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional, Sequence, Union
 
 from ..loop import ActOutcome
 
-# subprocess.run 互換の実行関数シーム(テストで差し替えるための注入点)。
-# capture_output / text / timeout / env / cwd を受け取り、
-# ``returncode`` / ``stdout`` / ``stderr`` を持つオブジェクトを返す。
-Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+# 結果の形・プロンプト整形・Runner シームはアダプタ共通の土台(base)に集約済み。
+# ここからは「Claude Code 固有の差分」(subprocess コマンド/フラグ/token 解析)だけを
+# 定義する。``render_prompt`` / ``Runner`` を本モジュール名前空間にも再公開して
+# 既存の ``adapters.claude_code.render_prompt`` 参照を壊さない(後方互換)。
+from .base import ActResultBase, Runner, render_prompt
+
+__all__ = [
+    "ClaudeCodeAct",
+    "ClaudeCodeResult",
+    "MockClaudeCodeAct",
+    "Runner",
+    "parse_tokens",
+    "render_prompt",
+]
 
 # Mock の各応答に許す形。str はそのまま応答テキスト、dict は ClaudeCodeResult の
 # フィールド、ClaudeCodeResult はそのまま使う。
@@ -46,67 +56,16 @@ MockResponse = Union[str, Mapping[str, Any], "ClaudeCodeResult"]
 
 
 @dataclass
-class ClaudeCodeResult:
+class ClaudeCodeResult(ActResultBase):
     """1 回の Claude Code 呼び出しの構造化結果(``ActOutcome.observation`` に載る)。
 
-    ``ActOutcome`` 自体は ``failed`` を持たないため、成否や生出力といった
-    「verify が判断に使いたい情報」はこの観測オブジェクトに集約する。
-    ``str(result)`` は応答テキスト(``text``)を返すので、テキストとして直接
-    扱う既存コードとも素直に繋がる。
+    :class:`~loop_agent.adapters.base.ActResultBase` を継承し 8 フィールド
+    (``text`` / ``tokens`` / ``failed`` / ``returncode`` / ``error`` / ``stdout`` /
+    ``stderr`` / ``command``)と ``__str__`` をそのまま受け継ぐ。``str(result)`` は
+    応答テキスト(``text``)を返すので、テキストとして直接扱う既存コードとも素直に
+    繋がる。:class:`~loop_agent.adapters.codex.CodexResult` と同型
+    (:class:`~loop_agent.adapters.base.ActResult` 契約に適合)。
     """
-
-    text: str = ""
-    tokens: int = 0
-    failed: bool = False
-    returncode: Optional[int] = None
-    error: str = ""
-    stdout: str = ""
-    stderr: str = ""
-    command: tuple[str, ...] = ()
-
-    def __str__(self) -> str:  # テキストとして使われたとき応答本文を返す。
-        return self.text
-
-
-def _format_fields(context: Any) -> dict[str, Any]:
-    """``prompt_template.format(**...)`` に渡す名前付きフィールドを context から作る。
-
-    - Mapping -> そのままのキー(``{"prompt": ...}`` など)
-    - dataclass(例: :class:`~loop_agent.state.LoopState`)-> 各フィールド名
-      (``iteration`` / ``tokens_used`` / ``elapsed`` ... をテンプレートに埋められる)
-    - str -> ``{"prompt": <その文字列>}``(プロンプト直渡しの最短経路)
-    - それ以外で ``__dict__`` を持つ -> その属性
-    - 最後の保険 -> ``{"prompt": <context>}``
-    """
-    if isinstance(context, Mapping):
-        return dict(context)
-    if is_dataclass(context) and not isinstance(context, type):
-        return {f.name: getattr(context, f.name) for f in fields(context)}
-    if isinstance(context, str):
-        return {"prompt": context}
-    if hasattr(context, "__dict__"):
-        return dict(vars(context))
-    return {"prompt": context}
-
-
-def render_prompt(template: str, context: Any) -> str:
-    """``template`` を context のフィールドで埋めて最終プロンプト文字列を返す。
-
-    テンプレートが context に無いフィールドを参照していた場合は、何が無くて何が
-    使えるのかを示す :class:`KeyError` を送出する(既定の ``"{prompt}"`` に対して
-    ``prompt`` を渡し忘れた、といった取り違えをすぐ気付けるようにする)。
-    """
-    field_map = _format_fields(context)
-    try:
-        return template.format(**field_map)
-    except KeyError as exc:  # .format は欠落キーを KeyError(key) で投げる。
-        missing = exc.args[0] if exc.args else exc
-        raise KeyError(
-            f"prompt_template {template!r} references {missing!r}, "
-            f"not present in context fields {sorted(field_map)}; "
-            "supply it via the gather hook (e.g. gather=lambda s: {'prompt': ...}) "
-            "or adjust prompt_template to the available fields"
-        ) from exc
 
 
 def _sum_token_fields(usage: Mapping[str, Any]) -> int:

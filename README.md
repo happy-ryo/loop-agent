@@ -976,6 +976,8 @@ act = MockCodexAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 | 失敗時 | `failed=True` を観測に載せて graceful（例外なし） | 同左 |
 | Mock | `MockClaudeCodeAct(responses=[...])` | `MockCodexAct(responses=[...])` |
 
+両者は結果の形（8 フィールド）とプロンプト整形を共通土台 `loop_agent.adapters.base`（`ActResult` 契約 / `ActResultBase` / `render_prompt` / `Runner`）に集約していて、差分は subprocess コマンド・フラグ・token/output 解析だけ。**3 つ目以降のアダプタ（例 `GeminiAct`）を同じ契約で書く手引き**は [docs/adapters/writing-an-adapter.md](./docs/adapters/writing-an-adapter.md)（4 か条の契約 / `ActResult` の形 / token 二重計上の回避 / hard-won lessons / 共通テストハーネスへの登録 / 追加チェックリスト）。
+
 ### テスト
 
 ```bash
