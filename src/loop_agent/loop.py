@@ -155,12 +155,15 @@ class TimeoutPolicy:
 
     **Async cancellation is cooperative.** On timeout the seam's task is
     cancelled (:class:`asyncio.CancelledError` is raised inside it at its next
-    await point) and a per-call timeout is reported regardless of how it reacts.
-    A seam that *swallows* ``CancelledError`` and then awaits something that
-    never completes can still hang the loop during cancellation cleanup, so do
-    not catch-and-ignore ``CancelledError`` in a timed seam. A blocking
-    *synchronous* portion of an ``async def`` seam is likewise uninterruptible
-    until it next awaits (the deadline is enforced at the await boundary).
+    await point) and a per-call timeout is reported immediately, without blocking
+    on the task's cleanup -- so the deadline reliably bounds the call even if the
+    seam *swallows* ``CancelledError``. Such a seam is merely left running as an
+    orphaned background task (it is not awaited again); a seam that swallows
+    cancellation and then never completes therefore leaks a background task,
+    rather than hanging the loop, so do not catch-and-ignore ``CancelledError``
+    in a timed seam. A blocking *synchronous* portion of an ``async def`` seam is
+    likewise uninterruptible until it next awaits (the deadline is enforced at
+    the await boundary).
 
     **Per-call budget.** Each ``act`` / ``verify`` invocation gets one deadline
     that spans its whole execution. For an unusual seam that does blocking
@@ -354,6 +357,22 @@ def _on_timeout(mode: str, seam: str, seconds: float) -> Exception:
     return _GracefulTimeout(seam, seconds)
 
 
+def _discard_task_outcome(task: "asyncio.Future[Any]") -> None:
+    """Retrieve and drop an abandoned (timed-out, cancelled) seam task's outcome.
+
+    Attached as a done-callback to a seam task the loop abandoned on timeout, so
+    its eventual result or exception is consumed -- no "exception was never
+    retrieved" / "task was destroyed but it is pending" warnings -- *without* the
+    loop blocking on the task's cancellation cleanup (which a misbehaving seam
+    could stall indefinitely).
+    """
+    if not task.cancelled():
+        # Accessing exception() marks any stored exception retrieved; the value
+        # (or lack of one) is intentionally discarded -- we already reported the
+        # per-call timeout.
+        task.exception()
+
+
 async def _run_seam(
     fn: Callable[[Any], Any],
     arg: Any,
@@ -447,16 +466,14 @@ async def _run_seam(
         task = asyncio.ensure_future(result)
         done, _pending = await asyncio.wait({task}, timeout=remaining)
         if not done:
-            # Our deadline expired while the seam was still running.
+            # Our deadline expired while the seam was still running. Request
+            # cancellation but do NOT block on its cleanup -- a seam that swallows
+            # CancelledError and then hangs (or runs slow teardown) must not
+            # defeat the per-call timeout. Report the timeout now; a done-callback
+            # consumes the orphaned task's eventual outcome so asyncio does not
+            # warn. (Do not catch-and-ignore CancelledError in a timed seam.)
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                # The seam's reaction to cancellation is moot -- we report a
-                # per-call timeout. A seam that swallows CancelledError and then
-                # awaits something that never completes can still hang here; do
-                # not catch-and-ignore CancelledError in a timed seam.
-                pass
+            task.add_done_callback(_discard_task_outcome)
             raise _on_timeout(mode, seam, seconds)
         # The seam finished within the deadline: return its value, or re-raise
         # its OWN exception (including an asyncio.TimeoutError it raised itself).

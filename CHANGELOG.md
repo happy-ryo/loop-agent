@@ -31,9 +31,10 @@
     を黙ってハングさせない）。per-call の締切は実 wall-clock 基準（`time_fn` は stop 条件
     用クロックのみに作用。post-hoc fallback だけ `time_fn` で計測）。
   - **既知制限**: async の cancel は協調的（締切時の task pending で判定するため
-    `CancelledError` 握り潰し seam でも kill は効き、seam 自身の `asyncio.TimeoutError` は
-    別物として伝播する。ただし握り潰した上で完了しない await は cancel cleanup でハング
-    しうる）。`SIGALRM` は再入不可（呼び出し終了時に組み込み先の `ITIMER_REAL` は復元）。
+    `CancelledError` 握り潰し seam でも kill は効き、cleanup を待たず即報告するのでループは
+    ハングしない＝握り潰して完了しない seam は orphan task としてリークするのみ。seam 自身の
+    `asyncio.TimeoutError` は別物として伝播）。`SIGALRM` は再入不可（呼び出し終了時に
+    組み込み先の `ITIMER_REAL` は復元）。
     per-call 締切は同期区間＋await 区間で単一 budget（remaining を繰り越し）。詳細は
     [`docs/recipes/timeout-and-kill.md`](./docs/recipes/timeout-and-kill.md)。
   - 既存の whole-run `Timeout` *stop 条件*（iteration 境界で累積 wall-clock を上限化、

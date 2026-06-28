@@ -725,3 +725,29 @@ def test_async_kill_wins_over_cancellederror_swallow():
                 timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
             )
         )
+
+
+def test_async_kill_bounds_despite_slow_cancellation_cleanup():
+    """The timeout reliably bounds the call: a seam that swallows CancelledError
+    and then runs slow cleanup must not delay SeamTimeout (we do not await its
+    cleanup)."""
+
+    async def stubborn_act(_ctx):
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            await asyncio.sleep(5.0)  # slow cleanup after swallowing cancellation
+            return ActOutcome(tokens=1)
+        return ActOutcome(tokens=1)
+
+    t0 = time.monotonic()
+    with pytest.raises(SeamTimeout):
+        asyncio.run(
+            async_run_loop(
+                act=stubborn_act,
+                verify=afast_verify,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=0.02, on_timeout=TIMEOUT_KILL),
+            )
+        )
+    assert time.monotonic() - t0 < 2.0  # not blocked on the 5s cleanup
