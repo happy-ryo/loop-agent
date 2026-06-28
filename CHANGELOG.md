@@ -21,8 +21,10 @@
     記録して **次 iteration** へ進む。`MaxIterations` / `Timeout` stop / マーカーへの
     `NoProgress` が timeout の連続を収束させる。`kill` は当該シームを cancel し
     `SeamTimeout` を **ループ外へ送出**する。
-  - **実機構とプラットフォーム差**: async シームは `asyncio.wait_for` で実際に cancel
-    （移植性あり）。sync シームは POSIX main thread の `SIGALRM`（`signal.setitimer`）で
+  - **実機構とプラットフォーム差**: async シームは asyncio の task cancel
+    （`asyncio.wait` + `task.cancel()`）で実際に cancel（移植性あり。締切時に task が
+    pending かで判定するので seam 自身の `asyncio.TimeoutError` とも混同しない）。
+    sync シームは POSIX main thread の `SIGALRM`（`signal.setitimer`）で
     実際に中断。`SIGALRM` 不在（Windows / 非 main thread）では sync シームを強制中断
     できないため、`graceful` は呼び出し **完了後** の超過検出（best-effort、hung call は
     縛れない）、`kill` は呼び出し前に `UnsupportedTimeoutKill` を送出（縛れない hard kill

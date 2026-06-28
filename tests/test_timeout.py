@@ -633,13 +633,16 @@ def test_sync_seam_own_exception_propagates_and_disarms_under_alarm():
 
 
 def test_no_alarm_sync_prefix_overrun_trips_before_await(monkeypatch):
-    """No-SIGALRM: a seam whose synchronous prefix blows the deadline before
-    returning an awaitable must trip immediately, not get a fresh wait_for budget."""
+    """No-SIGALRM: a seam whose synchronous prefix blows the (real wall-clock)
+    deadline before returning an awaitable trips immediately, not a fresh budget.
+
+    The prefix is measured on the real monotonic clock (not the injectable
+    time_fn), so this uses a small real sleep.
+    """
     monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
-    clock = ManualClock()
 
     def blocking_then_coro(_ctx):
-        clock.advance(10.0)  # synchronous prefix exceeds the 1.0s deadline
+        time.sleep(0.1)  # synchronous prefix exceeds the 0.02s deadline
 
         async def inner():
             return ActOutcome(observation="should-not-run", tokens=5)
@@ -651,8 +654,7 @@ def test_no_alarm_sync_prefix_overrun_trips_before_await(monkeypatch):
             act=blocking_then_coro,
             verify=afast_verify,
             conditions=[MaxIterations(2)],
-            time_fn=clock,
-            timeout=TimeoutPolicy(act=1.0, on_timeout=TIMEOUT_GRACEFUL),
+            timeout=TimeoutPolicy(act=0.02, on_timeout=TIMEOUT_GRACEFUL),
         )
     )
     assert result.iterations == 2

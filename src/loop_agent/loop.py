@@ -54,7 +54,7 @@ GATE_PAUSE = "pause"
 #             ループは返り続ける (例外を投げない)。stop 条件 (MaxIterations / Timeout /
 #             NoProgress) が次の guard で繰り返し timeout を捕捉・収束させる。
 #   kill    : 当該シームを cancel し、:class:`SeamTimeout` を **ループ外へ送出** する
-#             (LoopResult は返らない)。async シームは asyncio.wait_for で実際に cancel
+#             (LoopResult は返らない)。async シームは asyncio の task cancel で実際に cancel
 #             され、sync シームは POSIX main thread の SIGALRM で実際に中断される。
 TIMEOUT_GRACEFUL = "graceful"
 TIMEOUT_KILL = "kill"
@@ -73,9 +73,9 @@ class SeamTimeout(Exception):
     Raised *out of the loop* (so :func:`run_loop` / :func:`async_run_loop` does
     not return a :class:`LoopResult`) when ``act`` or ``verify`` overruns its
     configured :class:`TimeoutPolicy` deadline in hard-kill mode. For an async
-    seam the underlying coroutine has already been cancelled
-    (:func:`asyncio.wait_for`); for a synchronous seam on a POSIX main thread it
-    was interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
+    seam the underlying task has been cancelled (via :func:`asyncio.wait` +
+    ``task.cancel()``); for a synchronous seam on a POSIX main thread it was
+    interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
     ``seconds`` the deadline that was exceeded.
     """
 
@@ -96,7 +96,7 @@ class UnsupportedTimeoutKill(RuntimeError):
     that mechanism is unavailable, so a synchronous seam cannot be *guaranteed*
     to be interrupted -- a genuinely hung call would never return. Rather than
     silently hang, the driver refuses up front: use an async seam (cancelled via
-    :func:`asyncio.wait_for`, fully portable) or ``on_timeout="graceful"`` (which
+    the asyncio event loop, fully portable) or ``on_timeout="graceful"`` (which
     detects an overrun *after* the call returns; it cannot bound a hung call).
     """
 
@@ -144,8 +144,9 @@ class TimeoutPolicy:
     - :data:`TIMEOUT_KILL` -- cancel the call and raise :class:`SeamTimeout` out
       of the loop.
 
-    **Enforcement & platform limits.** An *async* seam is cancelled via
-    :func:`asyncio.wait_for` at the next await point. A *synchronous* seam is
+    **Enforcement & platform limits.** An *async* seam is cancelled via the
+    asyncio event loop (:func:`asyncio.wait` + ``task.cancel()``) at the next
+    await point. A *synchronous* seam is
     interrupted by POSIX ``SIGALRM`` on the main thread; where that is
     unavailable (Windows / non-main-thread), a hung sync call cannot be
     force-stopped: ``graceful`` then detects the overrun only *after* the call
@@ -176,7 +177,7 @@ class TimeoutPolicy:
     it expires and another process re-runs it (the crash-recovery path).
 
     **Clock.** The interrupting deadlines use the real wall clock
-    (``SIGALRM``/:func:`signal.setitimer` and :func:`asyncio.wait_for` both
+    (``SIGALRM``/:func:`signal.setitimer` and the :func:`asyncio.wait` budget both
     ignore the loop's injectable ``time_fn``); only the synchronous post-hoc
     fallback measures with ``time_fn``. So an injected ``time_fn`` steers the
     stop-condition clock, not the per-call interruption deadline.
@@ -366,23 +367,29 @@ async def _run_seam(
 
     Returns the seam's resolved result. On overrun raises :class:`SeamTimeout`
     (``mode == "kill"``) or :class:`_GracefulTimeout` (``"graceful"``). Async
-    results are bounded by :func:`asyncio.wait_for` (real cancellation);
-    synchronous calls by ``SIGALRM`` where available, else best-effort post-hoc
+    results are bounded by :func:`asyncio.wait` + ``task.cancel()`` (real
+    cancellation); synchronous calls by ``SIGALRM`` where available, else post-hoc
     detection (``graceful``) or :class:`UnsupportedTimeoutKill` (``kill``).
     Callers must ensure ``seconds`` is not ``None``.
 
     The deadline is a **single budget** across a call's synchronous and awaited
-    portions: the time already spent synchronously (the ``SIGALRM``-guarded
-    prefix, or the post-hoc-measured prefix on a no-SIGALRM platform) is
-    subtracted from the :func:`asyncio.wait_for` budget, and a synchronous prefix
-    that already exhausted the deadline trips immediately rather than handing the
-    returned awaitable a fresh budget.
+    portions: real wall-clock time already spent synchronously (the
+    ``SIGALRM``-guarded prefix, or a blocking prefix before an awaitable is
+    returned) is subtracted from the ``asyncio.wait`` budget, and a synchronous
+    prefix that already exhausted the deadline trips immediately rather than
+    handing the returned awaitable a fresh budget. The interrupting deadlines use
+    a real monotonic clock, *not* the injectable ``time_fn`` -- only the
+    no-SIGALRM post-hoc detection of a *completed synchronous* call measures with
+    ``time_fn`` (the documented, test-injectable fallback).
     """
-    started = time_fn()
+    # Real wall clock for the interrupting deadline (SIGALRM prefix + the awaited
+    # budget): asyncio.wait and SIGALRM both run on real time, so the remaining
+    # budget must too -- independent of an injected (possibly virtual) time_fn.
+    wall_start = time.monotonic()
     if _alarm_capable():
         # Guard the (possibly blocking) synchronous portion with SIGALRM. An
         # async seam returns its awaitable near-instantly here (no alarm), then
-        # is awaited under wait_for below.
+        # is awaited under asyncio.wait below.
         result, timed_out = _invoke_under_alarm(fn, arg, seconds)
         if timed_out:
             raise _on_timeout(mode, seam, seconds)
@@ -390,20 +397,22 @@ async def _run_seam(
         # No SIGALRM (Windows / non-main-thread): a synchronous call cannot be
         # interrupted. Refuse a hard kill we cannot guarantee *before* entering a
         # potentially unkillable call; an async seam stays interruptible via
-        # wait_for, so only an apparently-synchronous one is rejected.
+        # asyncio.wait, so only an apparently-synchronous one is rejected.
         if mode == TIMEOUT_KILL and not _looks_async(fn):
             raise UnsupportedTimeoutKill(
                 f"hard-kill timeout for synchronous seam {seam!r} requires POSIX "
                 "SIGALRM on the main thread, unavailable on this platform/thread; "
-                "use an async seam (cancelled via asyncio.wait_for) or "
+                "use an async seam (cancelled via asyncio.wait) or "
                 'on_timeout="graceful"'
             )
+        fn_start = time_fn()
         result = fn(arg)
         if not inspect.isawaitable(result):
             # graceful (kill on a sync seam was excluded above): the call already
-            # ran to completion -- detect an overrun after the fact. A genuinely
-            # hung call never reaches here (documented limitation).
-            if time_fn() - started >= seconds:
+            # ran to completion -- detect an overrun after the fact, measured with
+            # the injectable time_fn (the documented post-hoc fallback). A
+            # genuinely hung call never reaches here (documented limitation).
+            if time_fn() - fn_start >= seconds:
                 raise _on_timeout(mode, seam, seconds)
             return result
 
@@ -411,7 +420,7 @@ async def _run_seam(
         if driven_synchronously():
             # run_loop drives this synchronously: an awaitable seam is rejected
             # exactly as on the no-timeout path (maybe_await), pointing at
-            # async_run_loop instead of attempting wait_for without a loop.
+            # async_run_loop instead of attempting to await without a loop.
             close = getattr(result, "close", None)
             if close is not None:
                 close()
@@ -420,11 +429,11 @@ async def _run_seam(
                 "(act/verify/gather/condition/gate/on_step/on_complete); "
                 "use `await async_run_loop(...)` for async seams"
             )
-        # Carry the single per-call budget into the await: subtract the time the
-        # synchronous prefix already consumed. If it already exhausted the
-        # deadline, trip now instead of giving the awaitable a fresh budget
-        # (a blocking sync prefix is not interruptible anyway).
-        remaining = seconds - (time_fn() - started)
+        # Carry the single per-call budget into the await: subtract the real
+        # wall-clock time the synchronous prefix already consumed. If it already
+        # exhausted the deadline, trip now instead of giving the awaitable a fresh
+        # budget (a blocking sync prefix is not interruptible anyway).
+        remaining = seconds - (time.monotonic() - wall_start)
         if remaining <= 0:
             close = getattr(result, "close", None)
             if close is not None:
@@ -739,7 +748,7 @@ async def async_run_loop(
             :data:`ACT_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`)
             and continues so the stop conditions bound a run of timeouts;
             ``kill`` raises :class:`SeamTimeout` out of the loop. An async seam is
-            cancelled via :func:`asyncio.wait_for`; a synchronous seam by POSIX
+            cancelled via the asyncio event loop; a synchronous seam by POSIX
             ``SIGALRM`` on the main thread -- where unavailable, ``graceful``
             falls back to best-effort post-hoc detection and ``kill`` raises
             :class:`UnsupportedTimeoutKill` (it cannot bound a hung sync call).
