@@ -508,8 +508,18 @@ async def _run_seam(
             task.cancel()
             task.add_done_callback(_discard_task_outcome)
             raise _on_timeout(mode, seam, seconds)
-        # The seam finished within the deadline: return its value, or re-raise
-        # its OWN exception (including an asyncio.TimeoutError it raised itself).
+        # The task completed -- but a seam that blocks the event loop (CPU work or
+        # time.sleep before its first await) can finish only *after* the deadline,
+        # since asyncio.wait could not run the timeout while the loop was blocked.
+        # Enforce the real-wall-clock deadline before accepting the result, so an
+        # over-budget call cannot bypass the timeout. Consume any stored exception
+        # first to avoid an "exception never retrieved" warning.
+        if time.monotonic() - wall_start >= seconds:
+            if not task.cancelled():
+                task.exception()
+            raise _on_timeout(mode, seam, seconds)
+        # Finished within the deadline: return its value, or re-raise its OWN
+        # exception (including an asyncio.TimeoutError it raised itself).
         return task.result()
     return result
 

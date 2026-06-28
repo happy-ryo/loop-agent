@@ -157,6 +157,51 @@ def test_async_verify_kill_raises_seam_timeout():
     assert exc.value.seam == "verify"
 
 
+# -- async seam that blocks the event loop past the deadline ----------------
+
+
+def test_async_seam_blocking_event_loop_past_deadline_kill():
+    """An async seam that blocks the loop (no await) past its budget is still a
+    timeout: asyncio.wait cannot fire while blocked, so the deadline is enforced
+    on the real elapsed time after the task completes."""
+
+    async def blocking_async(_ctx):
+        time.sleep(0.1)  # blocks the event loop before any await
+        return ActOutcome(tokens=1)
+
+    with pytest.raises(SeamTimeout) as exc:
+        asyncio.run(
+            async_run_loop(
+                act=blocking_async,
+                verify=afast_verify,
+                conditions=[MaxIterations(5)],
+                timeout=TimeoutPolicy(act=0.02, on_timeout=TIMEOUT_KILL),
+            )
+        )
+    assert exc.value.seam == "act"
+
+
+def test_async_seam_blocking_event_loop_past_deadline_graceful():
+    def make_blocking():
+        async def blocking_async(_ctx):
+            time.sleep(0.05)  # exceeds the 0.02s budget, blocking the loop
+            return ActOutcome(tokens=7)
+
+        return blocking_async
+
+    result = asyncio.run(
+        async_run_loop(
+            act=make_blocking(),
+            verify=afast_verify,
+            conditions=[MaxIterations(2)],
+            timeout=TimeoutPolicy(act=0.02, on_timeout=TIMEOUT_GRACEFUL),
+        )
+    )
+    assert result.iterations == 2
+    assert [r.observation for r in result.history] == [ACT_TIMEOUT_OBSERVATION] * 2
+    assert result.tokens_used == 0  # the over-budget result was discarded
+
+
 # -- async graceful (record synthetic step, continue) -----------------------
 
 
