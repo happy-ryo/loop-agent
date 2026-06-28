@@ -161,11 +161,12 @@ class TimeoutPolicy:
     ``CancelledError`` in a timed seam. (A blocking *synchronous* portion of an
     ``async def`` seam is likewise uninterruptible until it next awaits.)
 
-    **Per-call budget.** Each ``act`` / ``verify`` invocation gets its own
-    deadline. For an unusual seam that does blocking synchronous work *and then*
-    returns an awaitable, the synchronous portion (``SIGALRM``) and the awaited
-    portion (``wait_for``) are each bounded by the deadline separately -- up to
-    ~2x in total; use a plain ``async def`` for a single tight budget.
+    **Per-call budget.** Each ``act`` / ``verify`` invocation gets one deadline
+    that spans its whole execution. For an unusual seam that does blocking
+    synchronous work *and then* returns an awaitable, the time spent in the
+    synchronous prefix is subtracted from the awaited portion's budget (a prefix
+    that already exhausts the deadline trips immediately), so the total is bounded
+    by the single deadline -- not doubled.
 
     **Gate interaction.** Under ``graceful``, if a :class:`~loop_agent.gate.HumanGate`
     leased the action (``GATE_PROCEED`` with an ``on_complete``), the lease is
@@ -364,7 +365,15 @@ async def _run_seam(
     synchronous calls by ``SIGALRM`` where available, else best-effort post-hoc
     detection (``graceful``) or :class:`UnsupportedTimeoutKill` (``kill``).
     Callers must ensure ``seconds`` is not ``None``.
+
+    The deadline is a **single budget** across a call's synchronous and awaited
+    portions: the time already spent synchronously (the ``SIGALRM``-guarded
+    prefix, or the post-hoc-measured prefix on a no-SIGALRM platform) is
+    subtracted from the :func:`asyncio.wait_for` budget, and a synchronous prefix
+    that already exhausted the deadline trips immediately rather than handing the
+    returned awaitable a fresh budget.
     """
+    started = time_fn()
     if _alarm_capable():
         # Guard the (possibly blocking) synchronous portion with SIGALRM. An
         # async seam returns its awaitable near-instantly here (no alarm), then
@@ -384,7 +393,6 @@ async def _run_seam(
                 "use an async seam (cancelled via asyncio.wait_for) or "
                 'on_timeout="graceful"'
             )
-        started = time_fn()
         result = fn(arg)
         if not inspect.isawaitable(result):
             # graceful (kill on a sync seam was excluded above): the call already
@@ -407,8 +415,18 @@ async def _run_seam(
                 "(act/verify/gather/condition/gate/on_step/on_complete); "
                 "use `await async_run_loop(...)` for async seams"
             )
+        # Carry the single per-call budget into the await: subtract the time the
+        # synchronous prefix already consumed. If it already exhausted the
+        # deadline, trip now instead of giving the awaitable a fresh budget
+        # (a blocking sync prefix is not interruptible by wait_for anyway).
+        remaining = seconds - (time_fn() - started)
+        if remaining <= 0:
+            close = getattr(result, "close", None)
+            if close is not None:
+                close()
+            raise _on_timeout(mode, seam, seconds)
         try:
-            return await asyncio.wait_for(result, seconds)
+            return await asyncio.wait_for(result, remaining)
         except asyncio.TimeoutError:
             raise _on_timeout(mode, seam, seconds)
     return result

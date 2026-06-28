@@ -610,6 +610,37 @@ def test_sigalrm_restores_prior_itimer():
         signal.signal(signal.SIGALRM, prev_handler)
 
 
+# -- single budget: a sync prefix that overruns trips before awaiting --------
+
+
+def test_no_alarm_sync_prefix_overrun_trips_before_await(monkeypatch):
+    """No-SIGALRM: a seam whose synchronous prefix blows the deadline before
+    returning an awaitable must trip immediately, not get a fresh wait_for budget."""
+    monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
+    clock = ManualClock()
+
+    def blocking_then_coro(_ctx):
+        clock.advance(10.0)  # synchronous prefix exceeds the 1.0s deadline
+
+        async def inner():
+            return ActOutcome(observation="should-not-run", tokens=5)
+
+        return inner()
+
+    result = asyncio.run(
+        async_run_loop(
+            act=blocking_then_coro,
+            verify=afast_verify,
+            conditions=[MaxIterations(2)],
+            time_fn=clock,
+            timeout=TimeoutPolicy(act=1.0, on_timeout=TIMEOUT_GRACEFUL),
+        )
+    )
+    assert result.iterations == 2
+    assert [r.observation for r in result.history] == [ACT_TIMEOUT_OBSERVATION] * 2
+    assert result.tokens_used == 0  # the returned awaitable was never awaited
+
+
 # -- cooperative-cancellation footgun (documented limitation) ---------------
 
 
