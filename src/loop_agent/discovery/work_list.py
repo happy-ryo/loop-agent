@@ -81,9 +81,9 @@ class ScheduleContext:
 
     **``attempts`` と ``selections`` の違い**: ``attempts[id]`` は *実行された* 試行回数
     (per-item 上限 / done 判定 / ModelLadder 用)。``selections[id]`` はその item が *選ばれた*
-    回数で、``count_attempt`` で試行から外した非実行 offer (gate SKIP 等) も含む。**公平性は
-    ``selections`` で測る** -- skip された item も「一度 offer した」分だけ後ろへ回し、同じ item
-    を無限に再提示して他を starve させないため。``count_attempt`` を使わなければ両者は常に一致する。
+    (offer された) 回数で、``item_of`` が非実行 (``None``) とした offer (gate SKIP 等) も含む。
+    **公平性は ``selections`` で測る** -- skip された item も「一度 offer した」分だけ後ろへ回し、
+    同じ item を無限に再提示して他を starve させないため。``item_of`` を使わなければ両者は一致する。
     """
 
     selectable: tuple[WorkItem, ...]
@@ -104,16 +104,17 @@ ContextBuilder = Callable[[WorkItem, int, LoopState], Any]
 # 「*この item* は終わったか」を判定する user policy (verify とは独立)。
 DonePredicate = Callable[[WorkItem, StepRecord], bool]
 
-# その history record を「実行された 1 回の試行」として数えるか (gate SKIP 行の除外用)。
-AttemptPredicate = Callable[[StepRecord], bool]
+# その record が「実際にどの item を act した結果か」を返す (``None`` = 非実行 / 帰属なし)。
+# 既定 (``None`` フック) は schedule リプレイで「選んだ item == act した item」と見なす。
+ItemAttributor = Callable[[StepRecord], Optional[str]]
 
 
 def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
     """選択回数最小 -> 元の並び順。#37 PoC と同じ公平戦略 (round-robin 相当)。
 
-    公平性は ``selections`` (offer 回数) で測る。``count_attempt`` を使わなければ
-    ``selections == attempts`` なので「試行回数最小」と一致する。gate SKIP 等で試行から
-    外した offer も後ろへ回るので、skip され続ける item が他を starve させない。
+    公平性は ``selections`` (offer 回数) で測る。``item_of`` を使わなければ
+    ``selections == attempts`` なので「試行回数最小」と一致する。gate SKIP 等で非実行とした
+    offer も後ろへ回るので、skip され続ける item が他を starve させない。
     """
     return min(
         ctx.selectable, key=lambda it: (ctx.selections[it.id], ctx.position[it.id])
@@ -123,9 +124,9 @@ def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
 def _strat_fifo(ctx: ScheduleContext) -> WorkItem:
     """元の並び順で最初の未完 item (素朴な戦略; per-item 上限と併用で starve を緩和)。
 
-    公平性カウンタを持たない素朴版なので、``count_attempt`` で試行から外した offer に対しては
-    rotate しない (skip された先頭 item を offer し続ける)。gate と合成して skip を試行から
-    外す場合は ``fewest_attempts`` / ``round_robin`` を使うこと。
+    公平性カウンタを持たない素朴版なので、``item_of`` で非実行とした offer に対しては
+    rotate しない (skip された先頭 item を offer し続ける)。gate と合成して skip を非実行に
+    する場合は ``fewest_attempts`` / ``round_robin`` を使うこと。
     """
     return min(ctx.selectable, key=lambda it: ctx.position[it.id])
 
@@ -278,14 +279,17 @@ class WorkListGather:
             試行回数でモデルを上げる、等に使える。既定は JSON ネイティブ dict ``{"id", "attempt",
             "priority", "payload"}`` を返す (永続人間ゲートと合成しても state.db に保存できるよう
             JSON ネイティブにしてある)。
-        count_attempt: history の各 record を「実行された 1 回の試行」として数えるかの
-            ``(record) -> bool`` 判定。既定 ``None`` は **全 record を試行として数える** (gate
-            無しの標準ループでは history は全て実行済み step なので正しい)。``gate`` が
-            ``GATE_SKIP`` (reject/respond) を返す構成では ``act`` を呼ばない非実行 step が
-            history に積まれる -- それを試行から外すには、skip 行を見分ける述語を渡す
-            (例: skip の ``observation`` / ``detail`` に印を付けておき ``count_attempt`` で読む)。
-            非実行 record は attempts に数えず ``done_when`` / per-item 上限の評価もしないので、
-            一度も走っていない item を上限で誤って *exhausted* にしない。
+        item_of: history の各 record が「*実際に* どの item を ``act`` した結果か」を返す
+            ``(record) -> item_id | None`` フック。既定 ``None`` は schedule リプレイで
+            「offer した item == act した item」と見なす (gate 無しの標準 1:1 ループでは正しい)。
+            ``gate`` を合成して offer と record がずれる構成では渡す:
+            ``GATE_SKIP`` (reject/respond) は ``act`` せず record だけ積むので ``None`` を返して
+            非実行にする; ``edit`` で別 item に差し替えると record はその item のものなので、
+            record (例: ``observation`` に焼いた item id) から実 item を返す。``None`` / work-list
+            外の id は実行として数えず attempts / done / per-item 上限を更新しない -- 走っていない
+            item を誤って *exhausted* にしたり、別 item の record を取り違えたりしないため (#56
+            review)。**公平性 (offer 回数) は schedule で測る** ので、``item_of`` が ``None`` を
+            返す skip でも offer は前進し、他 item へ rotate して starve を防ぐ。
 
     Raises:
         ValueError: item id が重複 / ``strategy`` が未知の文字列 / ``max_attempts_per_item < 1``。
@@ -299,7 +303,7 @@ class WorkListGather:
         max_attempts_per_item: Optional[int] = None,
         done_when: DonePredicate = _default_done,
         build_ctx: ContextBuilder = _default_build_ctx,
-        count_attempt: Optional[AttemptPredicate] = None,
+        item_of: Optional[ItemAttributor] = None,
     ) -> None:
         normalized: list[WorkItem] = [
             it if isinstance(it, WorkItem) else WorkItem(id=it) for it in items
@@ -330,7 +334,7 @@ class WorkListGather:
         self._max = max_attempts_per_item
         self._done_when = done_when
         self._build_ctx = build_ctx
-        self._count_attempt = count_attempt
+        self._item_of = item_of
 
     @property
     def items(self) -> tuple[WorkItem, ...]:
@@ -395,15 +399,20 @@ class WorkListGather:
         並び・構成が変わるので **過去の history を引き継がず、新しい ``LoopState`` で開始する**
         こと (triage が done 済みを除外し、新規 ready は試行 0 から始まるのが正しい挙動)。
 
-        gate の SKIP が non-executing な step 行を挟む構成 (gate が reject/respond) では、
-        その行は item を「選んだが act していない」。既定ではそれも 1 試行として数えるが、
-        ``count_attempt`` を渡せば非実行行を試行から外せる (選択回数 ``selections`` と rotation
-        基準は前進するが attempts / done / 上限は評価しない) -- 一度も走っていない item を
-        per-item 上限で誤って exhausted にしないため。公平性は ``selections`` (offer 回数) で
-        測るので、skip された item も後ろへ回り、``fewest_attempts`` / ``priority`` /
-        ``round_robin`` は同じ item を無限に再提示せず他へ rotate する (``fifo`` のみ素朴ゆえ
-        非 rotate)。標準の ``run_loop`` (gate 無し / skip しない gate) では history と dispatch が
-        1:1・``selections == attempts`` なので ``count_attempt`` は不要。
+        **offer と 帰属の分離**: ``selections`` (offer 回数) は schedule から決まり公平性を
+        駆動する。attempts / done / exhausted は record の *帰属先* item に付く。既定はこの二つを
+        同一視する (offer == act の 1:1 ループ)。gate が間に入って両者がずれる構成では:
+
+        - ``GATE_SKIP`` (reject/respond) -- ``act`` せず record を積む。``item_of`` が ``None`` を
+          返せば非実行として attempts に数えない (offer は前進するので公平に rotate する)。
+        - ``edit`` -- 別 item の context に差し替えて ``act`` する。record はその item のものなので、
+          ``item_of`` で record から実 item を読めば正しい item に帰属する (offer した元 item は
+          実行ゼロのまま)。``item_of`` を渡さないと record を offer した item に誤帰属する。
+
+        公平性は ``selections`` で測るので、skip された item も後ろへ回り ``fewest_attempts`` /
+        ``priority`` / ``round_robin`` は同じ item を無限に再提示しない (``fifo`` のみ素朴ゆえ
+        非 rotate)。標準の ``run_loop`` (gate 無し / skip も edit もしない gate) では offer と
+        record が 1:1・``selections == attempts`` なので ``item_of`` は不要。
         """
         attempts: dict[str, int] = {it.id: 0 for it in self._items}
         selections: dict[str, int] = {it.id: 0 for it in self._items}
@@ -412,25 +421,29 @@ class WorkListGather:
         last_selected: Optional[str] = None
 
         for record in state.history:
+            # sel = gather が *offer* した item (schedule から)。selectable が尽きた後も
+            # history が続く場合 (本 gatherer 由来でない step / 全 drained 後の余剰) は帰属しない。
             sel = self._select_id(attempts, selections, done, exhausted, last_selected)
             if sel is None:
-                # selectable が尽きた後も history が続く -- 本 gatherer 由来でない step か、
-                # 全 item drained 後の余剰。これ以上の帰属はしない。
                 break
-            # gather は item を選んだので「選択回数」と rotation 基準は前進させる。これが公平性を
-            # 駆動するので、非実行 (skip) でも前進させて同じ item を無限に再提示しない。
+            # offer は必ず前進させる -- 公平性 (selections) と round_robin の rotation 基準。
+            # 非実行 (skip) でも前進させるので、skip され続ける item が他を starve させない。
             selections[sel] += 1
             last_selected = sel
-            if self._count_attempt is not None and not self._count_attempt(record):
-                # 非実行の record (例: gate SKIP で act せず append された行)。選ばれはしたが
-                # 試行ではないので attempts を増やさず done/exhausted も評価しない -- 一度も
-                # 走っていない item を per-item 上限で誤って exhausted にしないため (#56 review)。
+            # 帰属 = この record が *実際に act した* item。既定 (item_of=None) は「offer した
+            # item == act した item」(標準の 1:1 ループ)。gate が SKIP (item 無し) / EDIT
+            # (別 item へ差し替え) する構成では offer と record がずれるので、item_of で record
+            # から実 item を読む (None=非実行)。これで attempts/done/exhausted を正しい item に
+            # 付け、走っていない item を上限で誤 exhausted にしない (#56 review)。
+            actual = sel if self._item_of is None else self._item_of(record)
+            if actual is None or actual not in self._by_id:
+                # 非実行 (skip) か、本 work-list 外の id への edit -- 実行として数えない。
                 continue
-            attempts[sel] += 1
-            if self._done_when(self._by_id[sel], record):
-                done.add(sel)
-            elif self._max is not None and attempts[sel] >= self._max:
-                exhausted.add(sel)
+            attempts[actual] += 1
+            if self._done_when(self._by_id[actual], record):
+                done.add(actual)
+            elif self._max is not None and attempts[actual] >= self._max:
+                exhausted.add(actual)
 
         selectable = self._selectable(done, exhausted)
         return _Derivation(
