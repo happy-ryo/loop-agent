@@ -27,8 +27,8 @@ from loop_agent.adapters import (
     MockCodexAct,
 )
 
-# parse_tokens は **アダプタごとに意味論が違う**(claude は全 *tokens* を合算、
-# codex は input+output のみで部分集合を除外)ため、共通 __init__ の再公開ではなく
+# parse_tokens は **アダプタごとに意味論が違う**(claude は input+output+cache_creation
+# を計上し cache_read を除外、codex は input+output のみで部分集合を除外)ため、共通 __init__ の再公開ではなく
 # 各サブモジュールから直接取る。token 二重計上ガードはこの差を固定する。
 from loop_agent.adapters.claude_code import parse_tokens as claude_parse_tokens
 from loop_agent.adapters.codex import parse_tokens as codex_parse_tokens
@@ -81,8 +81,8 @@ class AdapterSpec:
         success_text: ``success_stdout`` から取り出されるべき応答本文。
         success_tokens: ``success_stdout`` から計上されるべきトークン総数。
         token_guard_stdout: **素朴な合算なら過大計上されうる** usage サンプル
-            (codex は部分集合キー cached/reasoning を含み、claude は全種別の
-            加算バケットを含む。アダプタごとに「足し方を間違えると総量がずれる」形)。
+            (codex は部分集合キー cached/reasoning を含み、claude は除外対象の
+            cache_read を巨大値で含む。アダプタごとに「足し方を間違えると総量がずれる」形)。
         token_guard_expected: そのアダプタの意味論で正しいトークン総数
             (二重計上していたら不一致になる; Issue #55 の bug class を catch)。
         expects_devnull: ``__call__`` が ``stdin=DEVNULL`` を渡すべきか
@@ -107,14 +107,24 @@ class AdapterSpec:
         return self.act_cls(**kwargs)
 
 
-# Claude Code: usage の input/output/cache_creation/cache_read は互いに素な加算
-# バケットなので総量は全合算(100+40+10+5=155)。token_guard も同じ payload で
-# 「cache 系を *含めて* 合算する」という claude の意味論を固定する。
+# Claude Code: usage の input/output/cache_creation は計上するが cache_read は
+# token-cost ポリシで **除外** する(コストが軽く累積で膨らむ; Issue #55)。
+# success の総量は 100+40+10=150(cache_read=5 は計上しない)。
 _CLAUDE_SUCCESS = (
     '{"type": "result", "subtype": "success", "is_error": false, '
     '"result": "done fixing", '
     '"usage": {"input_tokens": 100, "output_tokens": 40, '
     '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 5}}'
+)
+
+# token_guard: cache_read を **わざと巨大(999999)** にして、誤って合算したら
+# 150 に絶対一致しないようにする(Issue #55 の cache_read 累積 bug を強く検出する。
+# codex が部分集合キーを 9999/8888 にするのと同じ狙い)。
+_CLAUDE_TOKEN_GUARD = (
+    '{"type": "result", "subtype": "success", "is_error": false, '
+    '"result": "done fixing", '
+    '"usage": {"input_tokens": 100, "output_tokens": 40, '
+    '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999}}'
 )
 
 # Codex: cached_input_tokens は input の、reasoning_output_tokens は output の
@@ -146,9 +156,9 @@ ADAPTER_SPECS = [
         bin_kwarg="claude_bin",
         success_stdout=_CLAUDE_SUCCESS,
         success_text="done fixing",
-        success_tokens=155,
-        token_guard_stdout=_CLAUDE_SUCCESS,
-        token_guard_expected=155,  # cache 系を *含めて* 合算する(加算バケット)。
+        success_tokens=150,
+        token_guard_stdout=_CLAUDE_TOKEN_GUARD,
+        token_guard_expected=150,  # cache_read(=999999)は計上しない(cost ポリシ)。
         expects_devnull=False,  # claude は stdin を明示せず継承する。
     ),
     AdapterSpec(

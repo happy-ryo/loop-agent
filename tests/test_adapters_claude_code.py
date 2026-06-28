@@ -8,7 +8,8 @@ timeout・起動失敗の graceful / 予算計上 / Mock 契約 / auth 環境継
 1. ``build_command`` のフラグ組み立て(``--print`` / ``--output-format`` 等)。
 2. ``--output-format json`` の ``is_error`` を失敗判定に使う。
 3. token usage を JSON ``usage`` / stream-json / 正規表現フォールバックで解析する
-   (Claude は全 ``*tokens*`` を加算する意味論)。
+   (Claude は input+output+cache_creation を計上し ``cache_read`` を除外する意味論;
+   Issue #55)。
 4. ``render_prompt`` のプレースホルダ整形(Mapping / ``LoopState`` / 素の文字列 / 欠落)。
 5. 実 subprocess 経路(フェイク claude 実行ファイル)。
 """
@@ -89,11 +90,46 @@ def test_json_is_error_marks_failed_even_on_zero_exit():
     assert result.tokens == 3
 
 
-# -- 3. token usage パース(Claude は全 *tokens* を合算) ---------------------
+# -- 3. token usage パース(input+output+cache_creation を計上、cache_read は除外) --
 
 
 def test_parse_tokens_from_json_usage():
-    assert parse_tokens(JSON_OK) == 155
+    # 100(input)+40(output)+10(cache_creation)=150。cache_read(=5)は計上しない。
+    assert parse_tokens(JSON_OK) == 150
+
+
+def test_parse_tokens_excludes_cache_read():
+    # Issue #55 の再現/回帰ガード: cache_read を巨大値にしても計上に含めない。
+    # 修正前(全 *tokens* 合算)なら 100+40+10+999999 で落ちる。修正後は 150。
+    payload = (
+        '{"type": "result", "is_error": false, "result": "ok", '
+        '"usage": {"input_tokens": 100, "output_tokens": 40, '
+        '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999}}'
+    )
+    assert parse_tokens(payload) == 150
+
+
+def test_parse_tokens_regex_fallback_excludes_cache_read():
+    # 構造化 JSON にならない混在出力でも、フォールバック正規表現は cache_read を拾わない。
+    noisy = (
+        'log\n"input_tokens": 100, "output_tokens": 40, '
+        '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999 trailing'
+    )
+    assert parse_tokens(noisy) == 150
+
+
+def test_actoutcome_tokens_exclude_cache_read():
+    # __call__ -> ActOutcome.tokens の経路でも cache_read を除外する(driver が積む値)。
+    runner = _completed(
+        stdout=(
+            '{"type": "result", "is_error": false, "result": "ok", '
+            '"usage": {"input_tokens": 100, "output_tokens": 40, '
+            '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999}}'
+        )
+    )
+    outcome = ClaudeCodeAct(runner=runner)({"prompt": "x"})
+    assert outcome.tokens == 150
+    assert outcome.observation.tokens == 150
 
 
 def test_parse_tokens_from_stream_json_last_result():

@@ -167,9 +167,13 @@ CLI 固有なのは `build_command`（フラグ）と `_parse_result`/`parse_tok
 意味論が違うので、各 CLI のスキーマを確認してから合算ルールを決めます。
 
 - **Claude Code**: `usage` の `input_tokens` / `output_tokens` /
-  `cache_creation_input_tokens` / `cache_read_input_tokens` は **互いに素な加算
-  バケット** なので、`*tokens*` を全部足すのが総処理量です
-  （`_sum_token_fields`）。
+  `cache_creation_input_tokens` / `cache_read_input_tokens` は互いに素な加算
+  バケットですが、計上するのは **`input_tokens + output_tokens +
+  cache_creation_input_tokens` の 3 種だけ** です（`_sum_token_fields` の
+  allowlist `_COUNTED_TOKEN_FIELDS`）。`cache_read_input_tokens` は **除外** します
+  ―― 課金重みが軽く（通常 input の ~0.1x で実質ほぼ無料）、内部マルチターンで
+  毎ターン cache を読み直すため累積が桁違いに膨らみ、`TokenBudget` を誤発火させる
+  からです（[Issue #55](#2-token-を二重計上すると-tokenbudget-が誤発火する)）。
 - **Codex / OpenAI**: `usage` の `cached_input_tokens` は `input_tokens` の、
   `reasoning_output_tokens` は `output_tokens` の **部分集合** です。全部足すと
   二重計上になるので、総処理量は **`input_tokens + output_tokens` のみ** を足し、
@@ -200,8 +204,11 @@ headless ループでは親 stdin が pipe/閉端のことがあり、`codex exe
 
 Self-translation PoC で `ClaudeCodeAct` の初期実装が `cache_read` を毎反復累積し、
 `TokenBudget` を実際よりずっと早く発火させる bug が見つかりました（Issue #55）。
-原因は「usage の全フィールドを足す」ロジックを、部分集合キーを持つ CLI に流用した
-こと。**新しいアダプタを足すたびに「部分集合 usage を二重計上していないか」の
+原因は「usage の全フィールドを足す」ロジックが、課金が軽く累積で膨らむ
+`cache_read_input_tokens` まで貪欲に拾っていたこと。**修正済み**: 計上対象を
+`input_tokens + output_tokens + cache_creation_input_tokens` の allowlist に絞り、
+`cache_read` は除外しました（token-cost ポリシ。`_sum_token_fields`）。
+**新しいアダプタを足すたびに「コストでない/部分集合の usage を計上していないか」の
 parametrize テストを必ず追加** してください
 （[`tests/adapters/test_contract.py`](../../tests/adapters/test_contract.py) の
 token guard が全アダプタ横断で構造的に catch します）。

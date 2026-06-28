@@ -28,8 +28,9 @@ import pytest
 from loop_agent.adapters import CodexAct, MockCodexAct, render_prompt
 
 # parse_tokens は codex サブモジュールから直接取る。``adapters.__init__`` が公開する
-# ``parse_tokens`` は claude_code 由来(全 *tokens* を合算)で、Codex の部分集合
-# (cached/reasoning)を二重計上してしまうため、Codex 用はモジュール側を使う。
+# ``parse_tokens`` は claude_code 由来(input+output+cache_creation を計上し
+# cache_read は除外する意味論)で、Codex の usage(部分集合 cached/reasoning を持ち、
+# cache_creation は無い)とは意味論が違うため、Codex 用はモジュール側を使う。
 from loop_agent.adapters.codex import parse_tokens
 
 

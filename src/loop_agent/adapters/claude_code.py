@@ -68,21 +68,42 @@ class ClaudeCodeResult(ActResultBase):
     """
 
 
-def _sum_token_fields(usage: Mapping[str, Any]) -> int:
-    """``usage`` マップから ``*tokens*`` を名前に含む整数値を合計する。
+# token-cost ポリシ: 予算(:class:`~loop_agent.conditions.TokenBudget`)に積むのは
+# **コストとして意味のある** トークンだけ、という allowlist。``input_tokens`` /
+# ``output_tokens`` /(キャッシュ書き込みの)``cache_creation_input_tokens`` の 3 種を
+# 計上し、``cache_read_input_tokens`` は **除外** する(Issue #55)。
+#
+# 除外理由: cache_read は (1) 課金重みが軽い(Anthropic 価格で通常 input の ~0.1x で
+# 実質ほぼ無料)、かつ (2) Claude Code が内部で複数ターン回ると **各ターンが cache 済み
+# context を読み直す** ため 1 回の ``act`` で報告される累計が実 input+output の桁違いに
+# 膨らむ。これを総和に入れると ``TokenBudget`` が想定よりはるか手前で誤発火する
+# (Self-translation PoC で ~170 行 1 ファイルの翻訳が ~340k tokens と計上された)。
+#
+# 旧実装の「名前に *tokens* を含む値を全部足す」は将来種別に追従できる反面、
+# cache_read のような「報告はされるがコストでない/二重に膨らむ」種別まで貪欲に拾う。
+# CodexAct の :func:`~loop_agent.adapters.codex._sum_codex_tokens`(input+output のみの
+# allowlist)と同じ「集計対象を明示する」方針に揃え、計上規則を予測可能にする。
+_COUNTED_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+)
 
-    ``input_tokens`` / ``output_tokens`` / ``cache_creation_input_tokens`` /
-    ``cache_read_input_tokens`` を漏れなく拾い、将来増えるトークン種別にも追従する。
-    予算(:class:`~loop_agent.conditions.TokenBudget`)は「処理した総トークン」で
-    切りたいので、種別を区別せず総和を取る。
+
+def _sum_token_fields(usage: Mapping[str, Any]) -> int:
+    """``usage`` マップから **計上対象トークン** の整数値を合計する。
+
+    計上対象は :data:`_COUNTED_TOKEN_FIELDS`(``input_tokens`` / ``output_tokens`` /
+    ``cache_creation_input_tokens``)の allowlist。``cache_read_input_tokens`` は
+    コストが軽く累積で膨らむため **除外** する(理由は上のコメント / Issue #55)。
+    予算(:class:`~loop_agent.conditions.TokenBudget`)はこの「実コスト総量」で切る。
     """
-    return sum(
-        value
-        for key, value in usage.items()
-        if isinstance(value, bool) is False
-        and isinstance(value, int)
-        and "tokens" in key.lower()
-    )
+    total = 0
+    for key in _COUNTED_TOKEN_FIELDS:
+        value = usage.get(key)
+        if isinstance(value, bool) is False and isinstance(value, int):
+            total += value
+    return total
 
 
 def _try_json(text: str) -> Any:
@@ -117,14 +138,10 @@ def _try_json(text: str) -> Any:
 # usage が構造化 JSON で取れなかったとき用の、人間可読/部分出力向けフォールバック。
 # 代表的なキーを 1 つずつ(最初の出現のみ)拾って合算する。stream-json の途中行や
 # modelUsage の内訳まで貪欲に拾うと二重計上しうるため、敢えて各キー先頭一致に絞る。
+# 計上対象は JSON 経路と同じ :data:`_COUNTED_TOKEN_FIELDS`(cache_read は除外。
+# 理由は :func:`_sum_token_fields` 上のコメント / Issue #55)。
 _TOKEN_FIELD_RES = tuple(
-    re.compile(rf'"{key}"\s*:\s*(\d+)')
-    for key in (
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    )
+    re.compile(rf'"{key}"\s*:\s*(\d+)') for key in _COUNTED_TOKEN_FIELDS
 )
 
 

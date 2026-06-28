@@ -204,12 +204,13 @@ db.record_result(result)
 
 `ClaudeCodeAct` は `os.environ` を継承して claude CLI に auth を委譲します。`failed=True` で返って `error` に auth 系メッセージが出る場合は、シェルで `claude --print "hi"` が単体で通るか先に確認してください。`env=` で API key を明示注入もできます。
 
-### `TokenBudget` が早すぎるタイミングで発火する（重要な落とし穴）
+### `TokenBudget` が早すぎるタイミングで発火する（修正済み: Issue #55）
 
-`ClaudeCodeAct` を `Read` + `Edit` 付きで回すと、Claude Code は内部で複数ターン回り、各ターンが cache 済み context を読み直すため、1 回の `act` で報告される `cache_read_input_tokens` の累計が実 input+output の桁違いに膨らみます。現状の token 集計はこれを合算するので、**`TokenBudget` が想定よりはるか手前で発火**します（Self-translation PoC で発見: 約 170 行 1 ファイルの翻訳が ~340k tokens と計上された）。
+`ClaudeCodeAct` を `Read` + `Edit` 付きで回すと、Claude Code は内部で複数ターン回り、各ターンが cache 済み context を読み直すため、1 回の `act` で報告される `cache_read_input_tokens` の累計が実 input+output の桁違いに膨らみます。初期実装はこれを合算していたため **`TokenBudget` が想定よりはるか手前で発火** していました（Self-translation PoC で発見: 約 170 行 1 ファイルの翻訳が ~340k tokens と計上された）。
 
-- **回避策**: run を `MaxIterations` / `Timeout` で律速し、`TokenBudget` は大きめ（例 `20_000_000`）に置いて「桁が暴れたとき用のバックストップ」として使う。
-- 真の input+output だけで律速したいなら、`act` をラップして `ActOutcome.tokens` を `input_tokens + output_tokens` に補正する薄い wrapper を自分で噛ませる（cache read は課金重みも軽い）。
+**現在は修正済み**です。`ClaudeCodeAct` の token 計上は `input_tokens + output_tokens + cache_creation_input_tokens` のみを積み、課金が軽く累積で膨らむ `cache_read_input_tokens` は除外します（token-cost ポリシ）。そのため `TokenBudget` は実コストに比例して効きます。
+
+- それでも長時間 run を確実に律速したいときは、`MaxIterations` / `Timeout` を併用するのが堅実です（`TokenBudget` 単独に頼らずバックストップを重ねる）。
 
 ### verify が timeout する / 永遠に止まらない
 
