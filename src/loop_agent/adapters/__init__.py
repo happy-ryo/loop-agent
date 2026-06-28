@@ -36,6 +36,13 @@ from .codex import (
     CodexResult,
     MockCodexAct,
 )
+from .model_ladder import (
+    EscalationContext,
+    EscalationPredicate,
+    ModelLadder,
+    after_attempts,
+    on_failure,
+)
 
 __all__ = [
     # 共通土台(新規アダプタが従う契約 / 結果の基底 / 整形・実行シーム)。
@@ -52,4 +59,10 @@ __all__ = [
     "CodexAct",
     "CodexResult",
     "MockCodexAct",
+    # ModelLadder(act 合成の canonical example。subprocess アダプタではない)。
+    "ModelLadder",
+    "EscalationContext",
+    "EscalationPredicate",
+    "on_failure",
+    "after_attempts",
 ]

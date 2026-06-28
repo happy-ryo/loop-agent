@@ -109,17 +109,29 @@ result = run_loop(
 
 これらは **loop-agent の新機能ではなく、`act` / `gather` シームで user が今日でも書けるパターン**。よく書くことになるので「正しく組まれた書き方」を示す（一部は将来 `adapters/` に reference 実装として packagize 予定）。
 
-**ModelLadder（困難タスクで強いモデルへエスカレーション）** — `act` は `Callable` なので、試行回数を見てモデルを上げる act を自分で書ける:
+**ModelLadder（困難タスクで強いモデルへエスカレーション）** — `act` は `Callable` なので、試行回数を見てモデルを上げる act を自分で書ける。この高頻度パターンを正準例として `loop_agent.adapters.ModelLadder` に packagize した（**新機能ではなく** `act` 合成の reference 実装。落とし穴 — stateful な試行カウント / act は verify の goal 判定を見られない / 異種合成 — をヘッジ済み。Issue #53）:
 
 ```python
-def escalating_act(ctx):
-    attempts = my_harness.attempts_for(ctx)        # per-candidate の試行回数は呼び出し側が持つ
-    if attempts == 0: return ClaudeCodeAct(model="haiku")(ctx)
-    if attempts == 1: return ClaudeCodeAct(model="sonnet")(ctx)
-    return ClaudeCodeAct(model="opus")(ctx)         # CodexAct と混ぜた異種チェーンも可
+from loop_agent.adapters import ModelLadder, ClaudeCodeAct
 
-result = run_loop(act=escalating_act, ...)
+act = ModelLadder([
+    ClaudeCodeAct(model="haiku"),
+    ClaudeCodeAct(model="sonnet"),
+    ClaudeCodeAct(model="opus"),
+], escalate_on="failure")        # 前段が failed=True なら次段へ昇格
+
+result = run_loop(act=act, ...)
 ```
+
+`escalate_on` は `"failure"`（前段失敗で昇格）/ 正の int `N`（同段を N 回試したら昇格。act が成功扱いでも verify が goal 未達で反復が続くケースを埋める相補戦略）/ 任意 predicate `Callable[[EscalationContext], bool]`（合成用、例 `lambda ec: ec.last_failed and ec.attempts >= 2`）。異種チェーンもそのまま組める（cost-optimal から始めて難所だけ別プロバイダーに渡す）:
+
+```python
+from loop_agent.adapters import ModelLadder, ClaudeCodeAct, CodexAct
+
+act = ModelLadder([ClaudeCodeAct(model="haiku"), CodexAct(model="gpt-5.5"), ClaudeCodeAct(model="opus")])
+```
+
+各段は `ActOutcome` を返す任意の `act` フックでよく、結果が共通の `ActResult` 契約（`observation.failed`）に適合していれば異種を混ぜても同じ判断ロジックで扱える（#52 の `ActResult` Protocol が合成性を担保）。実装は `src/loop_agent/adapters/model_ladder.py`、検証は `tests/test_adapters_model_ladder.py`。
 
 **WorkListGather（multi-item ループの公平 scheduling）** — N ファイル / N bug を回すとき、素朴な「先頭未完を返す `gather`」は 1 件が `MaxIterations` を独占して他を starve させる。試行回数最小から選ぶ round-robin を `gather` に書けば公平になる（Self-translation PoC でこの形を実走）:
 
