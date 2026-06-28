@@ -111,6 +111,8 @@ from .transport import (
     InMemoryWakeQueue,
     NullPushBackend,
     PushBackend,
+    RedisWakeQueue,
+    SqliteWakeQueue,
     Transport,
     WAKE_DECISION_REQUEST,
     WAKE_KINDS,
@@ -120,6 +122,7 @@ from .transport import (
     WakeQueue,
     cadence_for,
     due_to_poll,
+    open_wake_queue,
 )
 from .waker import LoopWaker, wake_id_for, wakes_for_result
 
@@ -218,6 +221,9 @@ __all__ = [
     "NullPushBackend",
     "WakeQueue",
     "InMemoryWakeQueue",
+    "SqliteWakeQueue",
+    "RedisWakeQueue",
+    "open_wake_queue",
     "Transport",
     "CADENCE_SECONDS",
     "DEFAULT_CADENCE_SECONDS",
