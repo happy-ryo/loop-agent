@@ -1,14 +1,16 @@
-"""Claude Code adapter (``loop_agent.adapters.claude_code``) の検証 (Issue #32)。
+"""Claude Code adapter (``loop_agent.adapters.claude_code``) の **固有** 検証 (Issue #32)。
 
-ここで確かめる命題:
+``act`` シーム 4 か条と ``ActResult`` の形(成功時の結果形 / ``failed`` セマンティクス /
+timeout・起動失敗の graceful / 予算計上 / Mock 契約 / auth 環境継承 / stdin 安全性)は
+全アダプタ横断の共通ハーネス ``tests/adapters/test_contract.py`` に移譲済み。ここには
+**Claude Code 固有** の挙動だけを残す:
 
-1. subprocess 成功時、応答テキストとトークンを載せた ``ActOutcome`` を返す。
-2. timeout 超過は例外ではなく ``failed=True`` の結果で graceful に返り、ループを
-   殺さない(境界の ``MaxIterations`` 等が効く)。
-3. token usage を JSON ``usage`` / stream-json / 正規表現フォールバックで解析し、
-   ``state.tokens_used`` に積んで ``TokenBudget`` を効かせられる。
-4. :class:`MockClaudeCodeAct` が subprocess 無しで同じ ``act`` 契約を満たす。
-5. ``prompt_template`` のプレースホルダが context のフィールドで埋まる。
+1. ``build_command`` のフラグ組み立て(``--print`` / ``--output-format`` 等)。
+2. ``--output-format json`` の ``is_error`` を失敗判定に使う。
+3. token usage を JSON ``usage`` / stream-json / 正規表現フォールバックで解析する
+   (Claude は全 ``*tokens*`` を加算する意味論)。
+4. ``render_prompt`` のプレースホルダ整形(Mapping / ``LoopState`` / 素の文字列 / 欠落)。
+5. 実 subprocess 経路(フェイク claude 実行ファイル)。
 """
 
 from __future__ import annotations
@@ -21,14 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from loop_agent import MaxIterations, TokenBudget, VerifyOutcome, run_loop
-from loop_agent.adapters import (
-    ClaudeCodeAct,
-    ClaudeCodeResult,
-    MockClaudeCodeAct,
-    parse_tokens,
-    render_prompt,
-)
+from loop_agent.adapters import ClaudeCodeAct, parse_tokens, render_prompt
 
 
 # -- フェイク runner: subprocess.run を差し替えてコマンド/出力を制御する --------
@@ -47,15 +42,6 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
     return _runner
 
 
-def _timeout_runner(timeout_value: float = 600.0):
-    """常に :class:`subprocess.TimeoutExpired` を送出する runner。"""
-
-    def _runner(command, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_value)
-
-    return _runner
-
-
 JSON_OK = (
     '{"type": "result", "subtype": "success", "is_error": false, '
     '"result": "done fixing", '
@@ -64,22 +50,7 @@ JSON_OK = (
 )
 
 
-# -- 1. subprocess 成功時の ActOutcome ------------------------------------
-
-
-def test_success_returns_actoutcome_with_text_and_tokens():
-    runner = _completed(stdout=JSON_OK, returncode=0)
-    act = ClaudeCodeAct(runner=runner)
-
-    outcome = act({"prompt": "fix the bug"})
-
-    assert outcome.tokens == 155  # 100 + 40 + 10 + 5
-    result = outcome.observation
-    assert isinstance(result, ClaudeCodeResult)
-    assert result.failed is False
-    assert result.text == "done fixing"
-    assert result.returncode == 0
-    assert str(result) == "done fixing"  # __str__ は本文を返す
+# -- 1. build_command(Claude 固有フラグ) -----------------------------------
 
 
 def test_build_command_includes_all_flags():
@@ -103,14 +74,7 @@ def test_build_command_includes_all_flags():
     assert cmd[-2:] == ["--", "the prompt"]
 
 
-def test_nonzero_exit_is_failed():
-    runner = _completed(stdout="", stderr="boom", returncode=2)
-    act = ClaudeCodeAct(runner=runner)
-
-    result = act({"prompt": "x"}).observation
-    assert result.failed is True
-    assert result.returncode == 2
-    assert "boom" in result.error
+# -- 2. JSON is_error を失敗判定に使う(Claude 固有) -------------------------
 
 
 def test_json_is_error_marks_failed_even_on_zero_exit():
@@ -125,46 +89,7 @@ def test_json_is_error_marks_failed_even_on_zero_exit():
     assert result.tokens == 3
 
 
-# -- 2. timeout は graceful(例外を投げない)--------------------------------
-
-
-def test_timeout_returns_failed_without_raising():
-    act = ClaudeCodeAct(timeout=0.01, runner=_timeout_runner(0.01))
-
-    outcome = act({"prompt": "long task"})  # 例外が漏れないこと自体が検証点
-
-    assert outcome.tokens == 0
-    result = outcome.observation
-    assert result.failed is True
-    assert "timeout" in result.error
-
-
-def test_timeout_does_not_kill_the_loop():
-    # timeout が続いても run_loop は MaxIterations で必ず止まる。
-    act = ClaudeCodeAct(timeout=0.01, runner=_timeout_runner(0.01))
-
-    def verify(outcome):
-        return VerifyOutcome(goal_met=not outcome.observation.failed)
-
-    result = run_loop(
-        act=act,
-        verify=verify,
-        gather=lambda state: {"prompt": "keep trying"},
-        conditions=[MaxIterations(3)],
-    )
-    assert result.status == "stopped"
-    assert result.stop.name == "max_iterations"
-    assert result.iterations == 3
-
-
-def test_missing_executable_is_graceful():
-    act = ClaudeCodeAct(claude_bin="claude-does-not-exist-xyz")
-    outcome = act({"prompt": "x"})
-    assert outcome.observation.failed is True
-    assert "could not launch" in outcome.observation.error
-
-
-# -- 3. token usage パース --------------------------------------------------
+# -- 3. token usage パース(Claude は全 *tokens* を合算) ---------------------
 
 
 def test_parse_tokens_from_json_usage():
@@ -192,69 +117,7 @@ def test_parse_tokens_returns_zero_when_absent():
     assert parse_tokens("just some plain text, no usage here") == 0
 
 
-def test_tokens_accumulate_into_token_budget():
-    # 1 反復 1200 tokens。予算 2000 なら 2 反復目を始めず止まる
-    # (TokenBudget は境界評価: 1200 -> 2400 で次の guard が発火)。
-    mock = MockClaudeCodeAct(responses=[{"text": "step", "tokens": 1200}])
-
-    result = run_loop(
-        act=mock,
-        verify=lambda o: VerifyOutcome(goal_met=False),
-        gather=lambda s: {"prompt": "go"},
-        conditions=[TokenBudget(2000), MaxIterations(100)],
-    )
-    assert result.stop.name == "token_budget"
-    assert result.tokens_used == 2400  # 2 反復計上後に境界で停止
-    assert result.iterations == 2
-
-
-# -- 4. MockClaudeCodeAct --------------------------------------------------
-
-
-def test_mock_cycles_then_sticks_to_last():
-    mock = MockClaudeCodeAct(
-        responses=["first", {"text": "second", "tokens": 5}]
-    )
-    a = mock({"prompt": "p1"})
-    b = mock({"prompt": "p2"})
-    c = mock({"prompt": "p3"})  # 使い切ったら最後に張り付く
-
-    assert a.observation.text == "first"
-    assert b.observation.text == "second" and b.tokens == 5
-    assert c.observation.text == "second"
-    assert mock.prompts == ["p1", "p2", "p3"]
-
-
-def test_mock_failed_response_drives_verify():
-    mock = MockClaudeCodeAct(responses=[{"failed": True, "error": "nope"}])
-    outcome = mock({"prompt": "x"})
-    assert outcome.observation.failed is True
-    assert outcome.observation.error == "nope"
-
-
-def test_mock_requires_at_least_one_response():
-    with pytest.raises(ValueError):
-        MockClaudeCodeAct(responses=[])
-
-
-def test_mock_reaches_goal_through_run_loop():
-    mock = MockClaudeCodeAct(responses=["work", "work", "done"])
-
-    def verify(outcome):
-        met = outcome.observation.text == "done"
-        return VerifyOutcome(goal_met=met)
-
-    result = run_loop(
-        act=mock,
-        verify=verify,
-        gather=lambda s: {"prompt": "iterate"},
-        conditions=[MaxIterations(10)],
-    )
-    assert result.goal_met is True
-    assert result.iterations == 3
-
-
-# -- 5. prompt placeholder -------------------------------------------------
+# -- 4. render_prompt(プレースホルダ整形) ----------------------------------
 
 
 def test_render_prompt_from_mapping():
@@ -282,15 +145,7 @@ def test_render_prompt_missing_field_raises_helpful_error():
     assert "iteration" in msg  # 使えるフィールドを示す
 
 
-def test_placeholder_reaches_the_command():
-    runner = _completed(stdout=JSON_OK)
-    act = ClaudeCodeAct(prompt_template="fix iter {iteration}", runner=runner)
-    act({"iteration": 7})
-    sent_command = runner.calls[-1][0]
-    assert sent_command[-1] == "fix iter 7"
-
-
-# -- 実 subprocess 経路(フェイク claude 実行ファイル)----------------------
+# -- 5. 実 subprocess 経路(フェイク claude 実行ファイル) -------------------
 
 
 def _write_fake_claude(tmp_path: Path, body: str) -> str:

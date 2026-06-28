@@ -24,12 +24,12 @@ Claude Code (headless ``claude --print``) を 1 行で ``run_loop`` に差し込
 
 from __future__ import annotations
 
+from .base import ActResult, ActResultBase, Runner, render_prompt
 from .claude_code import (
     ClaudeCodeAct,
     ClaudeCodeResult,
     MockClaudeCodeAct,
     parse_tokens,
-    render_prompt,
 )
 from .codex import (
     CodexAct,
@@ -38,12 +38,18 @@ from .codex import (
 )
 
 __all__ = [
+    # 共通土台(新規アダプタが従う契約 / 結果の基底 / 整形・実行シーム)。
+    "ActResult",
+    "ActResultBase",
+    "Runner",
+    "render_prompt",
+    # Claude Code アダプタ。
     "ClaudeCodeAct",
     "ClaudeCodeResult",
     "MockClaudeCodeAct",
+    "parse_tokens",
+    # Codex アダプタ。
     "CodexAct",
     "CodexResult",
     "MockCodexAct",
-    "parse_tokens",
-    "render_prompt",
 ]
