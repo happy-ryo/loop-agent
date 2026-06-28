@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-29
+
+loop-agent の最初の機能リリース。`gather -> act -> verify -> repeat` の最小ループ
+コアから、外側 Reflexion ループ + RQGM epoch 安全核までを含む。さらに非同期 API
+（`async_run_loop`）、act/verify の per-call timeout / kill（`TimeoutPolicy`）、統一
+例外階層（`LoopError`）、multi-item 公平 scheduling（`WorkListGather`）、coding
+agent 向け reference-bundled skill の同梱（`install-skills` CLI）を備える（設計の
+正本は [`report.md`](./report.md)）。
+
 ### Added
 
 - **Claude Code 向け reference-bundled skill の同梱 + `install-skills` CLI**（Issue #73）:
@@ -107,15 +116,6 @@
   より awaitable を検出した時点で `AsyncSeamInSyncLoop`（`RuntimeError` サブクラス）を
   **一貫して**送出する（そのシームが実際に suspend するか否かに依存しない）。非同期
   シームには `await async_run_loop(...)` を使う。
-
-## [0.1.0] - 2026-06-28
-
-loop-agent の最初の機能リリース。`gather -> act -> verify -> repeat` の最小ループ
-コアから、外側 Reflexion ループ + RQGM epoch 安全核までを含む（設計の正本は
-[`report.md`](./report.md)）。
-
-### Added
-
 - **ループコア（PoC）**: 単一エージェント・単一プロセスの
   `gather -> act -> verify -> repeat` ドライバ。`act` / `verify` は注入可能な
   フック。上限到達は例外ではなく理由付きの `LoopResult` で返る（`run_loop`）。
