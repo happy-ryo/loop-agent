@@ -116,6 +116,7 @@ from .loop import (
     _default_gather,
     run_loop,
 )
+from .errors import ConfigError, StateError
 from .notify import ApprovalDescriber, ApprovalRequest, Notifier, _summarize_action
 from .state import LoopState
 from .store import (
@@ -149,7 +150,7 @@ class Decision:
 
     def __post_init__(self) -> None:
         if self.kind not in DECISION_KINDS:
-            raise ValueError(
+            raise ConfigError(
                 f"unknown decision {self.kind!r}; expected one of {DECISION_KINDS}"
             )
 
@@ -305,7 +306,7 @@ class HumanGate:
         if self.resolver is not None:
             decision = self.resolver(entry)
             if not isinstance(decision, Decision):
-                raise TypeError(
+                raise ConfigError(
                     "resolver must return a Decision, got "
                     f"{type(decision).__name__}"
                 )
@@ -333,7 +334,7 @@ class HumanGate:
             extra = self.describe(action)
             if extra:
                 if not isinstance(extra, Mapping):
-                    raise TypeError(
+                    raise ConfigError(
                         "describe must return a Mapping of ApprovalRequest fields, "
                         f"got {type(extra).__name__}"
                     )
@@ -385,7 +386,7 @@ class HumanGate:
         stored = entry.get("action")
         current = json.loads(_require_json_native(context, "gated action"))
         if stored != current:
-            raise ValueError(
+            raise StateError(
                 f"gate {gate_key}: proposed action does not match the action this "
                 f"decision was recorded for (stored={stored!r}, current={current!r}); "
                 "the proposal sequence is non-deterministic across resume"

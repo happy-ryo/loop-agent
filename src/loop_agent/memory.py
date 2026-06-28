@@ -29,6 +29,7 @@ import hashlib
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Sequence
 
+from .errors import ConfigError
 from .state import StepRecord
 
 
@@ -137,11 +138,11 @@ class EpisodicMemory:
 
     def __post_init__(self) -> None:
         if self.cap < 1:
-            raise ValueError("EpisodicMemory cap must be >= 1")
+            raise ConfigError("EpisodicMemory cap must be >= 1")
         if self.per_lesson_chars < 1:
-            raise ValueError("EpisodicMemory per_lesson_chars must be >= 1")
+            raise ConfigError("EpisodicMemory per_lesson_chars must be >= 1")
         if self.render_byte_cap < 1:
-            raise ValueError("EpisodicMemory render_byte_cap must be >= 1")
+            raise ConfigError("EpisodicMemory render_byte_cap must be >= 1")
 
     def lessons(self) -> tuple[Lesson, ...]:
         """現在保持している lesson の **読み取り専用** ビュー (gather 配線用)。"""

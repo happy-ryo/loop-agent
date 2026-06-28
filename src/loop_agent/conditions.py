@@ -39,6 +39,7 @@ from typing import (
 )
 
 from ._async import AsyncSeamInSyncLoop, driven_synchronously, maybe_await
+from .errors import ConfigError
 from .state import LoopState, StepRecord
 
 
@@ -86,7 +87,7 @@ class MaxIterations:
 
     def __post_init__(self) -> None:
         if self.limit < 0:
-            raise ValueError("MaxIterations limit must be >= 0")
+            raise ConfigError("MaxIterations limit must be >= 0")
 
     def check(self, state: LoopState) -> Optional[str]:
         if state.iteration >= self.limit:
@@ -110,7 +111,7 @@ class TokenBudget:
 
     def __post_init__(self) -> None:
         if self.budget < 0:
-            raise ValueError("TokenBudget budget must be >= 0")
+            raise ConfigError("TokenBudget budget must be >= 0")
 
     def check(self, state: LoopState) -> Optional[str]:
         if state.tokens_used >= self.budget:
@@ -133,7 +134,7 @@ class Timeout:
 
     def __post_init__(self) -> None:
         if self.seconds < 0:
-            raise ValueError("Timeout seconds must be >= 0")
+            raise ConfigError("Timeout seconds must be >= 0")
 
     def check(self, state: LoopState) -> Optional[str]:
         if state.elapsed >= self.seconds:
@@ -255,13 +256,13 @@ class NoProgress:
 
     def __post_init__(self) -> None:
         if self.window < 1:
-            raise ValueError("NoProgress window must be >= 1")
+            raise ConfigError("NoProgress window must be >= 1")
         if self.repeat < 1:
-            raise ValueError("NoProgress repeat must be >= 1")
+            raise ConfigError("NoProgress repeat must be >= 1")
         if self.repeat > self.window:
             # max count within the window is `window`; repeat > window can never
             # fire, which is a silent mis-config -- reject it like a bad cap.
-            raise ValueError("NoProgress repeat must be <= window")
+            raise ConfigError("NoProgress repeat must be <= window")
 
     def check(self, state: LoopState) -> Optional[str]:
         recent = state.history[-self.window :]
@@ -292,7 +293,7 @@ class AnyOf:
     def __post_init__(self) -> None:
         conds = tuple(self.conditions)
         if not conds:
-            raise ValueError("AnyOf requires at least one stop condition")
+            raise ConfigError("AnyOf requires at least one stop condition")
         object.__setattr__(self, "conditions", conds)
 
     def first_triggered(self, state: LoopState) -> Optional[StopTrigger]:

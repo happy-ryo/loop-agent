@@ -24,6 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
+from .errors import ConfigError
+
 
 @dataclass(frozen=True)
 class OuterState:
@@ -58,7 +60,7 @@ class MaxEpisodes:
 
     def __post_init__(self) -> None:
         if self.limit < 0:
-            raise ValueError("MaxEpisodes limit must be >= 0")
+            raise ConfigError("MaxEpisodes limit must be >= 0")
 
     def check(self, state: OuterState) -> Optional[str]:
         if state.episode >= self.limit:
@@ -83,7 +85,7 @@ class RubricThreshold:
 
     def __post_init__(self) -> None:
         if self.sustain < 1:
-            raise ValueError("RubricThreshold sustain must be >= 1")
+            raise ConfigError("RubricThreshold sustain must be >= 1")
 
     def check(self, state: OuterState) -> Optional[str]:
         recent = state.gt_aggregate_history[-self.sustain :]
@@ -119,9 +121,9 @@ class ScorePlateau:
 
     def __post_init__(self) -> None:
         if self.window < 1:
-            raise ValueError("ScorePlateau window must be >= 1")
+            raise ConfigError("ScorePlateau window must be >= 1")
         if self.min_delta < 0:
-            raise ValueError("ScorePlateau min_delta must be >= 0")
+            raise ConfigError("ScorePlateau min_delta must be >= 0")
 
     def check(self, state: OuterState) -> Optional[str]:
         history = state.gt_aggregate_history
@@ -147,7 +149,7 @@ class ReflectionBudget:
 
     def __post_init__(self) -> None:
         if self.max_reflections < 0:
-            raise ValueError("ReflectionBudget max_reflections must be >= 0")
+            raise ConfigError("ReflectionBudget max_reflections must be >= 0")
 
     def check(self, state: OuterState) -> Optional[str]:
         if state.reflections >= self.max_reflections:
@@ -167,7 +169,7 @@ class EvaluatorUpdateBudget:
 
     def __post_init__(self) -> None:
         if self.max_updates < 0:
-            raise ValueError("EvaluatorUpdateBudget max_updates must be >= 0")
+            raise ConfigError("EvaluatorUpdateBudget max_updates must be >= 0")
 
     def check(self, state: OuterState) -> Optional[str]:
         if state.evaluator_updates >= self.max_updates:

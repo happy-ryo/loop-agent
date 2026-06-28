@@ -33,6 +33,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Union
 
+from ..errors import ConfigError
 from ..loop import ActOutcome
 
 # 結果の形・プロンプト整形・Runner シームはアダプタ共通の土台(base)に集約済み。
@@ -344,7 +345,7 @@ class MockClaudeCodeAct:
 
     def __post_init__(self) -> None:
         if not self.responses:
-            raise ValueError("MockClaudeCodeAct requires at least one response")
+            raise ConfigError("MockClaudeCodeAct requires at least one response")
         self._responses = [self._coerce(r) for r in self.responses]
 
     @staticmethod
@@ -355,7 +356,7 @@ class MockClaudeCodeAct:
             return ClaudeCodeResult(text=response)
         if isinstance(response, Mapping):
             return ClaudeCodeResult(**response)
-        raise TypeError(
+        raise ConfigError(
             "MockClaudeCodeAct responses must be str, Mapping, or ClaudeCodeResult, "
             f"got {type(response).__name__}"
         )

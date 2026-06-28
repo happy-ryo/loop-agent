@@ -45,6 +45,8 @@ from typing import (
 )
 from urllib.request import Request, urlopen
 
+from .errors import ConfigError
+
 # redaction の対象キー判定: payload の (ネストを含む) dict キー名にこれらの部分文字列が
 # 含まれていれば値をマスクする。大文字小文字は無視する。実運用では action の構造に
 # 合わせて拡張すること (各 Notifier の ``redact`` を差し替えれば policy を丸ごと交換可)。
@@ -257,7 +259,7 @@ class WebhookNotifier:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if retries < 0:
-            raise ValueError("retries must be >= 0")
+            raise ConfigError("retries must be >= 0")
         self.url = url
         self.method = method
         self.headers = dict(headers or {})
@@ -415,10 +417,10 @@ class EmailNotifier:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if retries < 0:
-            raise ValueError("retries must be >= 0")
+            raise ConfigError("retries must be >= 0")
         recipients = list(recipients)
         if not recipients:
-            raise ValueError("recipients must contain at least one address")
+            raise ConfigError("recipients must contain at least one address")
         self.host = host
         self.sender = sender
         self.recipients = recipients

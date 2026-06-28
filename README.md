@@ -68,6 +68,7 @@ while not goal_met and conditions_ok:
 - Claude Code ユーザー向けの 30 分動線（E primary + 監視 / resume / トラブルシュート）: **[docs/quickstart.md](./docs/quickstart.md)**
 - 動線 E の具体 recipe（flaky test 安定化 / 翻訳 / リファクタ）: **[docs/recipes/](./docs/recipes/)**
 - Reflexion を使うべきか・blind retry で足りるかの判断: **[docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md)**
+- 例外階層（`LoopError` / `ConfigError` / `StateError` / `AsyncSeamInSyncLoop`）と捕捉のしかた: **[docs/errors.md](./docs/errors.md)**
 
 ### 動線 A: 最短デモ（5 行 Python）
 
@@ -841,7 +842,7 @@ gather = WorkListGather.from_triage([Candidate(id="hi", priority=9), Candidate(i
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
 - `gather` を省略すると `LoopState` がそのまま `act` の context になる。`on_step(record, state)` は各反復完了後に呼ばれる最小の観測フック。
-- stop 条件を 1 つも渡さないと `ValueError`（無限ループ防止 = R3）。
+- stop 条件を 1 つも渡さないと `ConfigError`（無限ループ防止 = R3）。`ConfigError` は `LoopError` 階層の一員で、後方互換のため `ValueError` も継承する（[docs/errors.md](./docs/errors.md)）。
 
 ### CLI ランチャ（loop-agent run / status / resume / logs）
 

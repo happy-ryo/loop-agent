@@ -41,7 +41,14 @@ import contextvars
 import inspect
 from typing import Awaitable, TypeVar, Union
 
+# AsyncSeamInSyncLoop の正準定義は loop_agent.errors にある (Issue #43 で統一階層に再配置)。
+# 後方互換のためここから re-export する: 既存の `from loop_agent._async import
+# AsyncSeamInSyncLoop` / `loop_agent._async.AsyncSeamInSyncLoop` 参照を壊さない。
+from .errors import AsyncSeamInSyncLoop
+
 T = TypeVar("T")
+
+__all__ = ["AsyncSeamInSyncLoop", "reject_awaitables", "driven_synchronously", "maybe_await"]
 
 # async_run_loop が自身の実行範囲だけ True にする (run_loop 駆動なら _strict_sync=True)。
 # True の間 maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
@@ -49,15 +56,6 @@ T = TypeVar("T")
 reject_awaitables: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "loop_agent_reject_awaitables", default=False
 )
-
-
-class AsyncSeamInSyncLoop(RuntimeError):
-    """同期 :func:`loop_agent.run_loop` に非同期 (awaitable) シームが渡された。
-
-    ``act`` / ``verify`` / ``gather`` / ``conditions`` の ``check`` /
-    ``gate.review`` / ``on_step`` / ``on_complete`` のいずれかが awaitable を返した
-    ことを示す。非同期シームには :func:`loop_agent.async_run_loop` を使うこと。
-    """
 
 
 def driven_synchronously() -> bool:

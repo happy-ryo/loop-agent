@@ -38,6 +38,7 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Union
 
+from .errors import ConfigError, StateError
 from .progress import _to_jsonable
 from .state import LoopState, StepRecord
 
@@ -338,11 +339,11 @@ def _require_json_native(value: Any, what: str) -> str:
     **実行される / 同一性比較される** 値 (gated action・edit の置換 action) でそれを許すと、
     ``(1, 2)`` が ``[1, 2]`` に化けて別 action と誤一致したり、オブジェクトが ``'<x>'`` 文字列
     として実行される事故になる。符号化→復号して元と一致しない (= 欠損する) 値は、その場で
-    ``ValueError`` で loud に弾く (safety-sensitive な値は fidelity を厳格化する)。
+    ``ConfigError`` で loud に弾く (safety-sensitive な値は fidelity を厳格化する)。
     """
     encoded = _encode_observation(value)
     if json.loads(encoded) != value:
-        raise ValueError(
+        raise ConfigError(
             f"{what} must be JSON-native (round-trippable) so it survives "
             f"persistence/comparison losslessly; got {value!r} which does not. "
             "Use str/int/float/bool/None/list/dict."
@@ -453,7 +454,7 @@ class LoopStore:
         (詳細は :func:`loop_agent.loop.run_loop` の ``initial_state`` 参照)。
         """
         if not run_id:
-            raise ValueError("load_or_init: run_id must be a non-empty string")
+            raise ConfigError("load_or_init: run_id must be a non-empty string")
         with self.transaction():
             row = self.conn.execute(
                 "SELECT run_id FROM run WHERE run_id = ?", (run_id,)
@@ -737,7 +738,7 @@ class LoopStore:
         transaction 内の single-winner なので、並行登録でも ``created=True`` は厳密に 1 者。
         """
         if not gate_key:
-            raise ValueError("request_decision: gate_key must be a non-empty string")
+            raise ConfigError("request_decision: gate_key must be a non-empty string")
         action_json = _require_json_native(action, "gated action")
         with self.transaction():
             existing = self.conn.execute(
@@ -774,7 +775,7 @@ class LoopStore:
         org の ``pending_decisions.resolve`` に対応。``decision`` は
         :data:`DECISION_KINDS` の 4 種。``payload`` は ``edit`` の置換 action や
         ``respond`` の応答メッセージを載せる (JSON 符号化)。``pending`` 行のみ遷移可能で、
-        既に ``resolved`` 済みなら ``ValueError`` (terminal: 一度下した決定は再決定しない)。
+        既に ``resolved`` 済みなら ``StateError`` (terminal: 一度下した決定は再決定しない)。
         確定時に ``loop_gate`` event を 1 件追記する。
 
         ``edit`` の ``payload`` は **JSON ネイティブ (round-trip lossless)** を要求する。
@@ -785,7 +786,7 @@ class LoopStore:
         edit は厳格にする方針)。
         """
         if decision not in DECISION_KINDS:
-            raise ValueError(
+            raise ConfigError(
                 f"unknown decision {decision!r}; expected one of {DECISION_KINDS}"
             )
         if payload is None:
@@ -802,11 +803,11 @@ class LoopStore:
                 (run_id, gate_key),
             ).fetchone()
             if existing is None:
-                raise ValueError(
+                raise StateError(
                     f"no pending decision for gate_key {gate_key!r} (run {run_id!r})"
                 )
             if existing["status"] != "pending":
-                raise ValueError(
+                raise StateError(
                     f"decision {gate_key!r} already resolved; cannot re-decide"
                 )
             self.conn.execute(
@@ -833,7 +834,7 @@ class LoopStore:
         条件付き UPDATE で行い、**この呼び出しが遷移させられたときだけ** ``True`` を返す。
         既に ``executed`` (= 別プロセス / 別 resume が先に実行を主張済み) なら ``False``
         を返す — 敗者は実行してはならない (呼び出し側は skip する)。``pending`` (未解決) /
-        不在 / 非実行系の決定 (``reject`` / ``respond``) は ``ValueError`` (これらは
+        不在 / 非実行系の決定 (``reject`` / ``respond``) は ``StateError`` (これらは
         action を実行しないので executed へ遷移させない)。
 
         replay resume (fresh state で iteration 0 から再生する経路) では実行済みゲートを
@@ -873,15 +874,15 @@ class LoopStore:
                 (run_id, gate_key),
             ).fetchone()
             if row is None:
-                raise ValueError(
+                raise StateError(
                     f"no decision for gate_key {gate_key!r} (run {run_id!r})"
                 )
             if row["status"] == "executed":
                 return False  # 敗者: 別の resume が先に実行済み。
             if row["status"] == "pending":
-                raise ValueError(f"cannot mark unresolved gate {gate_key!r} executed")
+                raise StateError(f"cannot mark unresolved gate {gate_key!r} executed")
             # status == 'resolved' だが decision が reject/respond (= 実行しない決定)。
-            raise ValueError(
+            raise StateError(
                 f"gate {gate_key!r} decision {row['decision']!r} is not executable "
                 "(only approve/edit run an action)"
             )
@@ -914,7 +915,7 @@ class LoopStore:
 
         遷移条件:
 
-        - ``pending`` (未解決) / 不在 / 非実行系 (reject/respond) は ``ValueError``
+        - ``pending`` (未解決) / 不在 / 非実行系 (reject/respond) は ``StateError``
           (これらは action を実行しないのでリースを張らない)。
         - ``resolved``: ``executing`` へ遷移しリースを張る -> ACQUIRED。
         - ``executing`` かつ自分が保持者: 再入とみなしリースを延長 -> ACQUIRED。
@@ -929,9 +930,9 @@ class LoopStore:
         並行 resume しても ``resolved->executing`` に成功するのは 1 者だけ (single winner)。
         """
         if not owner:
-            raise ValueError("acquire_lease: owner must be a non-empty string")
+            raise ConfigError("acquire_lease: owner must be a non-empty string")
         if ttl <= 0:
-            raise ValueError(f"acquire_lease: ttl must be positive, got {ttl!r}")
+            raise ConfigError(f"acquire_lease: ttl must be positive, got {ttl!r}")
         now = time.time() if now is None else now
         expires = now + ttl
         with self.transaction():
@@ -941,7 +942,7 @@ class LoopStore:
                 (run_id, gate_key),
             ).fetchone()
             if row is None:
-                raise ValueError(
+                raise StateError(
                     f"no decision for gate_key {gate_key!r} (run {run_id!r})"
                 )
             status = row["status"]
@@ -953,11 +954,11 @@ class LoopStore:
                     "took_over": False,
                 }
             if status == "pending":
-                raise ValueError(
+                raise StateError(
                     f"cannot lease unresolved gate {gate_key!r} (run {run_id!r})"
                 )
             if row["decision"] not in ("approve", "edit"):
-                raise ValueError(
+                raise StateError(
                     f"gate {gate_key!r} decision {row['decision']!r} is not executable "
                     "(only approve/edit run an action)"
                 )
@@ -1035,7 +1036,7 @@ class LoopStore:
         防ぐ (driver は :attr:`loop_agent.loop.GateReview.on_complete` でこの順序を保証する)。
         """
         if not owner:
-            raise ValueError("complete_execution: owner must be a non-empty string")
+            raise ConfigError("complete_execution: owner must be a non-empty string")
         with self.transaction():
             cur = self.conn.execute(
                 "UPDATE pending_decision SET status = 'executed', "
