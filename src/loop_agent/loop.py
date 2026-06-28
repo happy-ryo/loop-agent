@@ -43,7 +43,11 @@ from ._async import (
     reject_awaitables,
 )
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
-from .errors import ConfigError, StateError
+# SeamTimeout / UnsupportedTimeoutKill の正準定義は loop_agent.errors にある
+# (Issue #71 で LoopError 統一階層へ再配置)。後方互換のためここから re-export する:
+# 既存の `from loop_agent.loop import SeamTimeout` / `loop_agent.loop.SeamTimeout`
+# 参照や、トップレベル `loop_agent` への露出 (__init__ が .loop から取り込む) を壊さない。
+from .errors import ConfigError, SeamTimeout, StateError, UnsupportedTimeoutKill
 from .state import LoopState, StepRecord
 
 # 人間ゲートの disposition: 提案 action をそのまま実行 / 実行せず記録だけ / 中断。
@@ -67,40 +71,6 @@ _TIMEOUT_MODES = (TIMEOUT_GRACEFUL, TIMEOUT_KILL)
 # NoProgress の既定 key (observation そのもの) で「timeout の繰り返し」を検出できる。
 ACT_TIMEOUT_OBSERVATION = "<seam-timeout:act>"
 VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
-
-
-class SeamTimeout(Exception):
-    """A loop seam exceeded its per-call timeout under ``on_timeout="kill"``.
-
-    Raised *out of the loop* (so :func:`run_loop` / :func:`async_run_loop` does
-    not return a :class:`LoopResult`) when ``act`` or ``verify`` overruns its
-    configured :class:`TimeoutPolicy` deadline in hard-kill mode. For an async
-    seam the underlying task has been cancelled (via :func:`asyncio.wait` +
-    ``task.cancel()``); for a synchronous seam on a POSIX main thread it was
-    interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
-    ``seconds`` the deadline that was exceeded.
-    """
-
-    def __init__(self, seam: str, seconds: float) -> None:
-        self.seam = seam
-        self.seconds = seconds
-        super().__init__(
-            f"{seam!r} seam exceeded its {seconds:g}s per-call timeout (hard kill)"
-        )
-
-
-class UnsupportedTimeoutKill(RuntimeError):
-    """A hard-kill timeout was requested for a *synchronous* seam that cannot be
-    interrupted on this platform/thread.
-
-    Hard-killing a blocking synchronous call requires POSIX ``SIGALRM`` on the
-    main thread (:func:`signal.setitimer`). On Windows, or off the main thread,
-    that mechanism is unavailable, so a synchronous seam cannot be *guaranteed*
-    to be interrupted -- a genuinely hung call would never return. Rather than
-    silently hang, the driver refuses up front: use an async seam (cancelled via
-    the asyncio event loop, fully portable) or ``on_timeout="graceful"`` (which
-    detects an overrun *after* the call returns; it cannot bound a hung call).
-    """
 
 
 class _GracefulTimeout(Exception):
