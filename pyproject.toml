@@ -8,7 +8,17 @@ version = "0.0.1"
 description = "loop-agent PoC: a minimal gather->act->verify->repeat loop core with composable stop conditions."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+# The loop core stays dependency-free. The only declared runtime dependency is
+# `tomli` on Python 3.10 *for the CLI's TOML reader*: stdlib `tomllib` exists
+# only on 3.11+, so 3.10 needs the (API-compatible) backport. On 3.11+ this
+# resolves to nothing, keeping installs dependency-free.
+dependencies = ['tomli>=1.1.0; python_version < "3.11"']
+
+# CLI launcher (Issue #31). `loop-agent` drives a TOML-defined gather->act->
+# verify loop; see loop_agent/cli.py. The CLI's TOML reader uses stdlib tomllib
+# (Python 3.11+), or the declared `tomli` backport on 3.10.
+[project.scripts]
+loop-agent = "loop_agent.cli:main"
 
 # OTel GenAI span 連携は optional 依存（report.md S4.5）。未導入環境では
 # loop_agent.otel.LoopSpan が no-op へ degrade し、JSONL/event sink は動き続ける。
