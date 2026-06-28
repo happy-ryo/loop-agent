@@ -332,6 +332,28 @@ def test_email_quits_even_on_send_failure():
     assert _FakeSMTP.instances[0].quit_called is True
 
 
+def test_email_subject_uses_redacted_summary():
+    # custom redact が summary を scrub する設定では件名も redaction される (P2 回帰)。
+    _FakeSMTP.instances = []
+
+    def scrub_summary(payload):
+        out = dict(payload)
+        out["summary"] = "[scrubbed]"
+        return out
+
+    notifier = EmailNotifier(
+        host="h",
+        sender="s@x",
+        recipients=["r@x"],
+        redact=scrub_summary,
+        smtp_factory=_FakeSMTP,
+    )
+    notifier.notify(make_request(summary="leak me prod-secret"))
+    msg = _FakeSMTP.instances[0].sent[0]
+    assert "prod-secret" not in msg["Subject"]
+    assert "[scrubbed]" in msg["Subject"]
+
+
 def test_email_requires_recipients():
     with pytest.raises(ValueError):
         EmailNotifier(host="h", sender="s@x", recipients=[])

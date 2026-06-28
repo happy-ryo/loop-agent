@@ -440,7 +440,10 @@ class EmailNotifier:
         message = EmailMessage()
         message["From"] = self.sender
         message["To"] = ", ".join(self.recipients)
-        message["Subject"] = f"{self.subject_prefix}: {request.summary}"
+        # 件名も body と同じく **redaction 後** の summary を使う。custom redact が
+        # summary を scrub する設定で、件名 (SMTP ヘッダ) から漏れないようにする。
+        subject_summary = payload.get("summary", request.summary)
+        message["Subject"] = f"{self.subject_prefix}: {subject_summary}"
         message.set_content(self.body_formatter(payload))
         return message
 
