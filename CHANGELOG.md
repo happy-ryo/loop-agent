@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- **multi-item 公平 scheduling `WorkListGather`**（Issue #56）: N 件を 1 本のループで
+  公平に回す `gather` フック。公平 scheduling 戦略（`round_robin` / `fewest_attempts` /
+  `fifo` / `priority` / custom callable）+ per-item 上限（`max_attempts_per_item` で
+  1 件が `MaxIterations` を独占して他を starve させるのを防ぐ）+ per-item の done 判定
+  フック（`done_when`、ループ全体の `verify` と独立）。attempts / done / exhausted は
+  毎回 `state.history` から導出するので **resume 安全**（in-process カウンタを持たない）。
+  全件 done/exhausted で止める `WorkListDrained` stop 条件と、優先度・順序計算を `triage`
+  に委譲する `WorkListGather.from_triage(...)` を同梱。既定 context は JSON ネイティブ dict
+  なので永続人間ゲート（`run_gated_loop`）と合成しても state.db に保存できる。人間ゲートを
+  挟んで offer と record がずれる構成（`GATE_SKIP` / `edit`）向けに、record の実 item を返す
+  `item_of` フックで正しく帰属できる。#37 Self-translation PoC で手書きした round-robin
+  pattern の正規化（`loop_agent.discovery.work_list`）。
+  - **内部変更**: `loop_agent.discovery` を単一モジュールから package 化（入力選定実装は
+    `_triage`・scheduling は `work_list`）。公開 import（`from loop_agent import ...` /
+    `from loop_agent.discovery import ...`）は不変。
+
 ## [0.1.0] - 2026-06-28
 
 loop-agent の最初の機能リリース。`gather -> act -> verify -> repeat` の最小ループ
