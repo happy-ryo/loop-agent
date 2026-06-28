@@ -96,6 +96,9 @@ ContextBuilder = Callable[[WorkItem, int, LoopState], Any]
 # 「*この item* は終わったか」を判定する user policy (verify とは独立)。
 DonePredicate = Callable[[WorkItem, StepRecord], bool]
 
+# その history record を「実行された 1 回の試行」として数えるか (gate SKIP 行の除外用)。
+AttemptPredicate = Callable[[StepRecord], bool]
+
 
 def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
     """試行回数最小 -> 元の並び順。#37 PoC と同じ公平戦略 (round-robin 相当)。"""
@@ -237,6 +240,14 @@ class WorkListGather:
         build_ctx: 選んだ item を ``act`` の context へ変換する ``(item, attempt, state) -> ctx``。
             ``attempt`` はこの dispatch *前* の既試行回数 (0 始まり) -- ModelLadder と合成して
             試行回数でモデルを上げる、等に使える。既定は :class:`WorkItem` 自身を返す。
+        count_attempt: history の各 record を「実行された 1 回の試行」として数えるかの
+            ``(record) -> bool`` 判定。既定 ``None`` は **全 record を試行として数える** (gate
+            無しの標準ループでは history は全て実行済み step なので正しい)。``gate`` が
+            ``GATE_SKIP`` (reject/respond) を返す構成では ``act`` を呼ばない非実行 step が
+            history に積まれる -- それを試行から外すには、skip 行を見分ける述語を渡す
+            (例: skip の ``observation`` / ``detail`` に印を付けておき ``count_attempt`` で読む)。
+            非実行 record は attempts に数えず ``done_when`` / per-item 上限の評価もしないので、
+            一度も走っていない item を上限で誤って *exhausted* にしない。
 
     Raises:
         ValueError: item id が重複 / ``strategy`` が未知の文字列 / ``max_attempts_per_item < 1``。
@@ -250,6 +261,7 @@ class WorkListGather:
         max_attempts_per_item: Optional[int] = None,
         done_when: DonePredicate = _default_done,
         build_ctx: ContextBuilder = _default_build_ctx,
+        count_attempt: Optional[AttemptPredicate] = None,
     ) -> None:
         normalized: list[WorkItem] = [
             it if isinstance(it, WorkItem) else WorkItem(id=it) for it in items
@@ -280,6 +292,7 @@ class WorkListGather:
         self._max = max_attempts_per_item
         self._done_when = done_when
         self._build_ctx = build_ctx
+        self._count_attempt = count_attempt
 
     @property
     def items(self) -> tuple[WorkItem, ...]:
@@ -342,9 +355,12 @@ class WorkListGather:
         並び・構成が変わるので **過去の history を引き継がず、新しい ``LoopState`` で開始する**
         こと (triage が done 済みを除外し、新規 ready は試行 0 から始まるのが正しい挙動)。
 
-        注意: gate の SKIP が non-executing な step 行を挟む構成では history と dispatch が
-        1:1 に揃わない (skip 行も 1 dispatch として数える)。標準の ``run_loop`` (gate 無し /
-        skip しない gate) では 1:1 が保たれる。
+        gate の SKIP が non-executing な step 行を挟む構成 (gate が reject/respond) では、
+        その行は item を「選んだが act していない」。既定ではそれも 1 試行として数えるが、
+        ``count_attempt`` を渡せば非実行行を試行から外せる (選択 = rotation 基準の前進は
+        するが attempts / done / 上限は評価しない) -- 一度も走っていない item を per-item
+        上限で誤って exhausted にしないため。標準の ``run_loop`` (gate 無し / skip しない gate)
+        では history と dispatch が 1:1 なので ``count_attempt`` は不要。
         """
         attempts: dict[str, int] = {it.id: 0 for it in self._items}
         done: set[str] = set()
@@ -357,8 +373,15 @@ class WorkListGather:
                 # selectable が尽きた後も history が続く -- 本 gatherer 由来でない step か、
                 # 全 item drained 後の余剰。これ以上の帰属はしない。
                 break
-            attempts[sel] += 1
+            # gather は item を選んだので rotation 基準は前進させる (round_robin が同じ item を
+            # 無限に再提示しないため)。ただし「実行された試行」として数えるかは別判定。
             last_selected = sel
+            if self._count_attempt is not None and not self._count_attempt(record):
+                # 非実行の record (例: gate SKIP で act せず append された行)。選ばれはしたが
+                # 試行ではないので attempts を増やさず done/exhausted も評価しない -- 一度も
+                # 走っていない item を per-item 上限で誤って exhausted にしないため (#56 review)。
+                continue
+            attempts[sel] += 1
             if self._done_when(self._by_id[sel], record):
                 done.add(sel)
             elif self._max is not None and attempts[sel] >= self._max:
