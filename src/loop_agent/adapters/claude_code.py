@@ -273,7 +273,12 @@ class ClaudeCodeAct:
             # (例 "Bash(git *)")場合でも 1 トークンに保つためカンマで連結する。
             cmd += ["--allowed-tools", ",".join(self.allowed_tools)]
         cmd += list(self.extra_args)
-        cmd.append(prompt)
+        # プロンプトは必ず "--" の後ろに置く。``--allowed-tools <tools...>`` のような
+        # 可変長(variadic)オプションや、extra_args 経由の ``--add-dir`` 等は、直後の
+        # トークンを「次の値」として貪欲に飲み込むため、区切り無しでプロンプトを末尾に
+        # 足すと CLI がプロンプトを失い(空リクエスト or timeout までハング)してしまう。
+        # POSIX 慣例の "--" でオプション解析を打ち切り、プロンプトを位置引数に確定させる。
+        cmd += ["--", prompt]
         return cmd
 
     def _build_env(self) -> dict[str, str]:

@@ -99,7 +99,8 @@ def test_build_command_includes_all_flags():
     assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
     assert cmd[cmd.index("--allowed-tools") + 1] == "Read,Edit"
     assert "--add-dir" in cmd
-    assert cmd[-1] == "the prompt"  # プロンプトは末尾の位置引数
+    # プロンプトは "--" 区切りの後ろの位置引数(可変長オプションに飲まれないため)。
+    assert cmd[-2:] == ["--", "the prompt"]
 
 
 def test_nonzero_exit_is_failed():
