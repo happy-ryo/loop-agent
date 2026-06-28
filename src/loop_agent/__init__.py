@@ -72,6 +72,20 @@ from .evaluator import (
 )
 from .gate import Decision, HumanGate, run_gated_loop
 from .loop import ActionGate, ActOutcome, GateReview, LoopResult, VerifyOutcome, run_loop
+from .notify import (
+    ApprovalDescriber,
+    ApprovalRequest,
+    ConsoleNotifier,
+    DEFAULT_SENSITIVE_KEY_PARTS,
+    EmailNotifier,
+    MultiNotifier,
+    Notifier,
+    REDACTED,
+    Redaction,
+    SlackNotifier,
+    WebhookNotifier,
+    redact_payload,
+)
 from .memory import (
     EpisodicMemory,
     Lesson,
@@ -169,6 +183,19 @@ __all__ = [
     "HumanGate",
     "Decision",
     "run_gated_loop",
+    # HumanGate 承認要求の外部通知 (webhook/Slack/email; Issue #39)
+    "Notifier",
+    "ApprovalRequest",
+    "ApprovalDescriber",
+    "Redaction",
+    "redact_payload",
+    "DEFAULT_SENSITIVE_KEY_PARTS",
+    "REDACTED",
+    "WebhookNotifier",
+    "SlackNotifier",
+    "EmailNotifier",
+    "ConsoleNotifier",
+    "MultiNotifier",
     # 外側 Reflexion ループ + RQGM epoch 安全核 (report.md S4.4 / S5 Phase3; Issue #22)
     "run_reflexion",
     "ReflexionContext",
