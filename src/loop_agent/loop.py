@@ -11,14 +11,27 @@ Termination is graceful and reason-bearing:
 
 Either way the driver returns a :class:`LoopResult` describing the outcome; it
 never raises to signal "limit reached".
+
+Two entry points share one control-flow implementation (Issue #40):
+
+- :func:`async_run_loop` -- the async driver and single source of truth. Each
+  seam (``gather`` / ``act`` / ``verify`` / ``conditions`` / ``gate`` /
+  ``on_step``) may be a synchronous callable *or* an async one; the driver awaits
+  results via :func:`loop_agent._async.maybe_await`, so sync and async hooks mix.
+- :func:`run_loop` -- the original synchronous API. It drives the shared
+  coroutine to completion *in the caller's own context* (no event loop is
+  created), so behaviour for synchronous hooks is byte-for-byte unchanged; it
+  raises a clear ``RuntimeError`` if handed an async hook (use
+  :func:`async_run_loop` for those).
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Awaitable, Callable, Optional, Protocol, Union, runtime_checkable
 
+from ._async import maybe_await, reject_awaitables
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
 from .state import LoopState, StepRecord
 
@@ -105,7 +118,8 @@ class GateReview:
     # gate が in-progress リース (report.md S5 Phase3 / Issue #21) を張った場合、ここで
     # executing -> executed を確定する (step 永続化後に呼ぶので「executed なら step 行は
     # 必ず存在」が保たれ、勝者クラッシュ時の step 欠落を防ぐ)。driver は中身を解さず呼ぶだけ。
-    on_complete: Optional[Callable[[], None]] = None
+    # 他シーム同様 sync/async どちらでも可 (driver が maybe_await で await する; Issue #40)。
+    on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
 
 
 @runtime_checkable
@@ -115,9 +129,16 @@ class ActionGate(Protocol):
     Evaluated *before* ``act`` executes the gathered context, so an irreversible
     action can be intercepted before its side effect. Returns a
     :class:`GateReview` telling the driver to proceed, skip, or pause.
+
+    ``review`` may also be **async** (return an awaitable resolving to a
+    :class:`GateReview`) -- e.g. a gate that awaits a remote approval service.
+    :func:`async_run_loop` awaits the result either way; :func:`run_loop` drives
+    an async gate through its internal event loop too.
     """
 
-    def review(self, context: Any, state: LoopState) -> GateReview:
+    def review(
+        self, context: Any, state: LoopState
+    ) -> Union[GateReview, Awaitable[GateReview]]:
         ...
 
 
@@ -203,10 +224,12 @@ class LoopResult:
         return self.stop.reason if self.stop is not None else ""
 
 
-GatherHook = Callable[[LoopState], Any]
-ActHook = Callable[[Any], ActOutcome]
-VerifyHook = Callable[[ActOutcome], VerifyOutcome]
-StepHook = Callable[[StepRecord, LoopState], None]
+# 各シームは sync callable のまま受けつつ、async (acallable) も受けられる (Issue #40)。
+# 戻り値が awaitable なら driver が await する (loop_agent._async.maybe_await)。
+GatherHook = Callable[[LoopState], Union[Any, Awaitable[Any]]]
+ActHook = Callable[[Any], Union[ActOutcome, Awaitable[ActOutcome]]]
+VerifyHook = Callable[[ActOutcome], Union[VerifyOutcome, Awaitable[VerifyOutcome]]]
+StepHook = Callable[[StepRecord, LoopState], Union[None, Awaitable[None]]]
 Conditions = Union[AnyOf, list[StopCondition], tuple[StopCondition, ...]]
 
 
@@ -215,7 +238,7 @@ def _default_gather(state: LoopState) -> LoopState:
     return state
 
 
-def run_loop(
+async def async_run_loop(
     *,
     act: ActHook,
     verify: VerifyHook,
@@ -225,13 +248,44 @@ def run_loop(
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
+    # _strict_sync は run_loop 専用の内部フラグ (公開 API では使わない)。True の間
+    # maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
+    _strict_sync: bool = False,
 ) -> LoopResult:
-    """Drive gather -> act -> verify -> repeat until the goal or a cap.
+    """Async driver: gather -> act -> verify -> repeat until the goal or a cap.
+
+    This is the **single source of truth** for the loop's control flow; the
+    synchronous :func:`run_loop` is a thin ``asyncio.run`` wrapper around it. Use
+    this entry point when you are already inside an event loop (``await
+    async_run_loop(...)``) or when any hook is a coroutine function.
+
+    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``, ``act``,
+    ``verify``, each ``conditions`` ``check``, ``gate.review``, ``on_step`` (and a
+    gate's ``on_complete``) -- may be a plain synchronous callable *or* an async
+    one (returning an awaitable). The driver awaits each result via
+    :func:`loop_agent._async.maybe_await`, so synchronous and asynchronous hooks
+    mix freely (e.g. an async ``gather`` + sync ``act`` + async ``verify``). A
+    synchronous hook adds no awaiting overhead -- its return value is not
+    awaitable, so it is used as-is.
+
+    **asyncio の使い方.** This coroutine performs no concurrency of its own: it
+    ``await``\\s each seam *sequentially* to preserve the exact gather -> gate ->
+    act -> verify ordering and the stop-condition evaluation timing of the
+    synchronous loop. It runs on whatever event loop awaits it. To run several
+    independent loops concurrently, schedule them as tasks from the caller, e.g.
+    ``await asyncio.gather(async_run_loop(...), async_run_loop(...))`` or
+    ``asyncio.create_task(async_run_loop(...))`` -- each call owns its own
+    :class:`LoopState`, so concurrent runs do not interfere. ``time_fn`` stays a
+    *synchronous* monotonic clock (it is read, never awaited); a blocking
+    synchronous ``act`` will block the event loop, so wrap genuinely blocking
+    work (or use an async hook with ``loop.run_in_executor``) when sharing a loop
+    with other tasks.
 
     Args:
         act: Hook producing an :class:`ActOutcome` from the gathered context.
+            May be sync or async.
         verify: Hook turning an :class:`ActOutcome` into a :class:`VerifyOutcome`;
-            ``goal_met=True`` terminates the loop naturally.
+            ``goal_met=True`` terminates the loop naturally. May be sync or async.
         conditions: An :class:`~loop_agent.conditions.AnyOf`, or any non-empty
             sequence of stop conditions (wrapped in ``AnyOf`` automatically).
         gather: Hook building the context handed to ``act``. Defaults to passing
@@ -290,6 +344,45 @@ def run_loop(
     ``NoProgress(key=lambda r: json.dumps(r.observation, sort_keys=True, default=repr))``),
     when the run must resume identically.
     """
+    # Scope the strict-sync flag to THIS run by setting it explicitly at entry
+    # (overriding any value inherited via copy_context from an outer run_loop):
+    # run_loop passes _strict_sync=True and drives this coroutine manually, while a
+    # nested asyncio.run(async_run_loop(...)) started from a synchronous hook gets the
+    # default False here -- so strict rejection neither leaks into the nested run nor
+    # depends on ambient event-loop presence (it works even when run_loop is called
+    # from inside a running loop).
+    token = reject_awaitables.set(_strict_sync)
+    try:
+        return await _drive_loop(
+            act=act,
+            verify=verify,
+            conditions=conditions,
+            gather=gather,
+            on_step=on_step,
+            gate=gate,
+            time_fn=time_fn,
+            initial_state=initial_state,
+        )
+    finally:
+        reject_awaitables.reset(token)
+
+
+async def _drive_loop(
+    *,
+    act: ActHook,
+    verify: VerifyHook,
+    conditions: Conditions,
+    gather: GatherHook = _default_gather,
+    on_step: Optional[StepHook] = None,
+    gate: Optional[ActionGate] = None,
+    time_fn: Callable[[], float] = time.monotonic,
+    initial_state: Optional[LoopState] = None,
+) -> LoopResult:
+    """The loop body for :func:`async_run_loop` (sync/async-seam driver).
+
+    Separated so :func:`async_run_loop` can scope the strict-sync contextvar
+    around it; see that function for the full contract.
+    """
     if isinstance(conditions, AnyOf):
         stop = conditions
     elif isinstance(conditions, (list, tuple)):
@@ -339,17 +432,17 @@ def run_loop(
 
     while True:
         state.elapsed = time_fn() - start
-        triggered = stop.first_triggered(state)
+        triggered = await stop.afirst_triggered(state)
         if triggered is not None:
             return LoopResult(status="stopped", stop=triggered, state=state)
 
-        context = gather(state)
+        context = await maybe_await(gather(state))
 
         # gated PROCEED が張ったリースの完了通知 (executing->executed)。act 実行後・
         # step 永続化後に呼ぶため、ここで掴んでおく (非ゲート step では None のまま)。
-        gate_on_complete: Optional[Callable[[], None]] = None
+        gate_on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
         if gate is not None:
-            review = gate.review(context, state)
+            review = await maybe_await(gate.review(context, state))
             if review.disposition == GATE_PAUSE:
                 # Interrupt before the irreversible side effect. No step is
                 # recorded for the un-executed action; the decision is persisted
@@ -375,7 +468,7 @@ def run_loop(
                 # replay no-op な skip (review.persist=False) は on_step を呼ばない:
                 # 前 run が永続化した本来の step 行を上書きで壊さないため。
                 if on_step is not None and review.persist:
-                    on_step(record, state)
+                    await maybe_await(on_step(record, state))
                 continue
             if review.disposition != GATE_PROCEED:
                 # Fail closed: an unrecognised disposition (e.g. a typo'd
@@ -393,10 +486,10 @@ def run_loop(
                 context = review.context
             gate_on_complete = review.on_complete
 
-        outcome = act(context)
+        outcome = await maybe_await(act(context))
         state.tokens_used += outcome.tokens
 
-        verdict = verify(outcome)
+        verdict = await maybe_await(verify(outcome))
         record = StepRecord(
             iteration=state.iteration,
             observation=outcome.observation,
@@ -414,7 +507,7 @@ def run_loop(
             state.goal_met = True
 
         if on_step is not None:
-            on_step(record, state)
+            await maybe_await(on_step(record, state))
 
         # step を永続化した *後* にリース完了を確定する (executing->executed)。順序が肝:
         # 「executed なら step 行は必ず存在」を満たし、勝者クラッシュ時の step 欠落を防ぐ。
@@ -422,7 +515,99 @@ def run_loop(
         # まま残り、別プロセスがリース失効で取り直して完遂する (= クラッシュと同じ復旧経路)。
         # 握り潰して継続すると未確定のまま後続へ進み順序整合を壊すため、fail-loud が安全。
         if gate_on_complete is not None:
-            gate_on_complete()
+            await maybe_await(gate_on_complete())
 
         if verdict.goal_met:
             return LoopResult(status="goal_met", stop=None, state=state)
+
+
+def run_loop(
+    *,
+    act: ActHook,
+    verify: VerifyHook,
+    conditions: Conditions,
+    gather: GatherHook = _default_gather,
+    on_step: Optional[StepHook] = None,
+    gate: Optional[ActionGate] = None,
+    time_fn: Callable[[], float] = time.monotonic,
+    initial_state: Optional[LoopState] = None,
+) -> LoopResult:
+    """Drive gather -> act -> verify -> repeat until the goal or a cap (sync).
+
+    This is the **synchronous entry point** and the original public API. It shares
+    one control-flow implementation with :func:`async_run_loop` (which owns the
+    loop body) and behaves identically for synchronous hooks: same arguments,
+    same :class:`LoopResult`, same stop-condition timing, same resume semantics.
+    See :func:`async_run_loop` for the full description of the arguments, the dual
+    termination contract, the human gate, and ``resume`` via ``initial_state``.
+
+    **Exact-parity drive (no event loop).** With fully synchronous hooks the
+    shared coroutine never actually awaits anything (``maybe_await`` returns
+    non-awaitable values without suspending), so ``run_loop`` runs it to
+    completion in the **caller's own context** by stepping it once
+    (``coro.send(None)`` -> ``StopIteration`` carries the result). It does *not*
+    create an event loop, wrap the work in a :class:`asyncio.Task`, or touch the
+    event-loop policy -- so caller-side context (e.g. :mod:`contextvars` set by a
+    hook) propagates exactly as it did before async support existed, hook
+    exceptions propagate with their own type unchanged, and there is zero asyncio
+    overhead per call. ``run_loop`` may therefore be called from anywhere,
+    including from within a running event loop (it blocks like any synchronous
+    call, exactly as the original sync loop did).
+
+    **Async seams belong on** :func:`async_run_loop`. ``run_loop`` calls it with
+    ``_strict_sync=True``, which scopes the strict-sync flag
+    (:data:`loop_agent._async.reject_awaitables`) to this run: if *any* seam
+    returns an awaitable -- a hook, a ``conditions`` check, ``gate.review``,
+    ``on_step``, or ``on_complete`` -- :func:`maybe_await` (and
+    :meth:`AnyOf.afirst_triggered`) raise
+    :class:`loop_agent._async.AsyncSeamInSyncLoop` (a ``RuntimeError``) at that
+    point, reliably and regardless of whether the awaitable would have suspended.
+    (The original sync ``run_loop`` never accepted async seams either, so this is
+    not a regression -- it is a clear, consistent error directing you to
+    ``await async_run_loop(...)``.) Because the flag is set explicitly per run, it
+    works even when ``run_loop`` is invoked from inside a running event loop, and a
+    nested ``asyncio.run(async_run_loop(...))`` started from a synchronous hook
+    runs non-strict (it enters with the default ``_strict_sync=False``).
+    """
+    # Drive the shared coroutine synchronously in the caller's context. async_run_loop
+    # (with _strict_sync=True) makes maybe_await / AnyOf.afirst_triggered reject any
+    # awaitable seam instead of awaiting it, so an all-sync loop runs straight to
+    # completion without ever suspending -- the first step raises StopIteration
+    # carrying the LoopResult. No event loop is created and no Task copies the
+    # context, so caller-side contextvars and exception types are preserved exactly.
+    # Seam exceptions raised during the step propagate out of send() directly (not
+    # via StopIteration), keeping their original type.
+    coro = async_run_loop(
+        act=act,
+        verify=verify,
+        conditions=conditions,
+        gather=gather,
+        on_step=on_step,
+        gate=gate,
+        time_fn=time_fn,
+        initial_state=initial_state,
+        _strict_sync=True,
+    )
+    try:
+        coro.send(None)
+    except StopIteration as completed:
+        # Normal completion: the coroutine's `return` surfaces as StopIteration
+        # carrying the LoopResult (this is the coroutine protocol, not a seam
+        # raising StopIteration -- that case is handled just below).
+        return completed.value
+    except RuntimeError as exc:
+        # PEP 479: a StopIteration *raised by a synchronous seam* inside the
+        # coroutine (e.g. an iterator-backed act doing next() on exhaustion) is
+        # rewritten to "RuntimeError: coroutine raised StopIteration" as it crosses
+        # the coroutine boundary, with the original exception as __cause__. The
+        # original purely-synchronous run_loop propagated the seam's own type, so
+        # unwrap it to preserve exception-type parity (other RuntimeErrors pass
+        # through unchanged).
+        if isinstance(exc.__cause__, StopIteration):
+            raise exc.__cause__
+        raise
+    else:
+        # Unreachable: with strict-sync set, maybe_await never awaits, so the
+        # coroutine cannot suspend. Guard defensively rather than hang.
+        coro.close()
+        raise RuntimeError("run_loop(): synchronous driver unexpectedly suspended")

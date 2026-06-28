@@ -79,7 +79,16 @@ from .evaluator import (
     agreement,
 )
 from .gate import Decision, HumanGate, run_gated_loop
-from .loop import ActionGate, ActOutcome, GateReview, LoopResult, VerifyOutcome, run_loop
+from ._async import AsyncSeamInSyncLoop
+from .loop import (
+    ActionGate,
+    ActOutcome,
+    GateReview,
+    LoopResult,
+    VerifyOutcome,
+    async_run_loop,
+    run_loop,
+)
 from .notify import (
     ApprovalDescriber,
     ApprovalRequest,
@@ -150,6 +159,8 @@ from .waker import LoopWaker, wake_id_for, wakes_for_result
 
 __all__ = [
     "run_loop",
+    "async_run_loop",
+    "AsyncSeamInSyncLoop",
     "ActOutcome",
     "VerifyOutcome",
     "LoopResult",

@@ -297,9 +297,14 @@ def run_observed_loop(
     else:
         user_on_step = on_step
 
-        def step_hook(record: StepRecord, state: LoopState) -> None:
+        def step_hook(record: StepRecord, state: LoopState):
             observer.on_step(record, state)
-            user_on_step(record, state)
+            # Return the user hook's result rather than swallowing it, so an
+            # awaitable (async on_step) reaches run_loop's strict-sync gate and is
+            # rejected with AsyncSeamInSyncLoop -- consistent with passing an async
+            # on_step to run_loop directly -- instead of being silently dropped.
+            # The observer's own on_step is synchronous (returns None).
+            return user_on_step(record, state)
 
     # time_fn / initial_state は渡されたときだけ run_loop に転送し、既定（time.monotonic
     # / fresh start）を尊重する。

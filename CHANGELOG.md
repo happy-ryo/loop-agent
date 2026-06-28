@@ -25,6 +25,22 @@
   - **内部変更**: `loop_agent.discovery` を単一モジュールから package 化（入力選定実装は
     `_triage`・scheduling は `work_list`）。公開 import（`from loop_agent import ...` /
     `from loop_agent.discovery import ...`）は不変。
+- **async/await 対応（`async_run_loop`）**: ループ制御フローの単一実装を `async def`
+  化し、新たな非同期エントリポイント `async_run_loop` として公開（Issue #40）。
+  同期 API `run_loop` は完全に維持される（同じ引数・同じ `LoopResult`・同じ stop
+  条件評価タイミング・同じ resume 意味論）。内部は共有コルーチンを **呼び出し側の
+  コンテキストでそのまま駆動**（全同期フックなら一度も await されないため event loop
+  を生成しない）。これにより `contextvars` 伝播も例外型もオーバーヘッドも従来どおり。
+  `gather` / `act` / `verify` / 各 `conditions` の `check` /
+  `gate.review` / `on_step` の各シームは **同期 callable のまま受けつつ、非同期
+  (acallable) も受けられる**（`loop_agent._async.maybe_await` で結果を await。
+  同期フックは追加コストなし）。混在（async gather + sync act + async verify 等）も
+  可能。`GoalMet` の verifier、`AnyOf.afirst_triggered` も非同期 `check` を受ける。
+  非同期シーム（任意のフック・`conditions` の `check`・`gate.review`・`on_step`・
+  `on_complete`）を `run_loop`（同期 API）へ渡した場合は、駆動中の strict-sync 判定に
+  より awaitable を検出した時点で `AsyncSeamInSyncLoop`（`RuntimeError` サブクラス）を
+  **一貫して**送出する（そのシームが実際に suspend するか否かに依存しない）。非同期
+  シームには `await async_run_loop(...)` を使う。
 
 ## [0.1.0] - 2026-06-28
 
