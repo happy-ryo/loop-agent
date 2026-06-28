@@ -28,9 +28,11 @@ LoopError(Exception)                              ライブラリ全エラーの
 
 | 型 | いつ送出されるか | 例 |
 |----|------------------|-----|
-| `ConfigError` | 引数の **値/型** が不正、または run の設定ミス（construction / 呼び出し時の検証）。CLI の TOML / 引数パースの設定エラーも含む | `MaxIterations(-1)`、空文字の id、フックに不正な型、未知の enum 値、`[act]` テーブル欠落 |
+| `ConfigError` | ライブラリが **明示的に検証**している引数の **値** が不正、または明示的な **型/形状チェック**に反する、もしくは run の設定ミス（construction / 呼び出し時の検証）。CLI の TOML / 引数パースの設定エラーも含む | `MaxIterations(-1)`、空文字の id、`conditions` が `AnyOf`/sequence でない、フック/resolver の戻り値型が不正、未知の enum 値、`[act]` テーブル欠落 |
 | `StateError` | 実行時の **不変条件 / 状態** 違反。「不正な入力」ではなく「その状態では許されない操作」 | 既に解決済みの gate 決定の再解決、未解決/実行不能な決定の execute/lease、resume 時に提案 action が記録と不一致、未知の gate disposition、driver の防御的 invariant |
 | `AsyncSeamInSyncLoop` | 同期 `run_loop` に awaitable なシーム（`act`/`verify`/`gather`/`condition.check`/`gate.review`/`on_step`/`on_complete`）が渡された | 非同期フックには `await async_run_loop(...)` を使う（#40） |
+
+> `ConfigError` はライブラリ **自身**の検証を包む。型ヒントに反する値を未チェックの数値経路へ渡した場合（例: `MaxIterations(None)`）は、その演算が素の `TypeError` を送出する（Python 標準の挙動で、ここでは包まない）。
 
 ## 後方互換（multiple inheritance）
 
