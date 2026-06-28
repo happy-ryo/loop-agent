@@ -44,4 +44,4 @@ def verify(outcome):
 - **public シグネチャの不変チェック**を verify に足すと、「テストが見ていない外形の破壊」を安価に検出できます。
 - **スコープを 1 モジュール / 1 反復に絞る**。act に「このモジュールだけ整理して」と渡し、verify は全 suite を回す（局所変更が全体を壊していないか）。
 - **Reflexion が効く可能性が高いタスク**: リファクタの失敗は *systematic* になりがち（例: 「この import 順序を毎回壊す」「同じ抽象化ミスを繰り返す」）。同じ誤りが反復するなら lesson が次モジュールに効くので、translation/flaky より Reflexion 向き。判断は [reflexion-when-to-use.md](../reflexion-when-to-use.md)。
-- **commit / push はループ外に隔離する**。編集自体は git で戻せるので、ループは編集だけ。不可逆な commit / push は収束後に人間が行う。`HumanGate` は `gather` が返すループの離散 action を審査するもので、`act` の subprocess が内部で打つ `git commit` は見えない（commit をゲートしたいなら commit をループの離散 action にする — [README の限定人間ゲート節](../../README.md#限定人間ゲート不可逆操作のみ-approveeditrejectrespond)）。
+- **commit / push はループ外に隔離する**。編集自体は git で戻せるので、ループは編集だけ。不可逆な commit / push は収束後に人間が行う。`HumanGate` は `gather` が返すループの離散 action を審査するもので、`act` の subprocess が内部で打つ `git commit` は見えない（commit をゲートしたいなら commit をループの離散 action にする — [docs/safety.md の限定人間ゲート節](../safety.md)）。

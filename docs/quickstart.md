@@ -2,7 +2,7 @@
 
 このページは、Claude Code を日常的に使っているあなたが loop-agent を **30 分で実走させる**ための動線です。最短は **動線 E（coding-agent driven）** — 自然言語で「こういうループを回したい」と書けば、Claude Code 自身が `gather / act / verify / conditions / gate` を組み立てて実行まで持っていきます。手で組みたい場合の最小形（動線 A / B）もあとに置いてあります。
 
-前提知識は [README の Embeddable Loop Engine 節](../README.md#embeddable-loop-engine-for-agents) のシーム一覧だけ。ループが「持つ」のはオーケストレーション本体だけで、policy（何を選び・どう実行し・何を成功とするか）は全部あなた（または coding agent）が書きます。
+前提知識は [docs/seams.md](./seams.md) のシーム一覧だけ。ループが「持つ」のはオーケストレーション本体だけで、policy（何を選び・どう実行し・何を成功とするか）は全部あなた（または coding agent）が書きます。
 
 ---
 
@@ -131,7 +131,7 @@ act = CodexAct(model="gpt-5.5", effort="medium", timeout=600)   # allowed_tools 
 
 ### TOML + CLI で回す（コードを書かない最小形）
 
-`task.toml` を書いて `loop-agent run` でも起動できます。詳細は [README の CLI ランチャ節](../README.md#cli-ランチャloop-agent-run--status--resume--logs)。
+`task.toml` を書いて `loop-agent run` でも起動できます。詳細は [docs/cli.md](./cli.md)。
 
 ```bash
 loop-agent run ./examples/task.toml --max-iter 5
@@ -194,7 +194,7 @@ result = run_loop(act=act, verify=verify,
 db.record_result(result)
 ```
 
-> **resume のコツ**: 停止判定は (gather された) **state から導く**こと。プロセスをまたぐと act/verify フックは作り直され、その内部のコール回数カウンタは復元されません。state から判定すれば新プロセスでも同じ判断を再現できます。詳細は [README の resume 節](../README.md#ループ状態の-sotstatedb)。
+> **resume のコツ**: 停止判定は (gather された) **state から導く**こと。プロセスをまたぐと act/verify フックは作り直され、その内部のコール回数カウンタは復元されません。state から判定すれば新プロセスでも同じ判断を再現できます。詳細は [docs/persistence-and-resume.md](./persistence-and-resume.md)。
 
 ---
 
@@ -233,7 +233,7 @@ db.record_result(result)
 | **HumanGate** | **ループ自身が提案する離散 action だけ**人間承認を挟む。pause→resume をまたいで決定を保持し、不可逆は exactly-once | `HumanGate(on=lambda action: action in {"commit", "push", "deploy"}, store=..., run_id=...)` |
 | **Reflexion** | 同じ誤りを繰り返す **systematic failure** で、失敗 episode の lesson を次 episode に配線して改善。ただし stochastic な取りこぼしには効かない（→ [reflexion-when-to-use.md](./reflexion-when-to-use.md)） | `run_reflexion(...)` |
 
-> **HumanGate の射程に注意（重要）**: `HumanGate` が審査するのは `gather` が返す**ループの離散 action**であって、`act` の subprocess（`claude --print`）が内部で実行する `git commit` 等は**見えない**（ゲートは `gather` と `act` の間で発火する）。したがって不可逆操作を本当にゲートしたいなら、(1) act の subprocess に commit / push をさせず（`allowed_tools` を編集系に絞る）、commit / push は**ループ外の人間ステップ**にする、または (2) commit を**ループの離散 action として `gather` に提案させ**、`on` で拾って `act` に実行させる。README の [限定人間ゲート節](../README.md#限定人間ゲート不可逆操作のみ-approveeditrejectrespond) が (2) の正準例（`on=lambda a: a == "deploy"`）。
+> **HumanGate の射程に注意（重要）**: `HumanGate` が審査するのは `gather` が返す**ループの離散 action**であって、`act` の subprocess（`claude --print`）が内部で実行する `git commit` 等は**見えない**（ゲートは `gather` と `act` の間で発火する）。したがって不可逆操作を本当にゲートしたいなら、(1) act の subprocess に commit / push をさせず（`allowed_tools` を編集系に絞る）、commit / push は**ループ外の人間ステップ**にする、または (2) commit を**ループの離散 action として `gather` に提案させ**、`on` で拾って `act` に実行させる。[docs/safety.md の限定人間ゲート節](./safety.md) が (2) の正準例（`on=lambda a: a == "deploy"`）。
 
 最小の安全テンプレ（self-improvement 系で推奨。act は編集のみ、commit は外）:
 
@@ -254,4 +254,6 @@ result = run_loop(
 
 - [docs/recipes/](./recipes/) — 動線 E の prose intent → harness の具体例（flaky test / 翻訳 / リファクタ）
 - [docs/reflexion-when-to-use.md](./reflexion-when-to-use.md) — Reflexion が効くタスク / 効かないタスクの判断基準（PoC 実証データ）
-- [README](../README.md) — 全 API・state.db / transport / work-discovery / 外側 Reflexion の詳細
+- [docs/api-reference.md](./api-reference.md) — 全 API 概要・ループコアのスコープ
+- [docs/persistence-and-resume.md](./persistence-and-resume.md) / [docs/transport.md](./transport.md) / [docs/reflexion.md](./reflexion.md) — state.db / transport / work-discovery / 外側 Reflexion の詳細
+- [README](../README.md) — 全体像と docs/ ナビゲーション

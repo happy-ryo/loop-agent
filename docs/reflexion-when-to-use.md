@@ -60,7 +60,7 @@ Run 2 の episode 内訳:
 1. **まず Reflexion なしで回す**（`run_loop` + `MaxIterations` などの上限）。多くのタスクはこれで足ります。
 2. **失敗ログを見て相関を確認する**。`LoopObserver` の JSONL / state.db の step を見て、「同じ箇所・同じ種類で繰り返し失敗しているか」を判定。
 3. **systematic なら Reflexion を足す**（`run_reflexion`）。失敗が試行をまたいで相関しているときだけ、lesson 配線が回数とコストを節約します。
-4. **モデル昇格と直交**。困難さが「弱いモデルの力不足」由来なら、Reflexion より [ModelLadder パターン](../README.md#動線-d-応用パターンシームで自分でも書ける正準例)（強いモデルへエスカレーション）が効きます。両者は重ねられます（lessons + モデル昇格の二段防御）。
+4. **モデル昇格と直交**。困難さが「弱いモデルの力不足」由来なら、Reflexion より [ModelLadder パターン](./adapters/README.md)（強いモデルへエスカレーション）が効きます。両者は重ねられます（lessons + モデル昇格の二段防御）。
 
 ### このタスク種別はどっち寄り?
 
@@ -79,4 +79,4 @@ Run 2 の episode 内訳:
 - **評価器を固定して self-optimize させない**: epoch 内は評価基準を凍結し、更新は epoch 境界で held-out の固定 gold ラベルに対する一致度で incumbent を ε 超で上回るときだけ。
 - **lesson の取込前検証**: grounding を要求し、自己申告の support は driver が再計算して上書きする（false lesson 注入を弾く）。
 
-詳細は [README の外側 Reflexion 節](../README.md#外側-reflexion-ループ--rqgm-epoch-安全核self-improving)。
+詳細は [docs/reflexion.md](./reflexion.md)。
