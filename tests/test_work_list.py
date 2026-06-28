@@ -73,6 +73,15 @@ def done_from_observation(_item: WorkItem, record: StepRecord) -> bool:
     return bool(isinstance(obs, dict) and obs.get("done"))
 
 
+def item_of_observation(record: StepRecord):
+    """``scripted_act`` が焼いた実 item id を返す item_of (gate 合成用)。
+
+    skip 行 (``{"skipped": True}`` で ``item`` 無し) には ``None`` (非実行) を返す。
+    """
+    obs = record.observation
+    return obs.get("item") if isinstance(obs, dict) else None
+
+
 def history_of(*ids_done: tuple[str, bool]) -> LoopState:
     """``(item_id, done)`` の並びから ``LoopState.history`` を組む (導出テスト用)。"""
     state = LoopState()
@@ -420,10 +429,10 @@ def test_default_ctx_is_json_native_for_persistent_gate():
     assert result.pending["action"]["id"] == "a"  # 既定 ctx dict が round-trip した
 
 
-def test_count_attempt_excludes_gate_skips_from_exhaustion():
-    # gate が item の action を SKIP すると run_loop は act せず StepRecord を積む。
-    # 既定ではそれも 1 試行として数えてしまい、走ってもいない item が per-item 上限で
-    # exhausted になりうる (#56 codex review)。count_attempt で非実行行を除外して防ぐ。
+def test_item_of_excludes_gate_skips_from_exhaustion():
+    # gate が item の action を SKIP すると run_loop は act せず StepRecord を積む。既定では
+    # それも 1 試行として数え、走ってもいない item が per-item 上限で exhausted になりうる
+    # (#56 codex review)。item_of が skip 行に None を返せば非実行として外せる。
 
     class SkipFirstTwo:
         """最初の 2 回は SKIP、以降は PROCEED する gate (skip 行に印を付ける)。"""
@@ -439,16 +448,12 @@ def test_count_attempt_excludes_gate_skips_from_exhaustion():
                 )
             return GateReview(disposition=GATE_PROCEED)
 
-    is_real_attempt = lambda rec: not (
-        isinstance(rec.observation, dict) and rec.observation.get("skipped")
-    )
-
     # 単一 item, cap=2。skip を試行に数えると 2 回の skip で即 exhausted (act 0 回) になる。
     g = WorkListGather(
         ["a"],
         max_attempts_per_item=2,
         done_when=done_from_observation,
-        count_attempt=is_real_attempt,
+        item_of=item_of_observation,
     )
     dispatched: list[str] = []
     result = run_loop(
@@ -466,8 +471,8 @@ def test_count_attempt_excludes_gate_skips_from_exhaustion():
 
 
 def test_excluded_skips_still_rotate_fairly_no_starvation():
-    # count_attempt で skip を試行から外しても、公平性は selections (offer 回数) で測るので
-    # 先頭 item を skip し続けても他 item が offer される (#56 codex review 2: starve 防止)。
+    # item_of で skip を非実行にしても、公平性は selections (offer 回数) で測るので先頭 item を
+    # skip し続けても他 item が offer される (#56 codex review 2: starve 防止)。
     offered: list[str] = []
 
     class SkipEverything:
@@ -475,11 +480,8 @@ def test_excluded_skips_still_rotate_fairly_no_starvation():
             offered.append(_ctx_id(context))  # gate に提示された item
             return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
 
-    is_real_attempt = lambda rec: not (
-        isinstance(rec.observation, dict) and rec.observation.get("skipped")
-    )
     g = WorkListGather(
-        ["a", "b", "c"], strategy="fewest_attempts", count_attempt=is_real_attempt
+        ["a", "b", "c"], strategy="fewest_attempts", item_of=item_of_observation
     )
     run_loop(
         act=scripted_act([], {}),
@@ -492,8 +494,42 @@ def test_excluded_skips_still_rotate_fairly_no_starvation():
     assert offered == ["a", "b", "c", "a", "b", "c"]
 
 
+def test_item_of_attributes_gate_edits_to_actual_item():
+    # scheduler は a を offer するが、gate が最初の a を b の action に edit して PROCEED する。
+    # record は b のものなので item_of で b に帰属する (#56 codex review 4: edit 取り違え防止)。
+    # item_of を渡さないと b の record が offer 元 a に誤帰属する。
+    class EditFirstAToB:
+        def __init__(self) -> None:
+            self.edited = False
+
+        def review(self, context, state):
+            if _ctx_id(context) == "a" and not self.edited:
+                self.edited = True
+                return GateReview(disposition=GATE_PROCEED, context={"id": "b"})
+            return GateReview(disposition=GATE_PROCEED)
+
+    g = WorkListGather(
+        ["a", "b", "c"], done_when=done_from_observation, item_of=item_of_observation
+    )
+    dispatched: list[str] = []
+    result = run_loop(
+        act=scripted_act(dispatched, {"a": 1, "b": 1, "c": 1}),
+        verify=never_done,
+        gather=g,
+        gate=EditFirstAToB(),
+        conditions=[WorkListDrained(g), MaxIterations(20)],
+    )
+    rep = g.report(result.state)
+    # 各 item は実 act 1 回ずつ正しい item に帰属して done (a は edit step では実行されず、
+    # 後の素通り step で実行された)。誤帰属なら a が 2 回・b が 0 回等になる。
+    assert set(rep.done) == {"a", "b", "c"}
+    assert rep.attempts == {"a": 1, "b": 1, "c": 1}
+    assert dispatched == ["b", "c", "a"]  # offer a->edit b, 次 c, 最後 a
+    assert result.stop.name == "work_list_drained"
+
+
 def test_skips_counted_as_attempts_by_default():
-    # 対照: count_attempt を渡さなければ skip 行も 1 試行として数える (既定挙動)。
+    # 対照: item_of を渡さなければ skip 行も 1 試行として offer 元 item に数える (既定挙動)。
     class AlwaysSkip:
         def review(self, context, state):
             return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
