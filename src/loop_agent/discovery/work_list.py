@@ -57,8 +57,9 @@ class WorkItem:
         id: 安定識別子 (非空・work-list 内で一意)。attempts / done の集計キー。
         priority: ``priority`` 戦略で使う優先度。**大きいほど優先**。既定 0。
         payload: 採択時に ``act`` へ渡したい任意値 (ファイルパス・タスク本文・seed 等)。
-            既定の ``build_ctx`` は :class:`WorkItem` 自身を ``act`` の context にするので、
-            ``act`` 側で ``ctx.payload`` / ``ctx.id`` を読める。
+            既定の ``build_ctx`` は JSON ネイティブ dict ``{"id", "attempt", "priority",
+            "payload"}`` を ``act`` の context にするので、``act`` 側で ``ctx["payload"]`` /
+            ``ctx["id"]`` を読める。``payload`` 自体も (永続ゲートと合成するなら) JSON ネイティブに。
     """
 
     id: str
@@ -230,9 +231,23 @@ def _default_done(item: WorkItem, record: StepRecord) -> bool:
     return bool(record.goal_met)
 
 
-def _default_build_ctx(item: WorkItem, attempt: int, state: LoopState) -> WorkItem:
-    """既定の context: :class:`WorkItem` 自身を ``act`` に渡す (``ctx.payload`` で本体取得)。"""
-    return item
+def _default_build_ctx(item: WorkItem, attempt: int, state: LoopState) -> dict[str, Any]:
+    """既定の context: JSON ネイティブな dict ``{"id", "attempt", "priority", "payload"}``。
+
+    ``act`` は ``ctx["id"]`` / ``ctx["payload"]`` / ``ctx["attempt"]`` で読む。**JSON ネイティブ
+    にしてあるのは意図的**: 永続人間ゲート (:class:`~loop_agent.gate.HumanGate` /
+    :func:`~loop_agent.gate.run_gated_loop`) と合成したとき、gate が pause すると context が
+    提案 action として state.db に保存される (``request_decision`` は JSON ネイティブを要求する)。
+    :class:`WorkItem` 自身を返すと round-trip できず ``ValueError`` になるため、dict を既定に
+    する (``payload`` が JSON ネイティブな限り安全)。``WorkItem`` をそのまま欲しい等は ``build_ctx``
+    で上書きする。
+    """
+    return {
+        "id": item.id,
+        "attempt": attempt,
+        "priority": item.priority,
+        "payload": item.payload,
+    }
 
 
 class WorkListGather:
@@ -260,7 +275,9 @@ class WorkListGather:
             再 dispatch されない (sticky)。
         build_ctx: 選んだ item を ``act`` の context へ変換する ``(item, attempt, state) -> ctx``。
             ``attempt`` はこの dispatch *前* の既試行回数 (0 始まり) -- ModelLadder と合成して
-            試行回数でモデルを上げる、等に使える。既定は :class:`WorkItem` 自身を返す。
+            試行回数でモデルを上げる、等に使える。既定は JSON ネイティブ dict ``{"id", "attempt",
+            "priority", "payload"}`` を返す (永続人間ゲートと合成しても state.db に保存できるよう
+            JSON ネイティブにしてある)。
         count_attempt: history の各 record を「実行された 1 回の試行」として数えるかの
             ``(record) -> bool`` 判定。既定 ``None`` は **全 record を試行として数える** (gate
             無しの標準ループでは history は全て実行済み step なので正しい)。``gate`` が

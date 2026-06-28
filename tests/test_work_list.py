@@ -35,6 +35,15 @@ from conftest import never_done
 # -- テスト用ハーネス ---------------------------------------------------------
 
 
+def _ctx_id(ctx) -> str:
+    """build_ctx の出力 (既定の JSON dict / WorkItem / 素の id 文字列) から item id を取る。"""
+    if isinstance(ctx, dict):
+        return ctx["id"]
+    if isinstance(ctx, WorkItem):
+        return ctx.id
+    return ctx
+
+
 def scripted_act(dispatched: list[str], completes: dict[str, int]):
     """dispatch された item id を記録し、``completes`` 回目で done フラグを立てる ``act``。
 
@@ -44,12 +53,13 @@ def scripted_act(dispatched: list[str], completes: dict[str, int]):
     """
     counts: dict[str, int] = {}
 
-    def _act(ctx: WorkItem) -> ActOutcome:
-        counts[ctx.id] = counts.get(ctx.id, 0) + 1
-        dispatched.append(ctx.id)
-        need = completes.get(ctx.id)
-        done = need is not None and counts[ctx.id] >= need
-        return ActOutcome(observation={"item": ctx.id, "done": done}, tokens=1)
+    def _act(ctx) -> ActOutcome:
+        item_id = _ctx_id(ctx)
+        counts[item_id] = counts.get(item_id, 0) + 1
+        dispatched.append(item_id)
+        need = completes.get(item_id)
+        done = need is not None and counts[item_id] >= need
+        return ActOutcome(observation={"item": item_id, "done": done}, tokens=1)
 
     return _act
 
@@ -291,7 +301,7 @@ def test_derivation_is_resume_safe_across_fresh_instances():
     assert g1.attempts(state) == g2.attempts(state)
     assert g1.done_items(state) == g2.done_items(state) == {"b"}
     # 次に dispatch する item も一致 (in-process カウンタに依存しない)。
-    assert g1(state).id == g2(state).id
+    assert g1(state)["id"] == g2(state)["id"]
 
 
 def test_empty_work_list_is_immediately_drained():
@@ -387,6 +397,29 @@ def test_from_triage_orders_by_ranking_and_excludes_blocked():
     assert g.items[0].payload == {"seed": 1}
 
 
+def test_default_ctx_is_json_native_for_persistent_gate():
+    # 既定 build_ctx は永続人間ゲート (run_gated_loop) と合成しても state.db に保存できる
+    # JSON ネイティブ dict を返す。WorkItem を返していた頃は request_decision の
+    # JSON-native 検査で ValueError になっていた (#56 codex review 3)。
+    from loop_agent import LoopStore, connect, run_gated_loop
+
+    store = LoopStore(connect(":memory:"))
+    g = WorkListGather(["a", "b"], done_when=done_from_observation)
+    result = run_gated_loop(
+        act=scripted_act([], {}),
+        verify=never_done,
+        gather=g,
+        on=lambda _ctx: True,  # 全 action を不可逆扱い -> 最初の dispatch で pause
+        store=store,
+        run_id="r1",
+        conditions=[WorkListDrained(g), MaxIterations(5)],
+    )
+    # JSON-native なので ValueError にならず pause し、保存された context が読める。
+    assert result.status == "paused"
+    assert result.pending is not None
+    assert result.pending["action"]["id"] == "a"  # 既定 ctx dict が round-trip した
+
+
 def test_count_attempt_excludes_gate_skips_from_exhaustion():
     # gate が item の action を SKIP すると run_loop は act せず StepRecord を積む。
     # 既定ではそれも 1 試行として数えてしまい、走ってもいない item が per-item 上限で
@@ -439,7 +472,7 @@ def test_excluded_skips_still_rotate_fairly_no_starvation():
 
     class SkipEverything:
         def review(self, context, state):
-            offered.append(context.id)  # gate に提示された item
+            offered.append(_ctx_id(context))  # gate に提示された item
             return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
 
     is_real_attempt = lambda rec: not (
