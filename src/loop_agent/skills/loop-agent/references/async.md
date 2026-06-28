@@ -1,3 +1,5 @@
+> This file is a load-on-demand bundled copy of `docs/async.md`. The canonical source is `docs/async.md` in the repository.
+
 # async/await 対応 (async_run_loop)
 
 LoopAgent は同期 `run_loop` と非同期 `async_run_loop` の 2 つのエントリポイントを提供する。control flow の実装は一本化されており、同期 API は完全維持されている（Issue #40）。
@@ -75,7 +77,7 @@ result = await async_run_loop(
 )
 ```
 
-各シームの型と契約の詳細は [seams.md](./seams.md) を参照。
+各シームの型と契約の詳細は [seams.md](seams.md) を参照。
 
 ## 複数ループの並行実行 (asyncio.gather)
 
@@ -100,10 +102,10 @@ results = await asyncio.gather(
 - **async シーム**: asyncio の task cancel で per-call timeout を実現する（kill mode）。
 - **sync シーム**: POSIX main thread の `SIGALRM` で実中断する（SIGALRM 不在環境では graceful=post-hoc、kill=`UnsupportedTimeoutKill`）。
 
-`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復へ進み、`"kill"` は `SeamTimeout` を送出する。これは whole-run の `Timeout` stop 条件とは別物である。詳細は [recipes/timeout-and-kill.md](./recipes/timeout-and-kill.md)。
+`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復へ進み、`"kill"` は `SeamTimeout` を送出する。これは whole-run の `Timeout` stop 条件とは別物である。詳細は [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md)。
 
 ## 関連
 
-- [../README.md](../README.md) — LoopAgent 全体像と動線
-- [seams.md](./seams.md) — gather / act / verify / conditions / gate / on_step シームの型と契約
-- [recipes/timeout-and-kill.md](./recipes/timeout-and-kill.md) — per-call timeout（graceful / kill）の使い方
+- [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) — LoopAgent 全体像と動線
+- [seams.md](seams.md) — gather / act / verify / conditions / gate / on_step シームの型と契約
+- [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md) — per-call timeout（graceful / kill）の使い方
