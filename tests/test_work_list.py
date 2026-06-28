@@ -432,6 +432,33 @@ def test_count_attempt_excludes_gate_skips_from_exhaustion():
     assert dispatched == ["a"]  # 実 act は 1 回だけ (skip 2 回は act を呼ばない)
 
 
+def test_excluded_skips_still_rotate_fairly_no_starvation():
+    # count_attempt で skip を試行から外しても、公平性は selections (offer 回数) で測るので
+    # 先頭 item を skip し続けても他 item が offer される (#56 codex review 2: starve 防止)。
+    offered: list[str] = []
+
+    class SkipEverything:
+        def review(self, context, state):
+            offered.append(context.id)  # gate に提示された item
+            return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
+
+    is_real_attempt = lambda rec: not (
+        isinstance(rec.observation, dict) and rec.observation.get("skipped")
+    )
+    g = WorkListGather(
+        ["a", "b", "c"], strategy="fewest_attempts", count_attempt=is_real_attempt
+    )
+    run_loop(
+        act=scripted_act([], {}),
+        verify=never_done,
+        gather=g,
+        gate=SkipEverything(),
+        conditions=[MaxIterations(6)],  # drained にはならない (skip は exhaust しない)
+    )
+    # 先頭 a に張り付かず a,b,c,a,b,c と巡回して全 item が human に提示される。
+    assert offered == ["a", "b", "c", "a", "b", "c"]
+
+
 def test_skips_counted_as_attempts_by_default():
     # 対照: count_attempt を渡さなければ skip 行も 1 試行として数える (既定挙動)。
     class AlwaysSkip:

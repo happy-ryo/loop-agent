@@ -77,10 +77,17 @@ class ScheduleContext:
     custom callable 戦略はこれを受け取り、``selectable`` の中から 1 件 (:class:`WorkItem`
     または その ``id``) を返す。``selectable`` 外を返すと :class:`WorkListGather` が
     ``ValueError`` で fail loud する (誤って done / exhausted を再選択しないため)。
+
+    **``attempts`` と ``selections`` の違い**: ``attempts[id]`` は *実行された* 試行回数
+    (per-item 上限 / done 判定 / ModelLadder 用)。``selections[id]`` はその item が *選ばれた*
+    回数で、``count_attempt`` で試行から外した非実行 offer (gate SKIP 等) も含む。**公平性は
+    ``selections`` で測る** -- skip された item も「一度 offer した」分だけ後ろへ回し、同じ item
+    を無限に再提示して他を starve させないため。``count_attempt`` を使わなければ両者は常に一致する。
     """
 
     selectable: tuple[WorkItem, ...]
     attempts: Mapping[str, int]
+    selections: Mapping[str, int]
     position: Mapping[str, int]
     last_selected: Optional[str]
     done: frozenset[str]
@@ -101,22 +108,35 @@ AttemptPredicate = Callable[[StepRecord], bool]
 
 
 def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
-    """試行回数最小 -> 元の並び順。#37 PoC と同じ公平戦略 (round-robin 相当)。"""
+    """選択回数最小 -> 元の並び順。#37 PoC と同じ公平戦略 (round-robin 相当)。
+
+    公平性は ``selections`` (offer 回数) で測る。``count_attempt`` を使わなければ
+    ``selections == attempts`` なので「試行回数最小」と一致する。gate SKIP 等で試行から
+    外した offer も後ろへ回るので、skip され続ける item が他を starve させない。
+    """
     return min(
-        ctx.selectable, key=lambda it: (ctx.attempts[it.id], ctx.position[it.id])
+        ctx.selectable, key=lambda it: (ctx.selections[it.id], ctx.position[it.id])
     )
 
 
 def _strat_fifo(ctx: ScheduleContext) -> WorkItem:
-    """元の並び順で最初の未完 item (素朴な戦略; per-item 上限と併用で starve を緩和)。"""
+    """元の並び順で最初の未完 item (素朴な戦略; per-item 上限と併用で starve を緩和)。
+
+    公平性カウンタを持たない素朴版なので、``count_attempt`` で試行から外した offer に対しては
+    rotate しない (skip された先頭 item を offer し続ける)。gate と合成して skip を試行から
+    外す場合は ``fewest_attempts`` / ``round_robin`` を使うこと。
+    """
     return min(ctx.selectable, key=lambda it: ctx.position[it.id])
 
 
 def _strat_priority(ctx: ScheduleContext) -> WorkItem:
-    """優先度降順 -> 試行回数昇順 -> 並び順。優先度を尊重しつつ同優先度内は公平。"""
+    """優先度降順 -> 選択回数昇順 -> 並び順。優先度を尊重しつつ同優先度内は公平。
+
+    同優先度内の公平性は ``selections`` (offer 回数) で測る (``_strat_fewest_attempts`` と同様)。
+    """
     return min(
         ctx.selectable,
-        key=lambda it: (-it.priority, ctx.attempts[it.id], ctx.position[it.id]),
+        key=lambda it: (-it.priority, ctx.selections[it.id], ctx.position[it.id]),
     )
 
 
@@ -193,6 +213,7 @@ class _Derivation:
     """``state.history`` リプレイの結果 (内部)。"""
 
     attempts: dict[str, int]
+    selections: dict[str, int]
     done: set[str]
     exhausted: set[str]
     last_selected: Optional[str]
@@ -312,6 +333,7 @@ class WorkListGather:
     def _select_id(
         self,
         attempts: dict[str, int],
+        selections: dict[str, int],
         done: set[str],
         exhausted: set[str],
         last_selected: Optional[str],
@@ -323,6 +345,7 @@ class WorkListGather:
         ctx = ScheduleContext(
             selectable=selectable,
             attempts=attempts,
+            selections=selections,
             position=self._position,
             last_selected=last_selected,
             done=frozenset(done),
@@ -357,24 +380,29 @@ class WorkListGather:
 
         gate の SKIP が non-executing な step 行を挟む構成 (gate が reject/respond) では、
         その行は item を「選んだが act していない」。既定ではそれも 1 試行として数えるが、
-        ``count_attempt`` を渡せば非実行行を試行から外せる (選択 = rotation 基準の前進は
-        するが attempts / done / 上限は評価しない) -- 一度も走っていない item を per-item
-        上限で誤って exhausted にしないため。標準の ``run_loop`` (gate 無し / skip しない gate)
-        では history と dispatch が 1:1 なので ``count_attempt`` は不要。
+        ``count_attempt`` を渡せば非実行行を試行から外せる (選択回数 ``selections`` と rotation
+        基準は前進するが attempts / done / 上限は評価しない) -- 一度も走っていない item を
+        per-item 上限で誤って exhausted にしないため。公平性は ``selections`` (offer 回数) で
+        測るので、skip された item も後ろへ回り、``fewest_attempts`` / ``priority`` /
+        ``round_robin`` は同じ item を無限に再提示せず他へ rotate する (``fifo`` のみ素朴ゆえ
+        非 rotate)。標準の ``run_loop`` (gate 無し / skip しない gate) では history と dispatch が
+        1:1・``selections == attempts`` なので ``count_attempt`` は不要。
         """
         attempts: dict[str, int] = {it.id: 0 for it in self._items}
+        selections: dict[str, int] = {it.id: 0 for it in self._items}
         done: set[str] = set()
         exhausted: set[str] = set()
         last_selected: Optional[str] = None
 
         for record in state.history:
-            sel = self._select_id(attempts, done, exhausted, last_selected)
+            sel = self._select_id(attempts, selections, done, exhausted, last_selected)
             if sel is None:
                 # selectable が尽きた後も history が続く -- 本 gatherer 由来でない step か、
                 # 全 item drained 後の余剰。これ以上の帰属はしない。
                 break
-            # gather は item を選んだので rotation 基準は前進させる (round_robin が同じ item を
-            # 無限に再提示しないため)。ただし「実行された試行」として数えるかは別判定。
+            # gather は item を選んだので「選択回数」と rotation 基準は前進させる。これが公平性を
+            # 駆動するので、非実行 (skip) でも前進させて同じ item を無限に再提示しない。
+            selections[sel] += 1
             last_selected = sel
             if self._count_attempt is not None and not self._count_attempt(record):
                 # 非実行の record (例: gate SKIP で act せず append された行)。選ばれはしたが
@@ -388,7 +416,9 @@ class WorkListGather:
                 exhausted.add(sel)
 
         selectable = self._selectable(done, exhausted)
-        return _Derivation(attempts, done, exhausted, last_selected, selectable)
+        return _Derivation(
+            attempts, selections, done, exhausted, last_selected, selectable
+        )
 
     # -- gather フック本体 ---------------------------------------------------
 
@@ -397,7 +427,9 @@ class WorkListGather:
         d = self._derive(state)
         if not d.selectable:
             return DRAINED
-        sel = self._select_id(d.attempts, d.done, d.exhausted, d.last_selected)
+        sel = self._select_id(
+            d.attempts, d.selections, d.done, d.exhausted, d.last_selected
+        )
         assert sel is not None  # selectable が非空なので必ず選べる
         item = self._by_id[sel]
         return self._build_ctx(item, d.attempts[sel], state)
