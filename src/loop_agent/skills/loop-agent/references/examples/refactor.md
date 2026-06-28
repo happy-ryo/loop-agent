@@ -1,22 +1,22 @@
-# 例: 挙動不変リファクタ
+# Example: behavior-preserving refactor
 
-> intent: N 個のモジュールを「挙動を変えずに」整理する（重複削除・命名統一・分割）。難所は verify を「挙動が変わっていない」で sharp に書くこと。
+> intent: tidy up N modules "without changing behavior" (remove duplication, unify naming, split things up). The hard part is writing verify sharply as "behavior has not changed".
 
-## intent -> seam 設計（なぜこの 5 シームになるか）
+## intent -> seam design (why these 5 seams)
 
-| seam | この domain での選択 | なぜ |
+| seam | choice for this domain | why |
 | --- | --- | --- |
-| gather | 対象モジュールを 1 件ずつ、試行回数が少ない順に出す | 1 モジュール / 1 反復にスコープを絞ると act が局所化し、verify の失敗を 1 モジュールに帰属できる。`WorkListGather(strategy="fewest_attempts")` が「1 件が反復を独占して他を starve させない」公平 scheduling を担う |
-| act | `ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"])` で 1 モジュールを整理 | リファクタは Read/Edit で足り、不可逆操作（commit/push）を act に渡さない。編集自体は git で戻せる |
-| **verify** | **既存テスト全 pass（ground truth）+ public シグネチャ不変** | ここが核。下記参照 |
-| conditions | `MaxIterations(15)` + `TokenBudget`（大きめ） | 機械的な hard cap。per-item 上限は `WorkListGather(max_attempts_per_item=...)` 側で持たせる |
-| gate | 原則なし。commit/push はループ外に隔離 | 不可逆操作は収束後に人間が行う（後述の落とし穴） |
+| gather | emit target modules one at a time, fewest attempts first | scoping to 1 module / 1 iteration localizes act and lets a verify failure be attributed to a single module. `WorkListGather(strategy="fewest_attempts")` provides fair scheduling so "one item doesn't monopolize iterations and starve the rest" |
+| act | tidy one module with `ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"])` | refactoring only needs Read/Edit; don't hand irreversible operations (commit/push) to act. The edits themselves are revertible via git |
+| **verify** | **the full existing test suite passes (ground truth) + public signatures unchanged** | this is the core. See below |
+| conditions | `MaxIterations(15)` + `TokenBudget` (generous) | a mechanical hard cap. The per-item limit is carried on the `WorkListGather(max_attempts_per_item=...)` side |
+| gate | none in principle. commit/push are isolated outside the loop | irreversible operations are performed by a human after convergence (see the pitfall below) |
 
-## verify の ground truth: 「挙動不変」をどう機械判定するか
+## verify ground truth: how to mechanically judge "behavior unchanged"
 
-リファクタの verify は **既存テストスイートが contract**。リファクタ前に green だったテストが後も全 green なら、テストがカバーする挙動は保存されている。
-- カバレッジが薄いモジュールは、**回す前に特性化テスト（characterization test）を足す**のが規律（先にテスト → リファクタ → 全 pass）。テストの網羅度がそのまま安全度になる。
-- **public シグネチャの不変チェック**を足すと、「テストが見ていない外形の破壊」を安価に検出できる。
+For a refactor, verify's **contract is the existing test suite**. If tests that were green before the refactor are all still green afterward, then the behavior the tests cover is preserved.
+- For modules with thin coverage, the discipline is to **add characterization tests before running** (tests first -> refactor -> all pass). How thorough the tests are is exactly how safe you are.
+- Adding a **public-signature invariance check** cheaply detects "breakage of the external shape that the tests don't observe."
 
 ```python
 import ast
@@ -35,16 +35,16 @@ def public_signatures(path: str):
         if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")
     )
 
-baseline = {m: public_signatures(m) for m in MODULES}  # 回す前に固定
-current = {}  # gather がこの反復の対象を書き込む（ClaudeCodeAct の observation は
-              # モデル出力テキストで gather ctx を含まないため、対象は別途共有する）
+baseline = {m: public_signatures(m) for m in MODULES}  # fix before running
+current = {}  # gather writes this iteration's target here (ClaudeCodeAct's observation is
+              # model output text and does not include the gather ctx, so the target is shared separately)
 
 def verify(outcome):
     m = current["module"]
-    # 1. public シグネチャ不変（外形の contract）
+    # 1. public signatures unchanged (the external-shape contract)
     if public_signatures(m) != baseline[m]:
         return VerifyOutcome(goal_met=False, detail=f"{m}: public signature changed")
-    # 2. 既存テスト全 pass（挙動の ground truth）
+    # 2. all existing tests pass (the ground truth of behavior)
     if subprocess.run(["pytest", "-q"]).returncode != 0:
         return VerifyOutcome(goal_met=False, detail=f"{m}: suite red")
     return VerifyOutcome(goal_met=True, detail=f"{m}: refactored")
@@ -53,7 +53,7 @@ gather = WorkListGather(
     MODULES,
     strategy="fewest_attempts",
     build_ctx=lambda item, attempt, state: current.update(module=item.id) or {
-        "prompt": f"{item.id} を挙動不変でリファクタして（Read/Edit のみ、commit はしない）",
+        "prompt": f"Refactor {item.id} without changing behavior (Read/Edit only, do not commit)",
     },
 )
 
@@ -62,7 +62,7 @@ result = run_loop(
     act=ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"]),
     verify=verify,
     conditions=[
-        WorkListDrained(gather),   # gatherer を渡す。全 item done で成功停止
+        WorkListDrained(gather),   # pass the gatherer. Stops successfully when all items are done
         MaxIterations(15),
         TokenBudget(2_000_000),
     ],
@@ -70,14 +70,14 @@ result = run_loop(
 print(result.status, result.succeeded, result.reason, result.iterations)
 ```
 
-> より厳密には「文字列定数を潰した `ast.dump` 比較」で *純粋に内部構造だけ* 変わったことまで検証できるが、リファクタは構造を変えるのが目的なので、通常は **テスト contract + public シグネチャ**で十分。
+> More strictly, an `ast.dump` comparison with string constants collapsed could verify that *purely the internal structure* changed, but since the whole point of a refactor is to change structure, the **test contract + public signatures** are usually enough.
 
-## hard-won lessons（この domain の落とし穴）
+## hard-won lessons (pitfalls of this domain)
 
-- **commit / push はループ外に隔離する。** 編集は git で戻せるのでループは編集だけにし、不可逆な commit/push は収束後に人間が行う。`HumanGate` は **gather が返すループの離散 action** を審査するもので、`act` の subprocess が内部で打つ `git commit` は見えない。commit をゲートしたいなら、commit 自体をループの離散 action にすること。
-- **Reflexion が効きやすい。** リファクタの失敗は systematic（「この import 順序を毎回壊す」等）になりがちで、同じ誤りが反復するなら lesson が次モジュールに効く（translation/flaky より Reflexion 向き）。
-- **verify は全 suite を回す。** act は 1 モジュールだけ触るが、verify は局所変更が全体を壊していないかを見るため suite 全体を回す。
+- **Isolate commit / push outside the loop.** Edits are revertible via git, so keep the loop to edits only and have a human perform the irreversible commit/push after convergence. `HumanGate` reviews **the discrete loop action that gather returns**; it cannot see a `git commit` that act's subprocess issues internally. If you want to gate the commit, make the commit itself a discrete loop action.
+- **Reflexion works well here.** Refactor failures tend to be systematic (e.g. "it breaks this import order every time"), and if the same mistake recurs, the lesson carries over to the next module (more Reflexion-friendly than translation/flaky).
+- **verify runs the whole suite.** act touches only one module, but verify runs the entire suite to check that a local change hasn't broken the whole.
 
 ---
 
-これはコピペ用テンプレートではない。自分の domain に合わせて gather / act / verify を設計し直すこと（[design-philosophy](../design-philosophy.md) / [seams.md](../seams.md) 参照）。
+This is not a copy-paste template. Redesign gather / act / verify to fit your own domain (see [design-philosophy](../design-philosophy.md) / [seams.md](../seams.md)).

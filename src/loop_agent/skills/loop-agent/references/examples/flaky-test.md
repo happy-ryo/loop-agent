@@ -1,54 +1,57 @@
-# Example: flaky test の安定化
+# Example: stabilizing flaky tests
 
-**intent**: CI で時々落ちる test 群を 1 件ずつ根本修正し、「再現性のある合格」で締める。
+**intent**: Fix a group of intermittently-failing CI tests one at a time at the root cause, and close out with "reproducible passes."
 
-これは domain への seam mapping の **発想スケッチ**であって、コピペ用テンプレートではない。
+This is an **idea sketch** of how to map a domain onto the seams, not a copy-paste template.
 
-## intent -> seam 設計（なぜこの形か）
+## intent -> seam design (why this shape)
 
-flaky 安定化という domain を 5 シームに落とすときの判断を、各シームごとに記す。
+Here is the reasoning, seam by seam, for mapping the "flaky stabilization" domain onto the 5 seams.
 
-- **gather — 試行回数最小から 1 件選ぶ**: flaky test は複数ある。1 件の難物が
-  `MaxIterations` を食い尽くすと他が永久に着手されない。試行回数が最小のものから
-  選ぶ公平 scheduling にして枯渇を防ぐ。「次に何をやるか」を decide するのが gather。
+- **gather - pick one item, fewest attempts first**: there are multiple flaky tests. If one
+  stubborn item eats up all of `MaxIterations`, the others never get worked on. Use fair
+  scheduling that picks the item with the fewest attempts first to prevent starvation. Deciding
+  "what to do next" is the job of gather.
 
-- **act — 編集のみ（`ClaudeCodeAct(allowed_tools=["Read","Edit"])`）**: 根本原因を
-  読んで直させる。ここが核心の安全設計 → **test の実行権限・commit/push 権限を act に
-  渡さない**。act に `Bash` 無制限を渡すと (a) retry/sleep を仕込んで verify を騙す、
-  (b) 内部で `git commit` を打って不可逆操作がループ外の人間ゲートをすり抜ける、の
-  両方が起きうる。ツール権限で断つのが最も確実（`HumanGate` は act の subprocess が
-  内部で打つ shell を観測できない）。
+- **act - edits only (`ClaudeCodeAct(allowed_tools=["Read","Edit"])`)**: have it read and fix
+  the root cause. This is the core safety design -> **do not give act permission to run tests or
+  to commit/push**. Granting act unrestricted `Bash` enables both (a) injecting retries/sleeps to
+  fool verify, and (b) running `git commit` internally, letting an irreversible operation slip
+  past the out-of-loop human gate. Cutting it off at tool permissions is the most reliable
+  approach (`HumanGate` cannot observe the shell that act's subprocess runs internally).
 
-- **verify — N 回連続 pass を ground truth にする（最重要）**: flaky は *単発 pass では
-  消えたか判別できない*。1 回通っても次に落ちるのが flaky の定義だからだ。だから
-  verify の成功判定を「その test を 10 回連続で pass」という機械的・再現性ベースの
-  ground truth にする。これが効くのは、act が retry/sleep で症状をマスクしても
-  「再現性」を測る verify は通りにくいため — verify の設計自体が「根本修正以外は
-  通さない」圧力になる。N は大きいほど確証が上がる（コストとのトレードオフ）。
-  ここを LLM-as-judge（「直ったと思う？」）にすると即座に「成功したフリ」へ収束する。
+- **verify - make N consecutive passes the ground truth (most important)**: with flaky tests a
+  *single pass cannot tell you whether the problem is gone*. A test passing once and failing the
+  next time is the very definition of flaky. So make verify's success criterion a mechanical,
+  reproducibility-based ground truth: "the test passes 10 times in a row." This works because
+  even if act masks the symptom with retries/sleeps, a verify that measures *reproducibility* is
+  hard to pass - the design of verify itself becomes pressure that "lets nothing but a real
+  root-cause fix through." The larger N is, the higher your confidence (a tradeoff against cost).
+  Turning this into an LLM-as-judge ("do you think it's fixed?") immediately converges on
+  "pretending to succeed."
 
-- **conditions — `MaxIterations` + 大きめ `TokenBudget`**: 暴走の二重防御。難物が
-  消えない場合の上限。`AnyOf` で OR 合成される。
+- **conditions - `MaxIterations` + a generous `TokenBudget`**: double protection against runaway.
+  An upper bound for when a stubborn item won't go away. Combined with OR via `AnyOf`.
 
-- **gate — 原則なし。不可逆操作はループ外へ隔離**: ファイル編集は git で戻せるので
-  ゲート不要。commit/push こそ不可逆だが、上記のとおり act の権限から外して
-  *ループ収束後に人間が一括 commit* する設計にした。どうしても commit をループ内で
-  ゲートしたいなら commit を「離散 action」に昇格させて `HumanGate` の `on=` で
-  捕まえる（[safety](../safety.md) 参照）。
+- **gate - none by default; isolate irreversible operations outside the loop**: file edits can be
+  reverted with git, so no gate is needed. It is commit/push that are irreversible, but as above
+  we removed those from act's permissions and designed it so a *human commits everything in one
+  batch after the loop converges*. If you really must gate the commit inside the loop, promote the
+  commit to a "discrete action" and catch it via `HumanGate`'s `on=` (see [safety](../safety.md)).
 
-## スケッチ
+## Sketch
 
 ```python
 from loop_agent import run_loop, MaxIterations, TokenBudget, VerifyOutcome
 from loop_agent.adapters import ClaudeCodeAct
 import subprocess
 
-FLAKY = ["tests/test_a.py::test_x", "tests/test_b.py::test_y"]  # CI ログ等から抽出
+FLAKY = ["tests/test_a.py::test_x", "tests/test_b.py::test_y"]  # extracted from CI logs, etc.
 done, attempts, current = set(), {t: 0 for t in FLAKY}, {"test": None}
 
 def gather(state):
     rem = [t for t in FLAKY if t not in done]
-    t = min(rem, key=lambda t: (attempts[t], FLAKY.index(t)))   # 公平 scheduling
+    t = min(rem, key=lambda t: (attempts[t], FLAKY.index(t)))   # fair scheduling
     current["test"] = t
     attempts[t] += 1
     return {"prompt": f"Find and fix the root cause of flaky test `{t}`. "
@@ -61,31 +64,34 @@ def run_n_times(test, n=10):                                    # ground truth
 
 def verify(outcome):
     t = current["test"]
-    stable = (not outcome.observation.failed) and run_n_times(t)  # observation は ClaudeCodeResult
+    stable = (not outcome.observation.failed) and run_n_times(t)  # observation is ClaudeCodeResult
     if stable:
         done.add(t)
     return VerifyOutcome(goal_met=(len(done) == len(FLAKY)),
                          detail=f"{t}: {'stable' if stable else 'still flaky'}")
 
 result = run_loop(
-    act=ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"], timeout=600),  # 編集のみ
-    gather=gather, verify=verify,                              # 再現確認は verify が担う
+    act=ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"], timeout=600),  # edits only
+    gather=gather, verify=verify,                              # verify owns reproducibility checks
     conditions=[MaxIterations(20), TokenBudget(20_000_000)],
 )
-print(result.status, result.reason, sorted(done))  # "goal_met"/"stopped", reason, 安定化済み
+print(result.status, result.reason, sorted(done))  # "goal_met"/"stopped", reason, stabilized set
 ```
 
-## adapt するときの勘所
+## Key points when adapting
 
-- `ClaudeCodeAct` の `act` 戻り値は `ActOutcome`、その `observation` は失敗フラグ
-  `failed` を持つ `ClaudeCodeResult`（成否や生出力を verify に渡すための構造体）。
-- flaky の失敗が *systematic*（全 test が同じ「時刻依存の競合」等）なら、lesson を
-  次の test に持ち越す Reflexion が効く。各 flaky が独立要因なら blind retry と差は
-  出にくい（[reflexion-when-to-use](../reflexion-when-to-use.md)）。
-- 自分の verify が「単発の成功」を見ていないか疑う。再現性が要る domain では
-  「N 回連続」「複数 seed」など ground truth 側に再現性を組み込む。
+- The return value of `ClaudeCodeAct`'s `act` is an `ActOutcome`, whose `observation` is a
+  `ClaudeCodeResult` carrying a failure flag `failed` (a struct for passing success/failure and
+  raw output to verify).
+- If the flaky failures are *systematic* (all tests share the same "time-dependent race," etc.),
+  Reflexion that carries lessons forward to the next test pays off. If each flaky test has an
+  independent cause, it's hard to beat blind retry
+  ([reflexion-when-to-use](../reflexion-when-to-use.md)).
+- Question whether your own verify is only looking at a "single success." In domains that require
+  reproducibility, build reproducibility into the ground truth side - "N in a row," "multiple
+  seeds," and so on.
 
 ---
 
-これはコピペ用テンプレートではない。自分の domain に合わせて gather/act/verify を
-設計し直すこと（[design-philosophy](../design-philosophy.md) / [seams.md](../seams.md) 参照）。
+This is not a copy-paste template. Redesign gather/act/verify to fit your own domain
+(see [design-philosophy](../design-philosophy.md) / [seams.md](../seams.md)).

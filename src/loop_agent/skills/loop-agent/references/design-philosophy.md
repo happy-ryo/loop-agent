@@ -1,83 +1,83 @@
-# loop-agent 設計哲学 — Embeddable / 5 シーム / coding-agent driven
+# loop-agent design philosophy - Embeddable / 5 seams / coding-agent driven
 
-> これは bundle 内の概念アンカーで、シームの型・契約の正本は `seams.md`。本ファイルは README の positioning と seams.md の核を合成した短い導入であり、設計判断に踏み込むときは各 reference を on-demand で読む。
+> This is the conceptual anchor within the bundle; the canonical source for seam types and contracts is `seams.md`. This file is a short introduction that synthesizes the positioning from the README with the core of seams.md. When you need to dig into a design decision, read each reference on-demand.
 
-loop-agent を user の domain に当てはめる前に、まずこの 1 枚で「何を提供し、何を提供しないライブラリか」を掴む。core は `gather → act → verify → repeat` のオーケストレーションと安全装置だけで、policy（何を選び・どう実行し・何を成功とするか）は全部あなたが 5 つのシームに注入する。
+Before you map loop-agent onto your domain, use this single page to grasp "what this library does and does not provide." The core is only the orchestration of `gather -> act -> verify -> repeat` plus safety guards; the policy (what to choose, how to run it, what counts as success) is entirely something you inject through the 5 seams.
 
 ## Embeddable Loop Engine
 
-提供するのは `gather → act → verify → repeat` のオーケストレーション本体と暴走防止だけだ。**何を選ぶか・どう実行するか・何を成功とするか — その policy は全部呼び出し側に置く**。だから loop-agent は user の domain を何も知らないまま、既存アプリの内側に小さく住んで「安全にループだけ回すエンジン」として機能する。これが "Embeddable" の本物の意味で、合言葉は **"Bring your own `gather` / `act` / `verify`. We provide the loop."**（policy はあなたが持ち、ループは私たちが回す）。
+What it provides is only the orchestration body of `gather -> act -> verify -> repeat` and runaway prevention. **What to choose, how to run it, what counts as success - all of that policy lives on the caller's side.** So loop-agent, knowing nothing about your domain, lives small inside an existing app and functions as an engine that "just turns the loop safely." This is the real meaning of "Embeddable," and the motto is **"Bring your own `gather` / `act` / `verify`. We provide the loop."** (you hold the policy, we turn the loop).
 
-立ち位置は「取り込む側 vs 組み込まれる側」で区別できる。LangGraph / AutoGen / OpenAI Agents SDK が「アプリを自分の枠組みに**取り込む**」フレームワークなのに対し、loop-agent は既存アプリの中に**組み込まれる**ループエンジンだ。あなたのアーキテクチャを置き換えず、その内側に `while not goal: gather → act → verify` を一つ足すだけ。組み込み先は自前 Python スクリプト / 既存 CLI / Web アプリ / MCP サーバー / cron 常駐 / Slack bot / 別の AI フレームワーク — どれの内側にも後付けできる。
+Its stance can be distinguished by "the side that absorbs vs. the side that is embedded." Whereas LangGraph / AutoGen / OpenAI Agents SDK are frameworks that **absorb** your app into their own framework, loop-agent is a loop engine that is **embedded** inside an existing app. It does not replace your architecture; it just adds one `while not goal: gather -> act -> verify` inside it. The host can be your own Python script / an existing CLI / a web app / an MCP server / a cron daemon / a Slack bot / another AI framework - it can be retrofitted inside any of them.
 
-依存は最小だ。ループコアは Python stdlib のみで動く。OTel（観測）/ SQLite（状態 SoT）/ `tomli`（TOML 読み）等はすべて optional で、未導入でも no-op に degrade する。
+Dependencies are minimal. The loop core runs on the Python stdlib alone. OTel (observability) / SQLite (state SoT) / `tomli` (TOML reading) and the like are all optional, degrading to no-op even when not installed.
 
-## Loop Engineering の位置づけ
+## Positioning of Loop Engineering
 
-Loop Engineering とは、人間がエージェントに一手ずつプロンプトを打つのをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する「システム（=ループ）そのもの」を設計する**実践だ。`prompt engineering → context engineering → loop engineering` という 3 層スタックの最上位（制御層）に位置する。loop-agent はこの制御層を最小の core として切り出したもので、シーム設計こそが Loop Engineering の実体になる。
+Loop Engineering is the practice of stopping prompting an agent one move at a time by a human, and instead **designing the very "system (= the loop)" that prompts, verifies, memorizes, and re-runs the agent**. It sits at the top (the control layer) of the 3-layer stack `prompt engineering -> context engineering -> loop engineering`. loop-agent carves out this control layer as a minimal core, and seam design is precisely the substance of Loop Engineering.
 
-## 5 つのシーム（policy 注入口）
+## The 5 seams (policy injection points)
 
-ループが「持つ」のはオーケストレーション本体だけ。policy は全部この 5 つのシームに注入する。
+What the loop "owns" is only the orchestration body. All policy is injected through these 5 seams.
 
-| シーム | 型 | あなたが決めること（=注入する policy） |
+| Seam | Type | What you decide (= the policy you inject) |
 |---|---|---|
-| `gather` | `Callable[[state], ctx]` | 次に何をやるか（候補選定・triage・キュー戦略・公平 scheduling） |
-| `act` | `Callable[[ctx], ActOutcome]` | どう実行するか（`ClaudeCodeAct` / `CodexAct` / 自作 adapter・モデル選択・subprocess かローカル fn か） |
-| `verify` | `Callable[[ActOutcome], VerifyOutcome]` | 何を「成功」とするか（pytest / AST / regex — **ground truth で判定**） |
-| `conditions` | `list[StopCondition]`（`AnyOf` で OR 合成） | いつ止めるか（回数 / 予算 / 時間 / 目標 / 進捗停滞） |
-| `gate` | `ActionGate`（`HumanGate` 等、`on=` で対象選定） | 何に人間承認を要求するか（commit / push / 任意の不可逆操作） |
+| `gather` | `Callable[[state], ctx]` | What to do next (candidate selection / triage / queue strategy / fair scheduling) |
+| `act` | `Callable[[ctx], ActOutcome]` | How to run it (`ClaudeCodeAct` / `CodexAct` / your own adapter, model selection, subprocess vs. local fn) |
+| `verify` | `Callable[[ActOutcome], VerifyOutcome]` | What counts as "success" (pytest / AST / regex - **judged by ground truth**) |
+| `conditions` | `list[StopCondition]` (OR-composed with `AnyOf`) | When to stop (count / budget / time / goal / progress stall) |
+| `gate` | `ActionGate` (`HumanGate` etc., target selected with `on=`) | What requires human approval (commit / push / any irreversible operation) |
 
-擬似コードにすると、loop-agent が持つのはこの 4 行だけだ。
+As pseudocode, what loop-agent owns is just these 4 lines.
 
 ```python
 while not goal_met and conditions_ok:
-    ctx = gather(state)        # 何を      (gather)
-    outcome = act(ctx)         # どう実行  (act)
-    v = verify(outcome)        # 何が成功  (verify)
+    ctx = gather(state)        # what       (gather)
+    outcome = act(ctx)         # how to run (act)
+    v = verify(outcome)        # what is success (verify)
     state.update(v)
 ```
 
-この 5 つのシームを書けば、それがあなたの domain の loop になる。型・契約の正本は `seams.md`。
+Write these 5 seams and that becomes the loop for your domain. The canonical source for types and contracts is `seams.md`.
 
-## 鉄則 3 つ（設計時に外さない）
+## The 3 iron rules (do not drop them at design time)
 
-- **verify は ground truth（機械判定）で書く**。何でも差せるのがシームの本質だが、成功判定を LLM-as-judge に委ねるとループは「成功したフリ」に収束しやすい。pytest の exit-code / AST 比較 / 文字列スキャンなど、機械的に判定できるものを使う。
-- **機械的上限は必ず置く**。`MaxIterations` / `TokenBudget` / `Timeout` を `AnyOf` で OR 合成し、最低 1 つは載せる。無いと `ConfigError` になるし、ゴール未達でも上限で必ず止まるという暴走防止が崩れる。
-- **不可逆操作は gate またはループ外**に置く。`HumanGate` は `gather` が返す離散 action だけを審査し、`act` subprocess 内部の `git commit` は見えない。だから commit / push / deploy は「ループの離散 action にして `on` で拾う」か「ループ外の人間ステップに隔離する」のどちらか。
+- **Write verify with ground truth (machine judgment).** The essence of a seam is that anything can be plugged in, but if you delegate the success judgment to an LLM-as-judge, the loop tends to converge on "pretending to succeed." Use something judgeable mechanically: pytest exit-code / AST comparison / string scan.
+- **Always place a mechanical upper bound.** OR-compose `MaxIterations` / `TokenBudget` / `Timeout` with `AnyOf` and load at least one. Without it you get a `ConfigError`, and the runaway prevention that guarantees it always stops at the bound even when the goal is unmet collapses.
+- **Place irreversible operations in a gate or outside the loop.** `HumanGate` only reviews the discrete actions that `gather` returns; it cannot see a `git commit` inside an `act` subprocess. So commit / push / deploy must either "be made a discrete loop action and picked up with `on`" or "be isolated into a human step outside the loop."
 
-加えて、停止条件には機械的上限のほかに**意味的 stop** を載せられる。`GoalMet`（検証可能ゴールが満たされたら成功停止）と `NoProgress`（同じアクションが反復され進捗が出ないときに打ち切り停止）を機械的上限と同じ `AnyOf` に並べると、二重の終了条件で安全に締まる。成否はチャネルを問わず `result.succeeded` で判定する。
+In addition, beyond the mechanical upper bound, the stop conditions can carry a **semantic stop**. Lining up `GoalMet` (success-stop when a verifiable goal is satisfied) and `NoProgress` (cutoff-stop when the same action repeats and no progress emerges) in the same `AnyOf` as the mechanical bound closes things off safely with dual termination conditions. Success or failure is judged with `result.succeeded` regardless of the channel.
 
-## act は差し替え自由
+## act is freely swappable
 
-`act` シームには `ClaudeCodeAct` / `CodexAct` / 自作 adapter（`ActHook` Protocol）が first-class な adapter として既に揃っている。複数の LLM プロバイダーが最初から揃い、`ActHook` に適合する callable なら何でも同じ `act` シームに載る。`ActOutcome` を返す callable でありさえすれば、subprocess（`claude --print` / `codex exec` 等）でも in-process 関数でも構わない — そこは呼び出し側の自由だ。act を外部 CLI に出すときは adapter の 4 か条契約（例外でループを殺さない / token を予算に積む / auth は CLI に委譲 / stdin を塞ぐ）が効いてくる。
+The `act` seam already comes with `ClaudeCodeAct` / `CodexAct` / your own adapter (the `ActHook` Protocol) as first-class adapters. Multiple LLM providers are available from the start, and any callable conforming to `ActHook` rides the same `act` seam. As long as it is a callable that returns an `ActOutcome`, it can be a subprocess (`claude --print` / `codex exec` etc.) or an in-process function - that is the caller's freedom. When you push act out to an external CLI, the adapter's 4-rule contract (do not kill the loop with an exception / accrue tokens to the budget / delegate auth to the CLI / close stdin) comes into play.
 
-## coding-agent driven（動線 E）
+## coding-agent driven (flow E)
 
-loop-agent の第一の使い手は人間でなく coding agent だ。動線はこうなる。
+The primary user of loop-agent is not a human but a coding agent. The flow looks like this.
 
 ```
-prose intent（人間の自然言語）
-  → coding agent が gather/act/verify/conditions/gate を書く
-  → run_loop 起動
-  → 結果を観察して policy を書き直す
-  → loop core（薄い・不変）
+prose intent (a human's natural language)
+  -> coding agent writes gather/act/verify/conditions/gate
+  -> run_loop launch
+  -> observe the result and rewrite the policy
+  -> loop core (thin, immutable)
 ```
 
-自然言語 intent で駆動できるので、コードを書かない user にも届く。**この skill 自体がその動線の公式支援**であり、あなた（coding agent）が user の domain を 5 シームに synthesize するための reference bundle である。recipe を丸写しするためのものではない — examples は inspiration として読み、原理を借りてコードは user の domain に書き直す。
+Because it can be driven by natural-language intent, it reaches users who do not write code. **This skill itself is the official support for that flow**, and it is a reference bundle for you (the coding agent) to synthesize the user's domain into the 5 seams. It is not for copying recipes verbatim - read the examples as inspiration, borrow the principles, and rewrite the code into the user's domain.
 
-## どの reference をいつ読むか
+## Which reference to read when
 
-核を掴んだら、user の domain に必要なシームから設計し、深掘りは on-demand で次を読む。
+Once you grasp the core, design from the seams your domain needs, and read the following on-demand when you dig deeper.
 
-- シームの型・契約・二重終了条件・ground-truth 鉄則 → `seams.md`
-- act を外部 CLI subprocess にする / 自作 adapter / 4 か条 / token 二重計上の罠 → `writing-an-adapter.md`
-- gate の射程 / 不可逆操作の隔離 / `allowed_tools` 規律 / 暴走防止 → `safety.md`
-- 中断 → 再開 / state.db SoT → `persistence-and-resume.md`
-- Reflexion を足すべきか（systematic vs stochastic） → `reflexion-when-to-use.md`
-- 非同期シーム / `async_run_loop` / sync-async 境界 → `async.md`
-- multi-item の公平 scheduling / wake 配送 / work-discovery → `transport.md`
-- 例外捕捉（`LoopError` / `ConfigError` / `StateError`） → `errors.md`
-- 発想例（写経しない） → `examples/translation.md`, `examples/flaky-test.md`, `examples/refactor.md`
+- Seam types / contracts / dual termination conditions / the ground-truth iron rule -> `seams.md`
+- Making act an external CLI subprocess / your own adapter / the 4 rules / the token double-counting trap -> `writing-an-adapter.md`
+- The reach of the gate / isolating irreversible operations / `allowed_tools` discipline / runaway prevention -> `safety.md`
+- Interrupt -> resume / state.db SoT -> `persistence-and-resume.md`
+- Whether you should add Reflexion (systematic vs. stochastic) -> `reflexion-when-to-use.md`
+- Async seams / `async_run_loop` / the sync-async boundary -> `async.md`
+- Fair scheduling for multi-item / wake delivery / work-discovery -> `transport.md`
+- Exception handling (`LoopError` / `ConfigError` / `StateError`) -> `errors.md`
+- Idea examples (do not transcribe) -> `examples/translation.md`, `examples/flaky-test.md`, `examples/refactor.md`
 
-bundle 内 reference は bare filename で参照できる。bundle に含まれない quickstart 等は GitHub の正本（例: <https://github.com/happy-ryo/loop-agent/blob/main/docs/quickstart.md>）を辿る。まず `seams.md` でシームの契約を固め、act を subprocess 化するなら `writing-an-adapter.md`、不可逆操作を扱うなら `safety.md` へ進むのが定石だ。
+References within the bundle can be referenced by bare filename. For things not included in the bundle, such as the quickstart, follow the canonical source on GitHub (e.g., <https://github.com/happy-ryo/loop-agent/blob/main/docs/quickstart.md>). The standard approach is to first nail down the seam contracts in `seams.md`, then proceed to `writing-an-adapter.md` if you are turning act into a subprocess, or to `safety.md` if you are handling irreversible operations.

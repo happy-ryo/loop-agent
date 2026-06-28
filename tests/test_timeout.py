@@ -37,6 +37,7 @@ from loop_agent import (
     run_loop,
 )
 from loop_agent.loop import GATE_PROCEED
+from loop_agent import ConfigError, LoopError, StateError
 from conftest import ManualClock, acting, done_after, never_done, stepping_for
 
 
@@ -142,6 +143,25 @@ def test_async_act_kill_raises_seam_timeout_and_cancels():
     assert exc.value.seam == "act"
     assert exc.value.seconds == 0.01
     assert flag["done"] is False  # the coroutine was cancelled, never finished
+
+
+def test_async_kill_seam_timeout_is_loop_error_hierarchy():
+    """Issue #71: the SeamTimeout actually raised on a kill-mode overrun is a
+    StateError / LoopError (and, via StateError's compat bases, a RuntimeError),
+    so a caller can catch it as the unified base. Its attributes are unchanged."""
+    with pytest.raises(SeamTimeout) as exc:
+        asyncio.run(
+            async_run_loop(
+                act=sleeping_aact(delay=5.0, flag={"done": False}),
+                verify=afast_verify,
+                conditions=[MaxIterations(10)],
+                timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
+            )
+        )
+    assert isinstance(exc.value, StateError)
+    assert isinstance(exc.value, LoopError)
+    assert isinstance(exc.value, RuntimeError)  # widened, never narrowed
+    assert not isinstance(exc.value, ConfigError)
 
 
 def test_async_verify_kill_raises_seam_timeout():
@@ -363,6 +383,24 @@ def test_sync_kill_unsupported_without_alarm(monkeypatch):
             conditions=[MaxIterations(10)],
             timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
         )
+
+
+def test_sync_kill_unsupported_is_loop_error_hierarchy(monkeypatch):
+    """Issue #71: the UnsupportedTimeoutKill raised when refusing a sync hard-kill
+    is a ConfigError / LoopError, while STILL being a RuntimeError (its pre-#71
+    base) so existing `except RuntimeError` callers keep catching it."""
+    monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
+    with pytest.raises(UnsupportedTimeoutKill) as exc:
+        run_loop(
+            act=acting(tokens=1),  # synchronous
+            verify=never_done,
+            conditions=[MaxIterations(10)],
+            timeout=TimeoutPolicy(act=0.01, on_timeout=TIMEOUT_KILL),
+        )
+    assert isinstance(exc.value, ConfigError)
+    assert isinstance(exc.value, LoopError)
+    assert isinstance(exc.value, RuntimeError)  # back-compat base preserved
+    assert not isinstance(exc.value, StateError)
 
 
 def test_sync_graceful_post_hoc_detection_without_alarm(monkeypatch):

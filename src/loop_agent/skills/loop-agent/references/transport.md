@@ -1,4 +1,4 @@
-> このファイルは `docs/transport.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/transport.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/transport.md`. The canonical source is `docs/transport.md` in the repository.
 
 # wake 配送 transport と work-discovery
 

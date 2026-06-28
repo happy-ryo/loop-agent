@@ -1,4 +1,4 @@
-> このファイルは `docs/safety.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/safety.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/safety.md`. The canonical source is `docs/safety.md` in the repository.
 
 # 安全装置 (暴走防止 / 限定人間ゲート)
 

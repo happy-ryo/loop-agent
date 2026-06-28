@@ -1,4 +1,4 @@
-> このファイルは `docs/reflexion-when-to-use.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/reflexion-when-to-use.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/reflexion-when-to-use.md`. The canonical source is `docs/reflexion-when-to-use.md` in the repository.
 
 # Reflexion を使うべきか — 効くタスク / 効かないタスク
 

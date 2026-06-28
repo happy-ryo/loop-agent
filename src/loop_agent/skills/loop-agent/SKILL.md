@@ -1,87 +1,87 @@
 ---
 name: loop-agent
-description: gather-act-verify ループ (loop-agent) を user の domain 向けに設計・実装するときに使う。「ループ書きたい」「自動化したい」「N 件に同じ処理を回したい」「coding agent でループを回したい」「gather-act-verify を設計したい」と言われたら起動。5 シーム (gather/act/verify/conditions/gate) を user の意図から synthesize するための load-on-demand reference bundle。
+description: Use this when you need to design and implement a gather-act-verify loop (loop-agent) for the user's domain. Trigger when the user says things like "I want to write a loop", "automate a repeated task", "run the same processing over N items", "drive a loop with a coding agent", or "design a gather-act-verify loop". A load-on-demand reference bundle for synthesizing the 5 seams (gather/act/verify/conditions/gate) from the user's intent.
 ---
 
-# loop-agent — gather-act-verify ループを user の domain 向けに設計・実装する
+# loop-agent -- design and implement a gather-act-verify loop for the user's domain
 
-loop-agent は「policy はあなたが持ち、ループは私たちが回す」Embeddable なループエンジンである。この skill は coding agent (あなた) が user の domain に合わせて 5 シーム (gather / act / verify / conditions / gate) を設計・実装するための reference bundle で、この SKILL.md がトリガと思考手順、`references/` 配下が on-demand で読む詳細を持つ。**recipe を丸写しするためのものではない** — user の意図を 5 シームへ synthesize し、コードは user の domain に合わせて書く。
+loop-agent is an embeddable loop engine whose motto is "you own the policy, we run the loop." This skill is a reference bundle for a coding agent (you) to design and implement the 5 seams (gather / act / verify / conditions / gate) for the user's domain. This SKILL.md holds the trigger and the thinking procedure; the files under `references/` hold the details you read on demand. **It is not a recipe to copy verbatim** -- synthesize the user's intent into the 5 seams and write the code to fit the user's domain.
 
-## トリガ（再掲）
+## Trigger (restated)
 
-次のいずれかを言われたら、このスキルの手順で考える。
+When the user says any of the following, reason through this skill's procedure.
 
-- 「ループ書きたい」
-- 「自動化したい」
-- 「N 件に同じ処理を回したい」
-- 「coding agent でループを回したい」
-- 「gather-act-verify を設計したい」
+- "I want to write a loop"
+- "automate a repeated task"
+- "run the same processing over N items"
+- "drive a loop with a coding agent"
+- "design a gather-act-verify loop"
 
-線引き: 「単発の 1 回処理」「ループ構造が要らないタスク」は対象外 — 反復・収束・停止条件のあるタスクにだけ適用する。
+Where to draw the line: a "one-off, single-pass operation" or a "task that needs no loop structure" is out of scope -- apply this only to tasks that have iteration, convergence, and stopping conditions.
 
-## AI がどう考えるか（手順）
+## How the AI should think (procedure)
 
-次の 5 ステップで進める。各ステップで読む reference を明示する。全部を一度に読まず、当たった論点だけを on-demand で読む。
+Proceed through the following 5 steps. For each step, the reference to read is called out explicitly. Don't read everything at once -- read only the references relevant to the issue you hit, on demand.
 
-1. **まず核を把握する** — `references/design-philosophy.md` を読み、5 シーム (gather / act / verify / conditions / gate) と Embeddable core (policy は注入、ループ本体だけがライブラリ) を頭に入れる。**最初に読むのはこれ 1 本だけ**。
-2. **user の domain に必要なシームを設計する** — user の要求 (database / DevOps / 科学計算 / 文書処理 / 何でも) を 5 シームに割り付ける。各シームの設計質問は下の「5 シーム設計チェックリスト」に従う。シームの型・契約・二重終了条件・ground-truth 鉄則を深掘りするなら `references/seams.md`。
-3. **必要な reference だけを on-demand で読む** — 全部は読まない。シーム設計で当たった論点に応じて下の対応表から選ぶ。
-4. **`examples/` は inspiration として読む（literal コピー禁止）** — `references/examples/{translation,flaky-test,refactor}.md` は「intent → シーム設計」の発想例。user の domain が一致しても**そのまま写さない**。verify の sharp さ・公平 scheduling・commit 隔離といった**設計原理**を借り、コードは user の domain に書き直す。
-5. **設計判断を user に提示してから実装する** — 5 シームをどう埋めたか (特に verify の ground-truth 根拠、停止条件、gate 対象) を user に短く提示し、合意を取ってから harness を書く。
+1. **Grasp the core first** -- read `references/design-philosophy.md` and internalize the 5 seams (gather / act / verify / conditions / gate) and the embeddable core (policy is injected; only the loop body itself is the library). **This one file is the only thing to read first.**
+2. **Design the seams your user's domain needs** -- map the user's request (database / DevOps / scientific computing / document processing / anything) onto the 5 seams. Follow the "5-seam design checklist" below for each seam's design questions. If you need to dig into seam types, contracts, the dual termination condition, and the ground-truth iron rule, see `references/seams.md`.
+3. **Read only the references you need, on demand** -- don't read them all. Pick from the table below according to the issue your seam design hits.
+4. **Read `examples/` as inspiration (no literal copying)** -- `references/examples/{translation,flaky-test,refactor}.md` are illustrations of "intent -> seam design." Even if the user's domain matches, **do not copy them verbatim**. Borrow the **design principles** -- the sharpness of verify, fair scheduling, commit isolation -- and rewrite the code for the user's domain.
+5. **Present design decisions to the user before implementing** -- briefly present to the user how you filled in the 5 seams (especially the ground-truth basis for verify, the stopping conditions, and the gate targets), get agreement, and then write the harness.
 
-### ステップ ↔ reference 対応表
+### Step -> reference table
 
-| 局面 | 読む reference |
+| Situation | Reference to read |
 |---|---|
-| 最初の核（必ず最初） | `references/design-philosophy.md` |
-| シームの型・契約・二重終了条件・ground-truth 鉄則 | `references/seams.md` |
-| act を外部 CLI subprocess にする / 自作 adapter / 4 か条 / token 二重計上 | `references/writing-an-adapter.md` |
-| gate の射程 / 不可逆操作の隔離 / `allowed_tools` 規律 / 暴走防止 | `references/safety.md` |
-| 中断 → 再開 / state.db SoT / resume 契約 | `references/persistence-and-resume.md` |
-| Reflexion を足すべきか（systematic vs stochastic） | `references/reflexion-when-to-use.md` |
-| 非同期シーム / `async_run_loop` / sync-async 境界 | `references/async.md` |
-| multi-item 公平 scheduling / wake 配送 / work-discovery | `references/transport.md` |
-| 例外捕捉（`LoopError` / `ConfigError` / `StateError`） | `references/errors.md` |
-| 発想例（写経しない） | `references/examples/translation.md`, `references/examples/flaky-test.md`, `references/examples/refactor.md` |
+| The initial core (always first) | `references/design-philosophy.md` |
+| Seam types, contracts, the dual termination condition, the ground-truth iron rule | `references/seams.md` |
+| Making act an external CLI subprocess / a custom adapter / the 4 clauses / token double-counting | `references/writing-an-adapter.md` |
+| Gate scope / isolating irreversible operations / `allowed_tools` discipline / runaway prevention | `references/safety.md` |
+| Interrupt -> resume / state.db SoT / the resume contract | `references/persistence-and-resume.md` |
+| Whether to add Reflexion (systematic vs stochastic) | `references/reflexion-when-to-use.md` |
+| Async seams / `async_run_loop` / the sync-async boundary | `references/async.md` |
+| Multi-item fair scheduling / wake delivery / work-discovery | `references/transport.md` |
+| Exception handling (`LoopError` / `ConfigError` / `StateError`) | `references/errors.md` |
+| Illustrations (don't copy by rote) | `references/examples/translation.md`, `references/examples/flaky-test.md`, `references/examples/refactor.md` |
 
-## 5 シーム設計チェックリスト
+## 5-seam design checklist
 
-各シームについて、user の domain を以下の質問で割り付ける。型は `from loop_agent import ...` のトップレベル公開シンボルに照合済み。
+For each seam, map the user's domain using the questions below. The types have been checked against the top-level public symbols of `from loop_agent import ...`.
 
-- **gather（次に何をやるか）** — 候補をどう列挙するか。triage / キュー戦略は何か。multi-item なら公平 scheduling (試行回数が最小の item から) が要るか (→ `references/transport.md`)。型は `Callable[[state], ctx]`。省略すると単一文脈で回る。
-- **act（どう実行するか）** — 外部 agent CLI を subprocess 起動するか (`from loop_agent.adapters import ClaudeCodeAct, CodexAct` / 自作 adapter は `ActHook` Protocol)、in-process callable か。モデル選択は何か。困難タスクでエスカレーションするなら `from loop_agent.adapters import ModelLadder`。型は `Callable[[ctx], ActOutcome]`、`ActOutcome(observation=..., tokens=...)` を返す。
-- **verify（何が成功か）** — 機械検証可能か。**ground truth で sharp に書けるか** (pytest exit-code / AST / regex)。LLM-as-judge に委ねない (「成功したフリ」に収束する)。flaky なら「N 回連続 pass」のように再現性を測る。型は `Callable[[ActOutcome], VerifyOutcome]`、`VerifyOutcome(goal_met=..., detail=...)` を返す。
-- **conditions（いつ止めるか）** — 機械的上限 (`MaxIterations` / `TokenBudget` / `Timeout`、`AnyOf` で OR 合成) は**必ず 1 つ以上**置く (無いと `ConfigError`)。意味的 stop (`GoalMet` / `NoProgress`) を載せるか。`run_loop(..., conditions=[...])` に渡す。
-- **gate（何に人間承認を要求するか）** — 不可逆操作 (commit / push / deploy) はあるか。**`HumanGate` は `gather` が返す離散 action だけを審査し、`act` subprocess 内部の `git commit` は見えない**。だから「act は編集のみ・不可逆はループ外の人間ステップ」または「commit をループの離散 action にして `on=` で拾う」のどちらかにする (→ `references/safety.md`)。
+- **gather (what to do next)** -- how do you enumerate candidates? What is the triage / queue strategy? For multi-item work, do you need fair scheduling (start from the item with the fewest attempts) (-> `references/transport.md`)? Type is `Callable[[state], ctx]`. Omitting it runs the loop over a single context.
+- **act (how to execute)** -- do you launch an external agent CLI as a subprocess (`from loop_agent.adapters import ClaudeCodeAct, CodexAct`; a custom adapter is the `ActHook` Protocol), or an in-process callable? What is the model selection? If you escalate on hard tasks, use `from loop_agent.adapters import ModelLadder`. Type is `Callable[[ctx], ActOutcome]`, returning `ActOutcome(observation=..., tokens=...)`.
+- **verify (what counts as success)** -- is it machine-verifiable? **Can you write it sharply against ground truth** (pytest exit-code / AST / regex)? Don't defer to an LLM-as-judge (it converges on "pretending to succeed"). If it's flaky, measure reproducibility, e.g. "N passes in a row." Type is `Callable[[ActOutcome], VerifyOutcome]`, returning `VerifyOutcome(goal_met=..., detail=...)`.
+- **conditions (when to stop)** -- **always place at least one** mechanical bound (`MaxIterations` / `TokenBudget` / `Timeout`, OR-composed with `AnyOf`) (without one you get a `ConfigError`). Do you also add a semantic stop (`GoalMet` / `NoProgress`)? Pass these to `run_loop(..., conditions=[...])`.
+- **gate (what requires human approval)** -- are there irreversible operations (commit / push / deploy)? **`HumanGate` only reviews the discrete actions returned by `gather`; a `git commit` inside the `act` subprocess is invisible to it.** So do one of two things: "act only edits, and irreversible steps are a human step outside the loop," or "make commit a discrete action of the loop and pick it up via `on=`" (-> `references/safety.md`).
 
-## 4 か条契約と adapter 落とし穴（act を subprocess 化するとき surface する）
+## The 4-clause contract and adapter pitfalls (surface this when making act a subprocess)
 
-自作 adapter を書く / `act` を外部 CLI にする場合、`references/writing-an-adapter.md` の 4 か条を必ず守る。
+When you write a custom adapter / make `act` an external CLI, you must follow the 4 clauses in `references/writing-an-adapter.md`.
 
-1. **例外でループを殺さない** — timeout / 非 0 終了 / 実行ファイル不在は `failed=True` の `ActOutcome` で graceful に返す。漏らしてよい例外は原則ゼロ。唯一 `render_prompt` の `KeyError` は意図的に eager。
-2. **token を予算に積む** — 取れないときは 0、成否に関わらず計上する。
-3. **auth は CLI に委譲** — `os.environ` を継承し `env=` で上書きマージ。キーをアダプタが読まない。
-4. **stdin を塞ぐ** — `stdin=subprocess.DEVNULL`、プロンプトは `--` の後ろの位置引数で渡す。
+1. **Don't kill the loop with exceptions** -- timeout / non-zero exit / missing executable should return gracefully as an `ActOutcome` with `failed=True`. In principle, zero exceptions should leak. The one intentional exception is the `KeyError` from `render_prompt`, which is eager by design.
+2. **Account tokens into the budget** -- when you can't get them, use 0; count them regardless of success or failure.
+3. **Delegate auth to the CLI** -- inherit `os.environ` and merge overrides via `env=`. The adapter must not read keys itself.
+4. **Close stdin** -- `stdin=subprocess.DEVNULL`, and pass the prompt as a positional argument after `--`.
 
-**token 二重計上の罠（最重要）**: usage は「加算バケットか / 部分集合か」を CLI ごとに確認する。Claude Code は `cache_read_input_tokens` を**除外** (`input+output+cache_creation` のみ)、Codex は `cached_input_tokens` / `reasoning_output_tokens` が部分集合なので `input+output` のみを積む。全フィールドを足すと `TokenBudget` が誤発火する (Issue #55)。
+**The token double-counting trap (most important)**: check per-CLI whether usage is "an additive bucket or a subset." Claude Code **excludes** `cache_read_input_tokens` (counting only `input+output+cache_creation`); Codex's `cached_input_tokens` / `reasoning_output_tokens` are subsets, so count only `input+output`. Adding all fields makes `TokenBudget` misfire (Issue #55).
 
-## hard-won lessons（毎回再発見しないために surface する）
+## Hard-won lessons (surface these so you don't rediscover them every time)
 
-詳細は reference に送る。設計時に外さない。
+The details go to the references. Don't miss these at design time.
 
-- **token accounting** — 上記 `cache_read` 二重計上 (→ `references/writing-an-adapter.md`)。
-- **sync シームの hard-kill は POSIX SIGALRM 依存** — act/verify の per-call timeout/kill は `TimeoutPolicy` (graceful + kill)。**sync シームの実中断は POSIX main thread の `SIGALRM` に依存し、Windows / 非 main thread では graceful へ縮退するか `UnsupportedTimeoutKill` を送出する**。確実な kill が要るなら async シーム + `await async_run_loop(...)` (→ `references/async.md` / `references/errors.md`)。
-- **stdin ハング** — `codex exec` は stdin が pipe だと追加入力を読みハングする。`stdin=DEVNULL` 必須 (→ `references/writing-an-adapter.md`)。
-- **async-sync 境界** — 同期 `run_loop` に awaitable なシーム (act/verify/gather/condition.check/gate.review) を渡すと `AsyncSeamInSyncLoop`。非同期シームは `await async_run_loop(...)` (→ `references/async.md` / `references/errors.md`)。
-- **`allowed_tools` 絞り込み** — self-improvement 系では act を編集系 (`Read` / `Edit`) に絞り、commit / push をループ外に隔離する。`HumanGate` は subprocess 内部操作を見られない (→ `references/safety.md`)。
+- **token accounting** -- the `cache_read` double-counting above (-> `references/writing-an-adapter.md`).
+- **hard-kill of sync seams depends on POSIX SIGALRM** -- per-call timeout/kill for act/verify is `TimeoutPolicy` (graceful + kill). **The actual interruption of a sync seam depends on POSIX main-thread `SIGALRM`, and on Windows / non-main threads it degrades to graceful or raises `UnsupportedTimeoutKill`.** If you need a reliable kill, use async seams + `await async_run_loop(...)` (-> `references/async.md` / `references/errors.md`).
+- **stdin hang** -- `codex exec` reads additional input and hangs if stdin is a pipe. `stdin=DEVNULL` is mandatory (-> `references/writing-an-adapter.md`).
+- **the async-sync boundary** -- passing an awaitable seam (act/verify/gather/condition.check/gate.review) to the synchronous `run_loop` raises `AsyncSeamInSyncLoop`. Async seams require `await async_run_loop(...)` (-> `references/async.md` / `references/errors.md`).
+- **narrowing `allowed_tools`** -- for self-improvement work, narrow act to editing tools (`Read` / `Edit`) and isolate commit / push outside the loop. `HumanGate` can't see operations inside the subprocess (-> `references/safety.md`).
 
-## examples は inspiration、literal ではない
+## examples are inspiration, not literal
 
-`references/examples/` は「prose intent → シーム設計スケッチ」の発想カタログである。user の domain に合わせて verify の ground-truth・gather の scheduling・gate の隔離という**原理**を移植し、コードは書き直す。写経テンプレとして使わない。
+`references/examples/` is a catalog of ideas mapping "prose intent -> seam-design sketch." Transplant the **principles** -- verify's ground truth, gather's scheduling, gate's isolation -- to fit the user's domain, and rewrite the code. Don't use them as copy-paste templates.
 
-## 禁止事項
+## Prohibitions
 
-- recipe を rote（写経）適用しない。
-- user 要求とズレた cookbook reuse をしない (「翻訳 recipe があるから」と無関係なタスクに当てはめる等)。
-- verify を LLM-as-judge にしない (ground truth を最優先)。
-- 停止条件を 1 つも置かない構成にしない (`ConfigError` になるし暴走防止が崩れる)。
+- Don't apply recipes by rote (copying).
+- Don't reuse a cookbook that diverges from the user's request (e.g., applying it to an unrelated task just "because there's a translation recipe").
+- Don't make verify an LLM-as-judge (ground truth comes first).
+- Don't build a configuration with no stopping conditions at all (it becomes a `ConfigError`, and runaway prevention breaks down).

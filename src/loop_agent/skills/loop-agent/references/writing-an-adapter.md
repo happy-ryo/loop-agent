@@ -1,4 +1,4 @@
-> このファイルは `docs/adapters/writing-an-adapter.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/adapters/writing-an-adapter.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/adapters/writing-an-adapter.md`. The canonical source is `docs/adapters/writing-an-adapter.md` in the repository.
 
 # 新しい act アダプタの書き方
 

@@ -1,4 +1,4 @@
-> このファイルは `docs/seams.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/seams.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/seams.md`. The canonical source is `docs/seams.md` in the repository.
 
 # シーム詳細 — gather / act / verify / conditions / gate
 

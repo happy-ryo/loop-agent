@@ -1,4 +1,4 @@
-> このファイルは `docs/async.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/async.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/async.md`. The canonical source is `docs/async.md` in the repository.
 
 # async/await 対応 (async_run_loop)
 

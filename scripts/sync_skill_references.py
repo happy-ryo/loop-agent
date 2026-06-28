@@ -89,8 +89,8 @@ def _rewrite_links(body: str, doc_dir: str) -> str:
 
 def _header(docs_relpath: str) -> str:
     return (
-        f"> このファイルは `{docs_relpath}` の load-on-demand 用バンドルコピーです。"
-        f"正典はリポジトリの `{docs_relpath}` を参照してください。\n\n"
+        f"> This file is a load-on-demand bundled copy of `{docs_relpath}`. "
+        f"The canonical source is `{docs_relpath}` in the repository.\n\n"
     )
 
 
@@ -137,10 +137,16 @@ def main(argv: list[str] | None = None) -> int:
         prog="sync_skill_references",
         description="Regenerate the bundled skill references from docs/ (Issue 73).",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--check",
         action="store_true",
         help="do not write; exit non-zero if any reference differs from docs/",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="regenerate the references from docs/ (the default when no mode given)",
     )
     args = parser.parse_args(argv)
 

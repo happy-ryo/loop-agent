@@ -1,4 +1,4 @@
-> このファイルは `docs/errors.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/errors.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/errors.md`. The canonical source is `docs/errors.md` in the repository.
 
 # 例外階層（LoopError）
 
@@ -18,13 +18,17 @@ except LoopError as exc:
 ## 階層
 
 ```
-LoopError(Exception)                              ライブラリ全エラーの基底
-├── ConfigError(LoopError, ValueError, TypeError)   引数の値/型が不正・設定ミス
-├── StateError(LoopError, ValueError, RuntimeError) 実行時の不変条件/ライフサイクル違反
-└── AsyncSeamInSyncLoop(LoopError, RuntimeError)    同期 run_loop に非同期シーム（#40）
+LoopError(Exception)                                  ライブラリ全エラーの基底
+├── ConfigError(LoopError, ValueError, TypeError)        引数の値/型が不正・設定ミス
+│   └── UnsupportedTimeoutKill(ConfigError, RuntimeError) 同期シーム hard-kill が不可な環境/スレッド（#42）
+├── StateError(LoopError, ValueError, RuntimeError)      実行時の不変条件/ライフサイクル違反
+│   └── SeamTimeout(StateError)                          per-call timeout の kill 発火（#42）
+└── AsyncSeamInSyncLoop(LoopError, RuntimeError)         同期 run_loop に非同期シーム（#40）
 ```
 
-正準定義は `loop_agent.errors`。`loop_agent` トップレベル（`from loop_agent import LoopError, ConfigError, StateError, AsyncSeamInSyncLoop`）と、後方互換のため `loop_agent.cli.ConfigError` / `loop_agent._async.AsyncSeamInSyncLoop` からも同一クラスが参照できる。
+正準定義は `loop_agent.errors`。`loop_agent` トップレベル（`from loop_agent import LoopError, ConfigError, StateError, AsyncSeamInSyncLoop, SeamTimeout, UnsupportedTimeoutKill`）と、後方互換のため `loop_agent.cli.ConfigError` / `loop_agent._async.AsyncSeamInSyncLoop` / `loop_agent.loop.SeamTimeout` / `loop_agent.loop.UnsupportedTimeoutKill` からも同一クラスが参照できる。
+
+> `SeamTimeout` / `UnsupportedTimeoutKill` は #42（per-call timeout/kill）で導入され、当初は `LoopError` 階層の外（それぞれ素の `Exception` / `RuntimeError`）にあった。#71 で上記のとおり階層へ統合した（挙動・attribute は不変）。
 
 ### 各型の意味
 
@@ -33,6 +37,8 @@ LoopError(Exception)                              ライブラリ全エラーの
 | `ConfigError` | ライブラリが **明示的に検証**している引数の **値** が不正、または明示的な **型/形状チェック**に反する、もしくは run の設定ミス（construction / 呼び出し時の検証）。CLI の TOML / 引数パースの設定エラーも含む | `MaxIterations(-1)`、空文字の id、`conditions` が `AnyOf`/sequence でない、フック/resolver の戻り値型が不正、未知の enum 値、`[act]` テーブル欠落 |
 | `StateError` | 実行時の **不変条件 / 状態** 違反。「不正な入力」ではなく「その状態では許されない操作」 | 既に解決済みの gate 決定の再解決、未解決/実行不能な決定の execute/lease、resume 時に提案 action が記録と不一致、未知の gate disposition、driver の防御的 invariant |
 | `AsyncSeamInSyncLoop` | 同期 `run_loop` に awaitable なシーム（`act`/`verify`/`gather`/`condition.check`/`gate.review`/`on_step`/`on_complete`）が渡された | 非同期フックには `await async_run_loop(...)` を使う（#40） |
+| `SeamTimeout`（`StateError` 派生） | `act`/`verify` が `on_timeout="kill"` の per-call deadline を超過し、当該シームが cancel/中断された（#42）。「所定時間内に完了しなかった」= 実行時の不変条件違反として `StateError` 配下 | `TimeoutPolicy(act=…, on_timeout="kill")` で act が timeout → `except SeamTimeout as e: e.seam, e.seconds` |
+| `UnsupportedTimeoutKill`（`ConfigError` 派生 + `RuntimeError`） | **同期**シームの hard-kill が要求されたが、POSIX main thread の `SIGALRM` が無く中断を保証できない（Windows / 非 main thread）（#42）。seam/環境の組み合わせの設定不整合として `ConfigError` 配下。pre-#71 の `except RuntimeError` 互換のため `RuntimeError` も基底に保持 | 非 POSIX 環境で同期シーム + `on_timeout="kill"`。async シームか `on_timeout="graceful"` を使う |
 
 > `ConfigError` はライブラリ **自身**の検証を包む。型ヒントに反する値を未チェックの数値経路へ渡した場合（例: `MaxIterations(None)`）は、その演算が素の `TypeError` を送出する（Python 標準の挙動で、ここでは包まない）。
 
@@ -46,6 +52,8 @@ LoopError(Exception)                              ライブラリ全エラーの
 - `ConfigError` は `ValueError` かつ `TypeError`
 - `StateError` は `ValueError` かつ `RuntimeError`
 - `AsyncSeamInSyncLoop` は `RuntimeError`
+- `SeamTimeout` は `StateError` 派生（したがって `ValueError` / `RuntimeError` でもある）。#71 以前は素の `Exception` だったため、これは捕捉範囲を **広げる**だけで `except SeamTimeout` は不変
+- `UnsupportedTimeoutKill` は `ConfigError` 派生（`ValueError` / `TypeError`）かつ **明示的に `RuntimeError`**。#71 以前は素の `RuntimeError` だったため、既存の `except RuntimeError` を壊さないよう `RuntimeError` を基底に残している
 
 したがって旧 API に対して書かれた `except ValueError` / `except TypeError` /
 `except RuntimeError` はそのまま動作し、新しいコードは精密な `LoopError` サブ型

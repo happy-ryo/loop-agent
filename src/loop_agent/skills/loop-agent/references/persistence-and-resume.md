@@ -1,4 +1,4 @@
-> このファイルは `docs/persistence-and-resume.md` の load-on-demand 用バンドルコピーです。正典はリポジトリの `docs/persistence-and-resume.md` を参照してください。
+> This file is a load-on-demand bundled copy of `docs/persistence-and-resume.md`. The canonical source is `docs/persistence-and-resume.md` in the repository.
 
 # 永続化と再開 (progress file / state.db SoT / resume)
 
