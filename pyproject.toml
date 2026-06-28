@@ -4,18 +4,63 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loop-agent"
-version = "0.0.1"
-description = "loop-agent PoC: a minimal gather->act->verify->repeat loop core with composable stop conditions."
+version = "0.1.0"
+description = "loop-agent: an embeddable loop engine for agents (gather -> act -> verify -> repeat, with composable stop conditions, persisted state, limited human gates, and an outer Reflexion loop)."
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = [
+    "agent",
+    "agentic",
+    "loop",
+    "loop-engineering",
+    "agent-loop",
+    "llm",
+    "reflexion",
+    "react",
+    "self-improving",
+    "human-in-the-loop",
+    "observability",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
 
-# OTel GenAI span 連携は optional 依存（report.md S4.5）。未導入環境では
-# loop_agent.otel.LoopSpan が no-op へ degrade し、JSONL/event sink は動き続ける。
+[project.urls]
+Homepage = "https://github.com/happy-ryo/loop-agent"
+Repository = "https://github.com/happy-ryo/loop-agent"
+Changelog = "https://github.com/happy-ryo/loop-agent/blob/main/CHANGELOG.md"
+Issues = "https://github.com/happy-ryo/loop-agent/issues"
+
+# Extras map to real optional functionality only:
+#   otel  -> OTel GenAI span integration (loop_agent.otel; degrades to no-op when absent)
+#   test  -> running the suite (incl. OTel SDK for in-memory-exporter span assertions)
+#   dev   -> test deps + release tooling (build/twine)
+# NOTE: there is intentionally no [redis] extra. The wake-delivery transport
+# (loop_agent.transport) is backend-agnostic via the PushBackend protocol and
+# ships only in-memory / callable backends; nothing imports redis, so an extra
+# pinning redis would install a dependency no code uses (report.md S3.3 / S4.6).
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.20"]
-# dev では SDK も入れ、in-memory exporter で OTel span の中身まで CI で検証する。
-dev = ["pytest>=7", "opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
+test = [
+    "pytest>=7",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
+dev = [
+    "loop-agent[test]",
+    "build>=1.0",
+    "twine>=5.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/loop_agent"]
