@@ -12,6 +12,7 @@ Subcommands::
     loop-agent status <run-id>
     loop-agent resume <run-id> ./task.toml
     loop-agent logs   <run-id> [--follow]
+    loop-agent install-skills [--user | --target PATH]
     loop-agent                       # quick help + a sample task.toml
 
 ``act`` and ``verify`` each work in one of two modes (report.md R1):
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import shutil
 import subprocess
 import sys
 import time
@@ -765,6 +767,105 @@ def cmd_logs(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+# -- install-skills ----------------------------------------------------------
+
+# The reference-bundled Claude Code skill (Issue #73) ships *inside* the package
+# at ``loop_agent/skills/loop-agent/`` so ``pip install loop-agent`` carries it.
+# ``install-skills`` copies it into a ``.claude/skills/`` directory a coding
+# agent will discover. The library code itself never imports these files; they
+# are docs-for-the-agent, distributed with the library so the agent always sees
+# the version that matches the installed loop-agent.
+SKILL_NAME = "loop-agent"
+
+
+def _bundled_skill_dir() -> Path:
+    """Filesystem path to the bundled skill shipped inside the package.
+
+    ``cli.py`` lives at ``loop_agent/cli.py``, so the skill is a sibling
+    ``skills/loop-agent/`` directory. This resolves correctly for both an
+    editable checkout and an installed wheel (both lay the package out as real
+    files on disk).
+    """
+    return Path(__file__).resolve().parent / "skills" / SKILL_NAME
+
+
+def _resolve_skill_dest(args: argparse.Namespace) -> Path:
+    """Pick the install destination: --target wins, else --user home, else cwd.
+
+    Default and ``--user`` both land at ``<base>/.claude/skills/loop-agent`` (the
+    layout Claude Code discovers); ``--target`` is taken as the exact directory
+    to write the skill into.
+    """
+    if getattr(args, "target", None) is not None:
+        return Path(args.target).expanduser()
+    base = Path.home() if getattr(args, "user", False) else Path.cwd()
+    return base / ".claude" / "skills" / SKILL_NAME
+
+
+def _installed_skill_name(skill_md: Path) -> Optional[str]:
+    """Return the ``name:`` from a SKILL.md YAML frontmatter, or None.
+
+    Used to recognise a *prior loop-agent install* at the destination (so a
+    reinstall may safely replace it) without mistaking a different skill's
+    directory for one of ours.
+    """
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    front = text[:end] if end != -1 else text
+    for line in front.splitlines():
+        if line.startswith("name:"):
+            return line[len("name:") :].strip().strip("\"'")
+    return None
+
+
+def cmd_install_skills(args: argparse.Namespace, out: Any = None) -> int:
+    out = sys.stdout if out is None else out
+    source = _bundled_skill_dir()
+    if not source.is_dir():
+        # A wheel that somehow dropped the data files would land here; fail with
+        # an actionable message rather than silently installing nothing.
+        raise ConfigError(
+            f"bundled skill not found at {source}; the installed loop-agent "
+            "package appears to be missing its skill data files."
+        )
+    dest = _resolve_skill_dest(args)
+    if dest.exists():
+        if not dest.is_dir():
+            raise ConfigError(
+                f"install destination {dest} exists and is not a directory"
+            )
+        # Replace the whole tree so the install *converges* to the bundled
+        # contents: a plain merge-copy would leave behind references that a newer
+        # loop-agent has renamed or removed, so a coding agent could keep reading
+        # stale files. Guard the footgun: only wipe a directory that is empty or
+        # is *our own* prior install (a SKILL.md whose frontmatter name is
+        # loop-agent). Refuse a non-empty unrelated directory or a *different*
+        # skill's directory (a mis-pointed --target) so we never delete it.
+        if any(dest.iterdir()) and _installed_skill_name(dest / "SKILL.md") != SKILL_NAME:
+            raise ConfigError(
+                f"{dest} is not empty and is not a loop-agent skill install "
+                "(no SKILL.md with 'name: loop-agent'); refusing to overwrite it. "
+                "Point --target at an empty or dedicated directory."
+            )
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Fresh copy of the bundle. Re-running is idempotent: an existing install is
+    # removed above, so the second run lands the same tree as the first.
+    shutil.copytree(source, dest)
+    file_count = sum(1 for p in dest.rglob("*") if p.is_file())
+    print(f"installed loop-agent skill -> {dest} ({file_count} files)", file=out)
+    print(
+        "restart your coding agent (e.g. Claude Code) to pick up the skill.",
+        file=out,
+    )
+    return 0
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -803,6 +904,7 @@ Usage:
   loop-agent status <run-id> [--db PATH]
   loop-agent resume <run-id> ./task.toml [--db PATH]
   loop-agent logs   <run-id> [--follow] [--db PATH]
+  loop-agent install-skills [--user | --target PATH]
 
 Run 'loop-agent <command> --help' for per-command options.
 
@@ -877,6 +979,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_db_flag(p_logs)
     p_logs.set_defaults(func=cmd_logs)
+
+    p_install = sub.add_parser(
+        "install-skills",
+        help="copy the bundled loop-agent coding-agent skill into a skills dir",
+    )
+    dest = p_install.add_mutually_exclusive_group()
+    dest.add_argument(
+        "--user",
+        action="store_true",
+        help="install into ~/.claude/skills/loop-agent (user-global) "
+        "instead of the project's .claude/skills/",
+    )
+    dest.add_argument(
+        "--target",
+        default=None,
+        help="install into this exact directory instead of "
+        ".claude/skills/loop-agent",
+    )
+    p_install.set_defaults(func=cmd_install_skills)
 
     return parser
 

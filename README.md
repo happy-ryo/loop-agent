@@ -80,6 +80,23 @@ print(result.status, result.reason)   # goal_met / goal met
 - **D（応用パターン）**: `act` / `gather` シームで今日でも書ける正準例。ModelLadder（困難タスクで強いモデルへエスカレーション） → **[docs/adapters/](./docs/adapters/README.md)**、WorkListGather（multi-item の公平 scheduling） → **[docs/transport.md](./docs/transport.md)**、Reflexion 合成 → **[docs/reflexion.md](./docs/reflexion.md)**。
 - **E（coding-agent driven・推奨）**: `intent（人間の自然言語） → coding agent が gather/act/verify/conditions/gate を書く → run_loop 起動 → 結果を観察して policy を書き直す → loop-agent runtime（薄い loop core・不変）`。自然言語 intent で駆動できるので**コードを書かない user にも届く**。→ **[docs/quickstart.md](./docs/quickstart.md)**
 
+## coding agent 向け skill bundle（同梱）
+
+動線 E（coding-agent driven）を library 側で公式に支援するため、coding agent（Claude Code / Cursor / Codex 等）が loop-agent を最適に使うための **load-on-demand reference bundle** を skill として同梱している。`SKILL.md`（trigger +「どう設計するか」の能動的指示）と `references/`（5 シーム / adapter の 4 か条 / safety / async / errors などの reference + 発想例）から成り、agent は必要な reference だけを on-demand で読んで user の domain に 5 シームを synthesize する。recipe を丸写しさせる cookbook ではなく、agent の synthesize 能力を活かす reference-bundled 設計。
+
+skill 本体は Python package に同梱（`loop_agent/skills/loop-agent/`）されるので、loop-agent のバージョンと skill が常に一致する。`pip install` 後、coding agent が探す `.claude/skills/` へ `install-skills` でコピーする:
+
+```bash
+pip install loop-agent
+loop-agent install-skills                    # ./.claude/skills/loop-agent/ に配置（プロジェクトローカル・既定）
+loop-agent install-skills --user             # ~/.claude/skills/loop-agent/ に配置（ユーザーグローバル）
+loop-agent install-skills --target <path>    # 任意パスに配置
+```
+
+`install-skills` は idempotent（再実行で同梱内容に収束）。配置後は coding agent（Claude Code 等）を再起動すると skill が有効になる。
+
+> **メンテナ向け**: `references/` の verbatim bundle 8 本は `docs/` から派生する。`docs/` を更新したら `python scripts/sync_skill_references.py` を実行して references を再生成しコミットする（`SKILL.md` / `design-philosophy.md` / `examples/` は手書きで対象外）。CI（`sync-skill-references`）が `--check` で同期を検証し、ズレていれば fail する。
+
 ## docs/ ナビゲーション
 
 | ドキュメント | 内容 |

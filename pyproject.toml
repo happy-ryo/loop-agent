@@ -79,6 +79,15 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/loop_agent"]
+# Ship the bundled coding-agent skill (Issue #73) as package data: SKILL.md +
+# references/ live inside the package at loop_agent/skills/loop-agent/, so
+# `pip install loop-agent` carries them and `loop-agent install-skills` copies
+# them into a .claude/skills/ dir. hatchling includes non-.py files under the
+# package by default; this pins the markdown bundle so it can never be silently
+# dropped from the wheel. The sdist carries it too via hatchling's default
+# (VCS-tracked) file selection, so the release (which builds the wheel from the
+# sdist) keeps the bundle end to end.
+artifacts = ["src/loop_agent/skills/**/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

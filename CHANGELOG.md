@@ -10,6 +10,23 @@
 
 ### Added
 
+- **Claude Code 向け reference-bundled skill の同梱 + `install-skills` CLI**（Issue #73）:
+  coding agent（Claude Code / Cursor / Codex 等）が loop-agent を最適に使うための
+  **load-on-demand reference bundle** を Python package に同梱（`loop_agent/skills/loop-agent/`）。
+  `SKILL.md`（trigger +「どう設計するか」の能動的指示）と `references/`（5 シーム /
+  adapter の 4 か条 / safety / async / errors 等の reference + 発想例）から成り、agent は
+  必要な reference だけを on-demand で読んで user の domain に 5 シームを synthesize する
+  （recipe を丸写しさせる cookbook ではなく、agent の synthesize 能力を活かす設計）。
+  - **`loop-agent install-skills`**: 同梱 skill を `.claude/skills/loop-agent/`（既定・
+    プロジェクトローカル）/ `--user`（`~/.claude/skills/`）/ `--target <path>`（任意）へ
+    idempotent にコピーする subcommand。skill は wheel / sdist に同梱されるので
+    loop-agent のバージョンと常に一致する。
+  - **docs -> references の自動同期**: `scripts/sync_skill_references.py`（決定的再生成、
+    stdlib のみ）が verbatim bundle 8 本を `docs/` から派生。CI（`sync-skill-references`）が
+    `--check` で同期を検証する（commit-back しない verify-only）。`SKILL.md` /
+    `design-philosophy.md` / `examples/` は手書きで対象外。
+  - 併せて `docs/async.md` の `conditions=MaxIterations(...)`（list 未ラップで `ConfigError`
+    になる例）を list ラップに修正。
 - **act/verify の per-call timeout / kill（`TimeoutPolicy`）**（Issue #42）: 1 回の
   `act` / `verify` 呼び出しに制限時間を設ける機構。`run_loop` / `async_run_loop` の
   `timeout=` 引数に `TimeoutPolicy`（`act` / `verify` / `default` の秒数 + `on_timeout`

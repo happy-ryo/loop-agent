@@ -1,0 +1,22 @@
+name: sync-skill-references
+
+# Verify the bundled coding-agent skill references stay in sync with docs/
+# (Issue #73). This is a verify-only check: it never commits back. When a
+# bundled doc changes without re-running the sync, the job fails and prints the
+# diff, telling the author to run `python scripts/sync_skill_references.py` and
+# commit the regenerated references.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check references are in sync with docs/
+        run: python scripts/sync_skill_references.py --check
