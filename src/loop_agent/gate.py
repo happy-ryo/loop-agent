@@ -98,8 +98,9 @@ import json
 import os
 import time
 import uuid
+import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .loop import (
     GATE_PAUSE,
@@ -115,6 +116,7 @@ from .loop import (
     _default_gather,
     run_loop,
 )
+from .notify import ApprovalDescriber, ApprovalRequest, Notifier, _summarize_action
 from .state import LoopState
 from .store import (
     DECISION_KINDS,
@@ -190,6 +192,17 @@ class HumanGate:
         now_fn: リース取得/失効判定に使う **wall-clock** (epoch 秒)。複数プロセスで時刻を
             突き合わせるため monotonic ではなく ``time.time`` 既定 (loop の ``elapsed`` 用
             ``time_fn`` とは別物)。決定論的テストのため注入可能。
+        notifier: 任意。新しい承認要求 (pending) を **このプロセスで初めて登録した瞬間** に
+            :meth:`loop_agent.notify.Notifier.notify` を best-effort で呼ぶ通知 backend
+            (:mod:`loop_agent.notify` の webhook / Slack / email / fan-out)。``None`` (既定) なら
+            従来通り無通知。通知は best-effort で、失敗は warning 化して :class:`HumanGate` を
+            止めない (承認要求自体は store に永続化済みなので通知が落ちても loop は進む)。
+            既登録ゲートの resume 再訪では再通知しない (``entry`` が既に存在するため)。
+            ``resolver`` 併用時は通知しない (同期 inline 解決で人間待ちにならないため)。
+        describe: 任意。``describe(action) -> Mapping`` で通知 payload
+            (:class:`~loop_agent.notify.ApprovalRequest`) の ``summary`` / ``action_kind`` /
+            ``deadline`` を導出・上書きする。未指定なら ``summary`` は action から自動生成
+            (:func:`loop_agent.notify._summarize_action`)。``notifier=None`` なら呼ばれない。
     """
 
     def __init__(
@@ -204,6 +217,8 @@ class HumanGate:
         owner: Optional[str] = None,
         lease_ttl: float = DEFAULT_LEASE_TTL,
         now_fn: Optional[Callable[[], float]] = None,
+        notifier: Optional[Notifier] = None,
+        describe: Optional[ApprovalDescriber] = None,
     ) -> None:
         self.on = on
         self.store = store
@@ -215,6 +230,8 @@ class HumanGate:
         self.owner = owner or f"pid{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.lease_ttl = lease_ttl
         self.now_fn = now_fn if now_fn is not None else time.time
+        self.notifier = notifier
+        self.describe = describe
         # run 行を確保する (request_decision の FK と begin event を冪等に満たす)。
         self.store.load_or_init(run_id)
 
@@ -252,7 +269,17 @@ class HumanGate:
         # request_decision の戻り値 (= 並行作成済みなら相手の行) を権威として扱う。
         entry = self.store.get_decision(self.run_id, gate_key)
         if entry is None:
-            entry = self.store.request_decision(self.run_id, gate_key, context)
+            # register_decision は権威行に加え **この呼び出しが INSERT したか** を返す。
+            # 新規承認要求の発火点はこの INSERT 1 回だけ: ``created`` のときだけ通知する。
+            # resume 再訪 (entry が既存で None でない) も、get_decision で None を見た後の
+            # TOCTOU レースで敗者が相手の行を受け取ったケース (created=False) も再通知しない。
+            # さらに resolver 併用時は通知しない: 直後の resolver 分岐が同期で inline 解決し
+            # **人間待ちにならない** ため (外部チャネルへ「承認待ち」を誤って page しない)。
+            entry, created = self.store.register_decision(
+                self.run_id, gate_key, context
+            )
+            if created and self.resolver is None:
+                self._notify_new_request(gate_key, context)
 
         # どの分岐に進む前に **必ず** 登録時の action と現在の提案 action の一致を確認する。
         # 提案列が resume 間でずれ、別の不可逆 action が同じ gate_key に来た場合に、(a) 古い
@@ -293,6 +320,53 @@ class HumanGate:
         # resolver 無し: 中断して人間の決定を待つ。決定は store に永続化済みなので
         # 同じ run_id で再実行すれば上の resolved 分岐で適用される。
         return GateReview(disposition=GATE_PAUSE, pending=entry)
+
+    def _build_request(self, gate_key: str, action: Any) -> ApprovalRequest:
+        """通知 payload (:class:`~loop_agent.notify.ApprovalRequest`) を構築する。
+
+        ``summary`` は ``describe`` があればそれを優先し、無ければ action から自動生成する。
+        ``describe`` が返す ``summary`` / ``action_kind`` / ``deadline`` で上書きできる。
+        ``created_at`` は gate の wall-clock (``now_fn``) を使う。
+        """
+        fields: dict[str, Any] = {"summary": _summarize_action(action)}
+        if self.describe is not None:
+            extra = self.describe(action)
+            if extra:
+                if not isinstance(extra, Mapping):
+                    raise TypeError(
+                        "describe must return a Mapping of ApprovalRequest fields, "
+                        f"got {type(extra).__name__}"
+                    )
+                fields.update(extra)
+        return ApprovalRequest(
+            run_id=self.run_id,
+            gate_key=gate_key,
+            action=action,
+            summary=str(fields.get("summary", "")),
+            action_kind=fields.get("action_kind"),
+            deadline=fields.get("deadline"),
+            created_at=self.now_fn(),
+        )
+
+    def _notify_new_request(self, gate_key: str, action: Any) -> None:
+        """新規承認要求を notifier へ best-effort で通知する (失敗で loop を止めない)。
+
+        ``notifier=None`` なら何もしない。``describe`` が例外を投げた場合も含め、通知経路の
+        どの失敗も :class:`HumanGate` を止めず ``warnings.warn`` (RuntimeWarning) で可視化する。
+        """
+        if self.notifier is None:
+            return
+        try:
+            request = self._build_request(gate_key, action)
+            self.notifier.notify(request)
+        except Exception as exc:  # noqa: BLE001 - 通知は best-effort、loop を止めない
+            warnings.warn(
+                f"gate {gate_key}: notifier "
+                f"{type(self.notifier).__name__} failed: "
+                f"{type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _guard_action_matches(
         self, entry: dict[str, Any], context: Any, gate_key: str
@@ -439,6 +513,8 @@ def run_gated_loop(
     owner: Optional[str] = None,
     lease_ttl: float = DEFAULT_LEASE_TTL,
     now_fn: Optional[Callable[[], float]] = None,
+    notifier: Optional[Notifier] = None,
+    describe: Optional[ApprovalDescriber] = None,
     time_fn: Optional[Callable[[], float]] = None,
     initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
@@ -446,8 +522,9 @@ def run_gated_loop(
 
     ``run_loop`` と同じ ``act`` / ``verify`` / ``conditions`` / ``gather`` /
     ``on_step`` / ``initial_state`` を取り、人間ゲートの構成 (``on`` / ``store`` /
-    ``run_id`` / ``resolver`` / ``key`` / ``active``、および複数プロセス同時 resume の
-    リース調整用 ``owner`` / ``lease_ttl`` / ``now_fn``。詳細は :class:`HumanGate`) を足す。
+    ``run_id`` / ``resolver`` / ``key`` / ``active``、複数プロセス同時 resume の
+    リース調整用 ``owner`` / ``lease_ttl`` / ``now_fn``、承認要求発火時の外部通知用
+    ``notifier`` / ``describe``。詳細は :class:`HumanGate`) を足す。
     決定の永続化を併せたい
     場合は ``on_step`` に :meth:`loop_agent.store.DBProgressLog.on_step` を渡す。
     pause した run を **中断地点から継続** して再開するには、その永続状態
@@ -465,6 +542,8 @@ def run_gated_loop(
         owner=owner,
         lease_ttl=lease_ttl,
         now_fn=now_fn,
+        notifier=notifier,
+        describe=describe,
     )
     run_kwargs: dict[str, Any] = {}
     if time_fn is not None:
