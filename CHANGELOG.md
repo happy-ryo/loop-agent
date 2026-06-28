@@ -10,6 +10,37 @@
 
 ### Added
 
+- **act/verify の per-call timeout / kill（`TimeoutPolicy`）**（Issue #42）: 1 回の
+  `act` / `verify` 呼び出しに制限時間を設ける機構。`run_loop` / `async_run_loop` の
+  `timeout=` 引数に `TimeoutPolicy`（`act` / `verify` / `default` の秒数 + `on_timeout`
+  モード）、秒数（両シームに graceful 適用の短縮形）、または `None`（既定・追加コスト
+  ゼロ）を渡す。全実装は async-first core の `_drive_loop` に入っているので **sync /
+  async 両 API へ自動適用**（#40 の二重実装回避の回収）。
+  - **モード**: `graceful`（既定）は当該シームを諦め、`goal_met=False` の合成 step
+    （observation マーカー `ACT_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`）を
+    記録して **次 iteration** へ進む。`MaxIterations` / `Timeout` stop / マーカーへの
+    `NoProgress` が timeout の連続を収束させる。`kill` は当該シームを cancel し
+    `SeamTimeout` を **ループ外へ送出**する。
+  - **実機構とプラットフォーム差**: async シームは asyncio の task cancel
+    （`asyncio.wait` + `task.cancel()`）で実際に cancel（移植性あり。締切時に task が
+    pending かで判定するので seam 自身の `asyncio.TimeoutError` とも混同しない）。
+    sync シームは POSIX main thread の `SIGALRM`（`signal.setitimer`）で
+    実際に中断。`SIGALRM` 不在（Windows / 非 main thread）では sync シームを強制中断
+    できないため、`graceful` は呼び出し **完了後** の超過検出（best-effort、hung call は
+    縛れない）、`kill` は呼び出し前に `UnsupportedTimeoutKill` を送出（縛れない hard kill
+    を黙ってハングさせない）。per-call の締切は実 wall-clock 基準（`time_fn` は stop 条件
+    用クロックのみに作用。post-hoc fallback だけ `time_fn` で計測）。
+  - **既知制限**: async の cancel は協調的（締切時の task pending で判定するため
+    `CancelledError` 握り潰し seam でも kill は効き、cleanup を待たず即報告するのでループは
+    ハングしない＝握り潰して完了しない seam は orphan task としてリークするのみ。seam 自身の
+    `asyncio.TimeoutError` は別物として伝播）。`SIGALRM` は再入不可（呼び出し終了時に
+    組み込み先の `ITIMER_REAL` は復元）。
+    per-call 締切は同期区間＋await 区間で単一 budget（remaining を繰り越し）。詳細は
+    [`docs/recipes/timeout-and-kill.md`](./docs/recipes/timeout-and-kill.md)。
+  - 既存の whole-run `Timeout` *stop 条件*（iteration 境界で累積 wall-clock を上限化、
+    進行中 step は中断しない）とは別物。新規 export: `TimeoutPolicy` / `SeamTimeout` /
+    `UnsupportedTimeoutKill` / `TIMEOUT_GRACEFUL` / `TIMEOUT_KILL` /
+    `ACT_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`。
 - **multi-item 公平 scheduling `WorkListGather`**（Issue #56）: N 件を 1 本のループで
   公平に回す `gather` フック。公平 scheduling 戦略（`round_robin` / `fewest_attempts` /
   `fifo` / `priority` / custom callable）+ per-item 上限（`max_attempts_per_item` で

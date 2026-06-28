@@ -37,3 +37,18 @@ result = run_loop(
 ```
 
 詳しい組み方・戦略の選び方は **[multi-item-work-list.md](./multi-item-work-list.md)**。手書きの round-robin（`min(rem, key=lambda x: (attempts[x], items.index(x)))`）でも同じことはできますが、attempt counter / done 集合の管理と resume 安全を `WorkListGather` が肩代わりします。
+
+## 暴走する 1 回の呼び出しを止める（per-call timeout / kill）
+
+`act` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
+
+```python
+from loop_agent import run_loop, TimeoutPolicy, MaxIterations
+
+result = run_loop(
+    act=my_act, verify=my_verify, conditions=[MaxIterations(20)],
+    timeout=TimeoutPolicy(act=30.0, verify=10.0, on_timeout="graceful"),
+)
+```
+
+書き方・モード・**プラットフォーム差（sync シームの hard kill は POSIX main thread のみ／Windows は明示エラー）** は **[timeout-and-kill.md](./timeout-and-kill.md)**。

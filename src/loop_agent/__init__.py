@@ -81,10 +81,17 @@ from .evaluator import (
 from .gate import Decision, HumanGate, run_gated_loop
 from ._async import AsyncSeamInSyncLoop
 from .loop import (
+    ACT_TIMEOUT_OBSERVATION,
+    TIMEOUT_GRACEFUL,
+    TIMEOUT_KILL,
+    VERIFY_TIMEOUT_OBSERVATION,
     ActionGate,
     ActOutcome,
     GateReview,
     LoopResult,
+    SeamTimeout,
+    TimeoutPolicy,
+    UnsupportedTimeoutKill,
     VerifyOutcome,
     async_run_loop,
     run_loop,
@@ -172,6 +179,14 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
+    # act/verify の per-call timeout / kill (Issue #42)
+    "TimeoutPolicy",
+    "SeamTimeout",
+    "UnsupportedTimeoutKill",
+    "TIMEOUT_GRACEFUL",
+    "TIMEOUT_KILL",
+    "ACT_TIMEOUT_OBSERVATION",
+    "VERIFY_TIMEOUT_OBSERVATION",
     "GoalMet",
     "GoalCheck",
     "NoProgress",
