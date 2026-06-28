@@ -69,13 +69,21 @@ class LoopError(Exception):
 
 
 class ConfigError(LoopError, ValueError, TypeError):
-    """An argument value/type is invalid, or the run is misconfigured.
+    """An argument value is invalid, or the run is misconfigured.
 
-    Raised by construction- and call-time validation (a stop condition built
-    with a negative limit, a non-empty-string id left empty, a hook given the
-    wrong type, an unknown enum value, ...) and by the CLI's TOML/argument
-    parsing. Inherits ``ValueError`` and ``TypeError`` so pre-hierarchy
-    ``except ValueError`` / ``except TypeError`` callers keep working.
+    Raised by the library's *explicit* construction- and call-time validation:
+    an invalid value (a stop condition built with a negative limit, a
+    non-empty-string id left empty, an unknown enum value, ...), an explicit
+    type/shape check (``conditions`` that is not an ``AnyOf``/sequence, a hook
+    or resolver returning the wrong type, an unsupported adapter response), and
+    the CLI's TOML/argument parsing. Inherits ``ValueError`` and ``TypeError``
+    so pre-hierarchy ``except ValueError`` / ``except TypeError`` callers keep
+    working.
+
+    Note: this wraps the library's *own* validation. Passing an argument whose
+    type violates the annotation to an un-checked numeric path (e.g.
+    ``MaxIterations(None)``) still surfaces as a plain ``TypeError`` from the
+    offending operation -- standard Python behaviour, not wrapped here.
     """
 
 

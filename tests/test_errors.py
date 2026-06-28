@@ -8,6 +8,7 @@ from ...``) preserve the cause so the origin stays traceable.
 import pytest
 
 import loop_agent
+import loop_agent.cli  # ensure the cli submodule is loaded for the alias check below
 from loop_agent import (
     AsyncSeamInSyncLoop,
     ConfigError,
@@ -85,6 +86,31 @@ def test_config_error_raised_by_validation_and_catchable_three_ways():
         MaxIterations(-1)
     with pytest.raises(ValueError):
         MaxIterations(-1)
+
+
+def test_explicit_type_check_raises_config_error():
+    # The library's *explicit* type validation (here: `conditions` is neither an
+    # AnyOf nor a sequence) is a ConfigError, catchable as LoopError / TypeError.
+    bad = dict(
+        act=lambda ctx: loop_agent.ActOutcome(observation="x", tokens=0),
+        verify=lambda o: loop_agent.VerifyOutcome(goal_met=True),
+        conditions=42,
+    )
+    with pytest.raises(ConfigError):
+        run_loop(**bad)
+    with pytest.raises(LoopError):
+        run_loop(**bad)
+    with pytest.raises(TypeError):
+        run_loop(**bad)
+
+
+def test_incidental_type_error_is_not_wrapped():
+    # Documented boundary: passing a type-hint-violating value to an un-checked
+    # numeric path surfaces as a plain TypeError (NOT a LoopError). This pins the
+    # contract in docs/errors.md so it cannot silently drift.
+    with pytest.raises(TypeError) as exc:
+        MaxIterations(None)  # `None < 0` raises before any explicit validation
+    assert not isinstance(exc.value, LoopError)
 
 
 def test_async_seam_raised_by_sync_loop_with_async_act():
