@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Mapping, Optional, Sequence, Union
 
 from ..state import LoopState, StepRecord
-from .triage import triage
+from ._triage import triage
 
 
 @dataclass(frozen=True)
