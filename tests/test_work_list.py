@@ -556,6 +556,23 @@ def test_schedule_context_is_exported_from_facades():
     assert discovery_pkg.ScheduleContext is ScheduleContext
 
 
+def test_triage_function_does_not_shadow_a_submodule():
+    # 入力選定の実装は _triage (private) に置く。triage を同名 submodule に置くと、facade の
+    # `from ._triage import triage` (関数) が package 属性 triage を上書きし、
+    # `import loop_agent.discovery.triage` が *関数* に bind される事故が起きる (#56 review)。
+    import loop_agent
+    import loop_agent.discovery as discovery_pkg
+
+    # facade の triage は関数 (Triage を返す) で、Candidate も facade から引ける。
+    assert callable(discovery_pkg.triage)
+    assert loop_agent.triage is discovery_pkg.triage
+    rec = discovery_pkg.triage([discovery_pkg.Candidate(id="x")])
+    assert rec.recommended.id == "x"
+    # 公開 submodule 名 triage は存在しない (shadow なし)。
+    with pytest.raises(ModuleNotFoundError):
+        import loop_agent.discovery.triage  # noqa: F401
+
+
 def test_resume_with_same_gatherer_continues_consistently():
     # 同一 gatherer を initial_state で再開すると、attempts が引き継がれて最後まで drained する。
     g = WorkListGather(
