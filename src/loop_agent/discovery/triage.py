@@ -47,7 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from .store import LoopStore
+from ..store import LoopStore
 
 # 配達層が使う gate_key の prefix。in-loop の不可逆 action ゲート (gate-<iteration>) と
 # 名前空間を分け、同じ ``pending_decision`` レジスタを安全に相乗りさせる。

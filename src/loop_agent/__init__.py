@@ -31,12 +31,20 @@ from .conditions import (
     TokenBudget,
 )
 from .discovery import (
+    DRAINED,
     AdoptionResult,
     BlockedCandidate,
     Candidate,
+    Drained,
     Proposal,
+    ScheduleContext,
+    Scheduler,
     Triage,
     WorkDiscovery,
+    WorkItem,
+    WorkListDrained,
+    WorkListGather,
+    WorkListProgress,
     discover_next,
     triage,
 )
@@ -268,6 +276,15 @@ __all__ = [
     "AdoptionResult",
     "WorkDiscovery",
     "discover_next",
+    # multi-item 公平 scheduling (Issue #56)
+    "WorkItem",
+    "WorkListGather",
+    "WorkListProgress",
+    "WorkListDrained",
+    "ScheduleContext",
+    "Scheduler",
+    "Drained",
+    "DRAINED",
 ]
 
 __version__ = "0.1.0"

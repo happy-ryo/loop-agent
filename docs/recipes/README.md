@@ -13,17 +13,27 @@
 | [flaky-test-stabilization.md](./flaky-test-stabilization.md) | flaky test の安定化（N 件） | 修正後に対象テストが N 回連続 pass |
 | [translation.md](./translation.md) | docstring/コメントの一括翻訳（N ファイル） | 翻訳対象に対象言語が 0 + AST 不変 + 当該テスト pass |
 | [refactor.md](./refactor.md) | 挙動不変リファクタ（N module） | 既存テスト全 pass + AST レベルで挙動同値 |
+| [multi-item-work-list.md](./multi-item-work-list.md) | N 件を 1 本のループで公平に回す（横断） | （上記各 recipe の verify をそのまま per-item 適用） |
 
 > 「このタスクは loop-agent に向いているか?」の最初のフィルタは **verify が sharp に書けるか**。書けないタスク（「もっと良い文章にして」等、機械判定できない目標）は coding agent 側で triage 除外するのが規律です。
 
 ## multi-item ループの公平性（全 recipe 共通の注意）
 
-3 つとも「N 件を回す」multi-item ループです。素朴な `gather`（先頭の未完を返す）だと、1 件が verify 失敗を連続したときに `MaxIterations` を独占し、残りが starve します。**試行回数最小から選ぶ round-robin** を `gather` に書いて公平にしてください:
+上の recipe はどれも「N 件を回す」multi-item ループです。素朴な `gather`（先頭の未完を返す）だと、1 件が verify 失敗を連続したときに `MaxIterations` を独占し、残りが starve します。これを正規化したのが `WorkListGather`（`loop_agent.discovery.work_list`, Issue #56）— **公平 scheduling + per-item 上限 + done 判定フック**を `gather` として注入できます:
 
 ```python
-def gather(state):
-    rem = [x for x in items if x not in done]
-    return min(rem, key=lambda x: (attempts[x], items.index(x)))   # 公平 scheduling
+from loop_agent import WorkListGather, WorkListDrained, run_loop, MaxIterations
+
+gather = WorkListGather(
+    ["a.py", "b.py", "c.py"],
+    strategy="fewest_attempts",     # 試行回数最小から選ぶ round-robin
+    max_attempts_per_item=3,        # 1 件が独占しないよう per-item で打ち止め
+    done_when=lambda item, rec: rec.observation["passed"],   # この item は終わったか
+)
+result = run_loop(
+    act=my_act, verify=my_verify, gather=gather,
+    conditions=[WorkListDrained(gather), MaxIterations(50)],  # drained で停止
+)
 ```
 
-（この「fair scheduling + per-item 上限」は将来 `WorkListGather` として packagize 予定。今は上記を自分で書きます。）
+詳しい組み方・戦略の選び方は **[multi-item-work-list.md](./multi-item-work-list.md)**。手書きの round-robin（`min(rem, key=lambda x: (attempts[x], items.index(x)))`）でも同じことはできますが、attempt counter / done 集合の管理と resume 安全を `WorkListGather` が肩代わりします。
