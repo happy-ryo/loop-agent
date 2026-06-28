@@ -129,7 +129,7 @@ act = MockCodexAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 | 主な引数 | `allowed_tools` / `model` / `permission_mode` / `output_format` / `extra_args` | `model="gpt-5.5"` / `effort="medium"` / `sandbox` / `json_output` / `skip_git_repo_check` / `allowed_args` |
 | 共通引数 | `timeout` / `prompt_template` / `env` / `cwd` / `runner` | 同左 |
 | 観測オブジェクト | `ClaudeCodeResult(.text/.failed/.tokens/.returncode/.error)` | `CodexResult(.text/.failed/.tokens/.returncode/.error)` |
-| token 集計 | `usage` の全 `*tokens*` を合算 | `input_tokens + output_tokens`（cached/reasoning は部分集合のため除外） |
+| token 集計 | `input_tokens + output_tokens + cache_creation_input_tokens`（`cache_read_input_tokens` は課金が軽く累積で膨らむため除外。Issue #55） | `input_tokens + output_tokens`（cached/reasoning は部分集合のため除外） |
 | auth | os.environ 継承（claude セッション + `ANTHROPIC_API_KEY`） | os.environ 継承（codex セッション + `OPENAI_API_KEY`） |
 | 失敗時 | `failed=True` を観測に載せて graceful（例外なし） | 同左 |
 | Mock | `MockClaudeCodeAct(responses=[...])` | `MockCodexAct(responses=[...])` |

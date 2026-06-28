@@ -59,25 +59,36 @@ transport.poll_and_handle("coordinator", lambda wake: handle(wake))
 
 ## backend 拡張点（WakeQueue / PushBackend Protocol）
 
-同梱の backend は **stdlib のみ**の最小実装に絞ってある:
+`WakeQueue`（配送の正本）は 3 種同梱しており、`open_wake_queue(backend, **opts)` で名前指定で
+生成できる（Public API を変えずに backend を選べる。in-memory が既定、明示で SQLite / Redis）:
 
-- **`InMemoryWakeQueue`** — RLock でスレッド安全な in-process の `WakeQueue` 実装。
-- **`NullPushBackend`** — 「常に push 失敗（= backend 不通）」を表す `PushBackend` 実装。pull
-  fallback の挙動を素のまま使いたいときの既定。
+- **`InMemoryWakeQueue`**（`"memory"`・既定）— RLock でスレッド安全な in-process 実装。単一
+  プロセス内の配送に。
+- **`SqliteWakeQueue`**（`"sqlite"`・`path` / `table` 等を `opts` で）— プロセス再起動をまたいで
+  wake を残す**永続キュー**。cross-process 構成では TTL ロックに依存せず（`BEGIN IMMEDIATE` は
+  操作途中で失効しない）安全。`purge_delivered` で確定済みを掃除できる。
+- **`RedisWakeQueue`**（`"redis"`・`client` か `url` を `opts` で）— 正本を Redis に置き、別ホストの
+  プロセス間でも wake を配送する。optional な `redis` 依存が要る（未導入なら生成時に loud に弾く）。
+
+`PushBackend`（即応 accelerator）は stdlib のみの実装を同梱する:
+
+- **`NullPushBackend`** — 「常に push 失敗（= backend 不通）」を表す。pull fallback の挙動を素の
+  まま使いたいときの既定。
 - **`CallablePushBackend(fn)`** — 任意の `push(wake) -> bool` 関数を `PushBackend` に持ち上げる
   薄いアダプタ。
 
-これらを超える backend は **Protocol を実装して注入する**のが拡張点である。`WakeQueue` /
-`PushBackend` の Protocol に適合すれば、たとえば次のようなものを利用者側で実装して差し込める:
+```python
+from loop_agent import Transport, open_wake_queue, NullPushBackend
 
-- **SQLite-backed な永続 `WakeQueue`** — プロセス再起動をまたいで wake を残す永続キュー。
-- **Redis ベースの `PushBackend`** — 即応 push の accelerator を分散環境で動かす。
-- **broker / renga CLI bridge** — 外部の窓口・broker へ wake をブリッジする `PushBackend`。
+queue = open_wake_queue("sqlite", path="wakes.db")   # 永続キュー（再起動をまたぐ）
+transport = Transport(queue, NullPushBackend())       # backend を変えても Public API は不変
+```
 
-これらは Protocol への適合のみで成立する利用者実装であり、リポジトリに同梱されるものではない。
-配送のセマンティクス（at-most-once / at-least-once の倒し方、claim-then-confirm の fencing、
-wake id de-dup）は Protocol 契約として固定されているので、backend を差し替えても受信側の
-idempotent handler 前提は変わらない。
+同梱を超える backend（外部の窓口・broker / renga CLI へ wake をブリッジする `PushBackend` 等）は
+**Protocol を実装して注入する**のが拡張点である。`WakeQueue` / `PushBackend` の Protocol に適合
+すれば利用者実装を差し込める。配送のセマンティクス（at-most-once / at-least-once の倒し方、
+claim-then-confirm の fencing、wake id de-dup）は Protocol 契約として固定されているので、backend を
+差し替えても受信側の idempotent handler 前提は変わらない。
 
 ## work-discovery（次反復対象の入力選定・propose-only / 人間ゲート維持）
 

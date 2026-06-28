@@ -83,7 +83,7 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
 
 ## 安全テンプレ
 
-self-improvement 系で推奨する最小の安全テンプレは、**act は編集のみ・commit はループ外**に隔離する形である。act adapter（`ClaudeCodeAct` / `CodexAct` / 自作 adapter (ActHook Protocol) のいずれでも同じ）の `allowed_tools` を編集系に絞り、不可逆操作はループの外の人間ステップに置く。
+self-improvement 系で推奨する最小の安全テンプレは、**act は編集のみ・commit はループ外**に隔離する形である。この原則はどの act adapter（`ClaudeCodeAct` / `CodexAct` / 自作 adapter (ActHook Protocol)）でも共通だが、ツール権限を絞る具体的な knob は adapter ごとに異なる — `ClaudeCodeAct` は `allowed_tools` を編集系に絞り、`CodexAct` は `sandbox`（例 `"read-only"` / `"workspace-write"`）や `allowed_args` で commit/push を断つ。いずれにせよ不可逆操作はループの外の人間ステップに置く。
 
 ```python
 # verify は ground truth（pytest exit-code）。必ず止まる上限を 2 つ。
