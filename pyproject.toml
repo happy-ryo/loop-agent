@@ -56,14 +56,16 @@ Issues = "https://github.com/happy-ryo/loop-agent/issues"
 
 # Extras map to real optional functionality only:
 #   otel  -> OTel GenAI span integration (loop_agent.otel; degrades to no-op when absent)
+#   redis -> Redis-backed cross-process WakeQueue (loop_agent.transport.RedisWakeQueue; Issue #41)
 #   test  -> running the suite (incl. OTel SDK for in-memory-exporter span assertions)
 #   dev   -> test deps + release tooling (build/twine)
-# NOTE: there is intentionally no [redis] extra. The wake-delivery transport
-# (loop_agent.transport) is backend-agnostic via the PushBackend protocol and
-# ships only in-memory / callable backends; nothing imports redis, so an extra
-# pinning redis would install a dependency no code uses (report.md S3.3 / S4.6).
+# NOTE: the loop core and the default in-memory / SQLite (stdlib `sqlite3`)
+# transports stay dependency-free. `redis` is required only by the optional
+# cross-process RedisWakeQueue backend, which import-gates `redis` and raises a
+# helpful error when the extra is not installed (report.md S3.3 / S4.6; Issue #41).
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.20"]
+redis = ["redis>=4.2"]
 test = [
     "pytest>=7",
     "opentelemetry-api>=1.20",

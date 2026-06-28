@@ -35,9 +35,14 @@ loop-agent 側に依存ゼロ (stdlib のみ) で実装する。
 
 from __future__ import annotations
 
+import json
+import re
+import sqlite3
 import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol, runtime_checkable
 
 # -- wake 種別 (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」) ---------
 #
@@ -550,6 +555,580 @@ def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
     return fn(wake_id)
 
 
+# ---------------------------------------------------------------------------
+# クロスプロセス backend (Issue #41)
+#
+# :class:`InMemoryWakeQueue` は単一プロセス内でしか正本を共有できない。別プロセスの
+# ループ / 窓口へ wake を配送するには queue の正本を **プロセス外の永続ストア** に置く必要が
+# ある。:class:`WakeQueue` Protocol は backend 中立なので、同じ三状態 claim-then-confirm
+# セマンティクスを SQLite (stdlib のみ) / Redis (optional dep) で実装すれば、:class:`Transport`
+# の Public API を一切変えずに backend を差し替えられる (in-memory が既定、明示で SQLite/Redis)。
+#
+# 設計判断:
+#
+# - **serialization = JSON** (pickle ではない)。``payload`` は JSON 形 (:meth:`Wake.to_dict`
+#   が前提) で、JSON はプロセス/言語横断で安全・任意コード実行の risk が無い。``payload`` は
+#   JSON 化可能な値のみ (非対応の値は enqueue で ``TypeError``)。
+# - **key namespace 規約**。Redis は ``{namespace}:wake:{id}`` / ``{namespace}:recipient:{r}``
+#   等で他用途のキーと衝突を避ける (namespace 既定 ``"loop_agent"``)。SQLite は table 名で
+#   分離する (既定 ``wakes``)。
+# - **TTL / cleanup**。long-running ループでは DELIVERED レコードが残留する。Redis は確定時に
+#   ``EXPIRE`` で自動失効 (``delivered_ttl``)、SQLite は :meth:`SqliteWakeQueue.purge_delivered`
+#   で明示回収する (monotonic clock では wall-clock TTL を当てにできないため、SQLite は明示回収を
+#   既定とする)。
+#
+# **クロスプロセスの時計に関する重要注意**: lease 失効判定は :class:`Transport` が渡す ``now``
+# (既定 ``time.monotonic``) を共有 backend 上で突き合わせる。``time.monotonic`` は **プロセス毎に
+# 原点が異なる** ため、同一 SQLite/Redis backend を複数プロセスで共有する構成では、各プロセスの
+# :class:`Transport` に **wall-clock (``time_fn=time.time``) を渡して時計を揃える** こと。さもないと
+# あるプロセスが書いた ``lease_expiry`` を別プロセスの monotonic と比較して lease 判定が壊れる。
+
+
+def _dumps_payload(payload: Mapping[str, Any]) -> str:
+    """``payload`` を JSON 文字列へ畳む (backend 永続化用)。
+
+    JSON 化不能な値は ``TypeError`` を ``ValueError`` に翻訳して、enqueue の入力検証として
+    呼び出し側に分かりやすく返す (pickle を使わない = 任意コード実行 risk を持ち込まない)。
+    """
+    try:
+        return json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
+    except TypeError as exc:
+        raise ValueError(f"Wake.payload must be JSON-serializable: {exc}") from exc
+
+
+def _make_wake(id: str, kind: str, recipient: str, run_id: str, payload_json: str) -> Wake:
+    """backend から読んだフィールドを :class:`Wake` へ復元する。"""
+    return Wake(
+        id=id,
+        kind=kind,
+        recipient=recipient,
+        run_id=run_id,
+        payload=json.loads(payload_json) if payload_json else {},
+    )
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str, *, what: str) -> str:
+    """SQL 識別子 (table 名) を検証する (SQL injection 防止: table 名は bind できないため)。"""
+    if not _IDENT_RE.match(name):
+        raise ValueError(f"{what} must match {_IDENT_RE.pattern!r}, got {name!r}")
+    return name
+
+
+class SqliteWakeQueue:
+    """:class:`WakeQueue` の SQLite 実装 (stdlib ``sqlite3`` のみ・プロセス外永続)。
+
+    三状態 claim-then-confirm / owner fencing のセマンティクスは :class:`InMemoryWakeQueue` と
+    **完全に等価** で、正本を SQLite ファイル (または ``:memory:``) に置くことでプロセスを跨いだ
+    配送を可能にする。``path`` にファイルパスを渡せば複数プロセスが同じ正本を共有でき、
+    ``":memory:"`` (既定) は単一プロセス内の永続テスト用。
+
+    **原子性**: 状態を変える操作 (enqueue/claim/confirm/release_expired/mark_delivered) は
+    ``BEGIN IMMEDIATE`` で write lock を取って 1 トランザクションに収め、check-and-set を
+    atomic にする。プロセス内の並行 poller はプロセス内 :class:`threading.RLock` で直列化し、
+    プロセス間は SQLite のファイルロック + ``busy_timeout`` で待ち合わせる (``WAL`` で読み書きの
+    並行性を上げる)。これにより複数プロセス/スレッドが並行 poll しても二重 claim しない。
+
+    **接続**: 1 接続を ``check_same_thread=False`` で開き、上記ロックで保護する (``:memory:`` は
+    接続毎に別 DB になるため単一接続が必須)。``isolation_level=None`` (autocommit) でトランザクションを
+    明示制御する。使い終わったら :meth:`close` するか ``with`` 文で使う。
+    """
+
+    def __init__(
+        self,
+        path: str = ":memory:",
+        *,
+        table: str = "wakes",
+        busy_timeout: float = 5.0,
+    ) -> None:
+        self._path = path
+        self._t = _validate_identifier(table, what="table")
+        # claim は内部で release_expired 相当の SQL を同一 tx で呼ぶ。RLock で再入を許す。
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
+        # WAL はファイル DB の読み書き並行性を上げる (:memory: では no-op 相当)。
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._tx():
+            self._conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._t} (
+                    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id           TEXT    NOT NULL UNIQUE,
+                    kind         TEXT    NOT NULL,
+                    recipient    TEXT    NOT NULL,
+                    run_id       TEXT    NOT NULL,
+                    payload      TEXT    NOT NULL,
+                    state        TEXT    NOT NULL,
+                    owner        TEXT,
+                    lease_expiry REAL    NOT NULL DEFAULT 0
+                )
+                """
+            )
+            # claim/pending: 宛先 + 状態を seq 順に引く。release_expired: 状態 + lease で掃く。
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._t}_recipient_state "
+                f"ON {self._t}(recipient, state, seq)"
+            )
+            self._conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {self._t}_state_lease "
+                f"ON {self._t}(state, lease_expiry)"
+            )
+
+    @contextmanager
+    def _tx(self) -> Iterator[None]:
+        """``BEGIN IMMEDIATE`` で write lock を取り、commit/rollback まで直列化する。"""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
+    def enqueue(self, wake: Wake) -> bool:
+        if not wake.id:
+            raise ValueError("enqueue: Wake.id must be a non-empty string")
+        payload = _dumps_payload(wake.payload)
+        with self._tx():
+            cur = self._conn.execute(
+                f"INSERT OR IGNORE INTO {self._t} "
+                "(id, kind, recipient, run_id, payload, state, owner, lease_expiry) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, 0)",
+                (wake.id, wake.kind, wake.recipient, wake.run_id, payload, UNDELIVERED),
+            )
+            return cur.rowcount > 0  # INSERT OR IGNORE: 挿入=1 / 重複 id で無視=0。
+
+    def _release_expired_locked(self, now: float) -> int:
+        cur = self._conn.execute(
+            f"UPDATE {self._t} SET state = ?, owner = NULL "
+            "WHERE state = ? AND lease_expiry <= ?",
+            (UNDELIVERED, CLAIMED, now),
+        )
+        return cur.rowcount
+
+    def release_expired(self, *, now: float) -> int:
+        with self._tx():
+            return self._release_expired_locked(now)
+
+    def claim(
+        self,
+        recipient: str,
+        *,
+        now: float,
+        lease: float,
+        owner: str,
+        limit: Optional[int] = None,
+    ) -> list[Wake]:
+        if lease <= 0:
+            raise ValueError("claim: lease must be > 0")
+        with self._tx():
+            self._release_expired_locked(now)
+            sql = (
+                f"SELECT id, kind, recipient, run_id, payload FROM {self._t} "
+                "WHERE state = ? AND recipient = ? ORDER BY seq"
+            )
+            params: list[Any] = [UNDELIVERED, recipient]
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(int(limit))
+            rows = self._conn.execute(sql, params).fetchall()
+            new_expiry = now + lease
+            for r in rows:
+                self._conn.execute(
+                    f"UPDATE {self._t} SET state = ?, owner = ?, lease_expiry = ? WHERE id = ?",
+                    (CLAIMED, owner, new_expiry, r["id"]),
+                )
+            return [
+                _make_wake(r["id"], r["kind"], r["recipient"], r["run_id"], r["payload"])
+                for r in rows
+            ]
+
+    def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
+        with self._tx():
+            # owner 一致 + lease 未失効 (lease_expiry > now) を満たす CLAIMED のみ確定 (fencing)。
+            cur = self._conn.execute(
+                f"UPDATE {self._t} SET state = ?, owner = NULL "
+                "WHERE id = ? AND state = ? AND owner = ? AND lease_expiry > ?",
+                (DELIVERED, wake_id, CLAIMED, owner, now),
+            )
+            return cur.rowcount > 0
+
+    def mark_delivered(self, wake_id: str) -> bool:
+        with self._tx():
+            # UNDELIVERED のときだけ確定 (CLAIMED な active claim を奪わない)。
+            cur = self._conn.execute(
+                f"UPDATE {self._t} SET state = ?, owner = NULL WHERE id = ? AND state = ?",
+                (DELIVERED, wake_id, UNDELIVERED),
+            )
+            return cur.rowcount > 0
+
+    def pending(self, recipient: Optional[str] = None) -> list[Wake]:
+        with self._lock:
+            sql = (
+                f"SELECT id, kind, recipient, run_id, payload FROM {self._t} "
+                "WHERE state != ?"
+            )
+            params: list[Any] = [DELIVERED]
+            if recipient is not None:
+                sql += " AND recipient = ?"
+                params.append(recipient)
+            sql += " ORDER BY seq"
+            rows = self._conn.execute(sql, params).fetchall()
+            return [
+                _make_wake(r["id"], r["kind"], r["recipient"], r["run_id"], r["payload"])
+                for r in rows
+            ]
+
+    def state_of(self, wake_id: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT state FROM {self._t} WHERE id = ?", (wake_id,)
+            ).fetchone()
+            return row["state"] if row is not None else None
+
+    def purge_delivered(self) -> int:
+        """確定済み (``DELIVERED``) レコードを物理削除し、削除件数を返す (cleanup)。
+
+        long-running ループでは確定済み行が残留するため、保守として定期的に呼んで回収する。
+        非確定 (``UNDELIVERED`` / ``CLAIMED``) は触らないので配送中の wake を喪失しない。
+        """
+        with self._tx():
+            cur = self._conn.execute(
+                f"DELETE FROM {self._t} WHERE state = ?", (DELIVERED,)
+            )
+            return cur.rowcount
+
+    def close(self) -> None:
+        """SQLite 接続を閉じる (``:memory:`` では DB ごと破棄される)。"""
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> "SqliteWakeQueue":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _import_redis() -> Any:
+    """optional dep ``redis`` を import gate 越しに読み込む (未導入なら親切なエラー)。"""
+    try:
+        import redis  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - 環境依存
+        raise ImportError(
+            "RedisWakeQueue requires the optional 'redis' dependency. "
+            "Install it with: pip install 'loop-agent[redis]'"
+        ) from exc
+    return redis
+
+
+def _text(value: Any) -> str:
+    """redis-py が返す bytes/str を str へ正規化する (``decode_responses`` 非依存にする)。"""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+class RedisWakeQueue:
+    """:class:`WakeQueue` の Redis 実装 (optional dep ``redis``・プロセス外永続)。
+
+    三状態 claim-then-confirm / owner fencing のセマンティクスは :class:`InMemoryWakeQueue` /
+    :class:`SqliteWakeQueue` と等価。正本を Redis に置くことで、別ホストのプロセス間でも wake を
+    配送できる。``redis`` 未導入の環境では生成時に親切な :class:`ImportError` を投げる
+    (import gate)。
+
+    **データモデル** (key namespace 規約; ``namespace`` 既定 ``"loop_agent"``):
+
+    - ``{ns}:wake:{id}``        : wake 1 件の hash (kind/recipient/run_id/payload/state/owner/
+      lease_expiry/seq)。
+    - ``{ns}:recipient:{r}``    : 宛先 ``r`` の sorted set (score=seq, member=id)。claim/pending の
+      **seq 順** 走査に使う。確定/配送済みになった id はここから除かれる。
+    - ``{ns}:claimed``          : CLAIMED 行の sorted set (score=lease_expiry, member=id)。
+      :meth:`release_expired` が ``ZRANGEBYSCORE -inf now`` で失効分だけ効率的に掃ける。
+    - ``{ns}:seq``              : 単調増加カウンタ (``INCR``)。
+    - ``{ns}:recipients``       : 既知 recipient の set (``pending(None)`` の全走査用)。
+    - ``{ns}:lock``             : 状態変更を直列化する分散ロック (``SET NX PX``)。
+
+    **原子性**: 状態を変える各操作はプロセス内 :class:`threading.RLock` (プロセス内直列化) と
+    Redis 分散ロック ``{ns}:lock`` (``SET NX PX`` + token 照合 **atomic** 解放) で囲み、複数
+    プロセスの check-and-set を直列化する (claim の二重取得を防ぐ)。ロックは ``lock_ttl`` 秒で
+    自動失効するので、ロック保持者がクラッシュしても deadlock しない。解放は server-side Lua の
+    compare-and-delete (:meth:`_release_lock`) で **自 token のときだけ** 行い、失効後に別者が
+    握り直したロックを誤って消さない。
+
+    **既知の制限 (cross-process の強さ)**: 分散ロックは ``lock_ttl`` の TTL ロックなので、1 操作が
+    ``lock_ttl`` を **超過** すると (STW-GC / ネットワーク遅延 / 巨大 recipient zset の sweep 等)
+    ロックが操作の途中で失効し、別プロセスが同じ wake を二重 claim しうる。この窓では配送は
+    **at-least-once に縮退** する (確定済みが再 CLAIMED に戻る resurrection を含む)。本 transport の
+    契約は元々 at-least-once + 冪等 handler (受信側が :attr:`Wake.id` で de-dup) なので回復可能だが、
+    ``lock_ttl`` は 1 操作が確実に収まる十分大きい値にすること。**厳密な at-most-once が要る
+    cross-process 構成では TTL ロックに依存しない** :class:`SqliteWakeQueue` (``BEGIN IMMEDIATE``
+    は操作途中で失効しない) を推奨する。:class:`InMemoryWakeQueue` / :class:`SqliteWakeQueue` と
+    「等価」なのは **lock_ttl 内に各操作が収まる前提** での話である。
+
+    **TTL / cleanup**: 確定 (DELIVERED) 時に wake hash へ ``EXPIRE`` を張り (``delivered_ttl``
+    秒、既定 1 日)、long-running ループでの残留を自動回収する。``delivered_ttl=None`` で無効化。
+    recipient の pending が空になると ``{ns}:recipients`` registry からも除き、registry の無制限
+    増殖を防ぐ (高 cardinality な peer id を宛先にしても leak しない)。
+
+    テストや DI のため ``client`` に redis-py 互換クライアントを直接注入できる。省略時は ``url``
+    から ``redis.Redis.from_url`` で生成する (どちらも無い場合は ``ValueError``)。
+    """
+
+    def __init__(
+        self,
+        client: Any = None,
+        *,
+        url: Optional[str] = None,
+        namespace: str = "loop_agent",
+        delivered_ttl: Optional[float] = 86400.0,
+        lock_ttl: float = 10.0,
+        lock_timeout: float = 10.0,
+    ) -> None:
+        if client is None:
+            redis = _import_redis()
+            if url is None:
+                raise ValueError("RedisWakeQueue: provide either `client` or `url`")
+            client = redis.Redis.from_url(url)
+        self._r = client
+        self._ns = namespace
+        self._delivered_ttl = delivered_ttl
+        self._lock_ttl = lock_ttl
+        self._lock_timeout = lock_timeout
+        self._lock = threading.RLock()
+        self._k_seq = f"{namespace}:seq"
+        self._k_claimed = f"{namespace}:claimed"
+        self._k_recipients = f"{namespace}:recipients"
+        self._k_lock = f"{namespace}:lock"
+
+    def _k_wake(self, wake_id: str) -> str:
+        return f"{self._ns}:wake:{wake_id}"
+
+    def _k_recipient(self, recipient: str) -> str:
+        return f"{self._ns}:recipient:{recipient}"
+
+    # 自分が握っているときだけロックを解放する Lua (compare-and-delete; 1 命令で atomic)。
+    _RELEASE_LOCK_LUA = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+
+    def _release_lock(self, token: str) -> None:
+        """ロックを **自 token のときだけ** atomic に解放する (他者のロックを消さない)。
+
+        check-then-delete を 2 往復でやると GET と DELETE の間にロックが失効して別プロセスが
+        握り直したロックを誤って消しうる。server-side Lua の compare-and-delete で 1 命令に畳む。
+        ``eval`` 非対応の client では best-effort な check-then-delete に退避する。
+        """
+        try:
+            self._r.eval(self._RELEASE_LOCK_LUA, 1, self._k_lock, token)
+        except Exception:  # noqa: BLE001 - eval 非対応 client は best-effort 解放に退避。
+            if _text(self._r.get(self._k_lock)) == token:
+                self._r.delete(self._k_lock)
+
+    @contextmanager
+    def _dlock(self) -> Iterator[None]:
+        """プロセス内 RLock + Redis 分散ロックで状態変更を直列化する。"""
+        import time as _time
+
+        with self._lock:
+            token = uuid.uuid4().hex
+            start = _time.monotonic()
+            while True:
+                if self._r.set(self._k_lock, token, nx=True, px=int(self._lock_ttl * 1000)):
+                    break
+                if _time.monotonic() - start > self._lock_timeout:
+                    raise TimeoutError(
+                        f"RedisWakeQueue: could not acquire {self._k_lock} "
+                        f"within {self._lock_timeout}s"
+                    )
+                _time.sleep(0.01)
+            try:
+                yield
+            finally:
+                self._release_lock(token)
+
+    def _hgetall(self, key: str) -> dict[str, str]:
+        raw = self._r.hgetall(key)
+        return {_text(k): _text(v) for k, v in raw.items()}
+
+    def _terminalize(self, wake_id: str, recipient: str) -> None:
+        """wake を DELIVERED (terminal) にし、ordering/claimed index から外す (+TTL)。"""
+        wkey = self._k_wake(wake_id)
+        rkey = self._k_recipient(recipient)
+        self._r.hset(wkey, mapping={"state": DELIVERED, "owner": ""})
+        self._r.zrem(rkey, wake_id)
+        self._r.zrem(self._k_claimed, wake_id)
+        # recipient の pending が尽きたら registry から外す ({ns}:recipients の無制限増殖を防ぐ。
+        # 再 enqueue 時に sadd で復活するので pending(None) の全走査は壊れない)。
+        if self._r.zcard(rkey) == 0:
+            self._r.srem(self._k_recipients, recipient)
+        if self._delivered_ttl is not None:
+            self._r.expire(wkey, int(self._delivered_ttl))
+
+    def enqueue(self, wake: Wake) -> bool:
+        if not wake.id:
+            raise ValueError("enqueue: Wake.id must be a non-empty string")
+        payload = _dumps_payload(wake.payload)
+        wkey = self._k_wake(wake.id)
+        with self._dlock():
+            if self._r.exists(wkey):
+                return False  # 同一 id は no-op (de-dup の土台)。
+            seq = int(self._r.incr(self._k_seq))
+            self._r.hset(
+                wkey,
+                mapping={
+                    "id": wake.id,
+                    "kind": wake.kind,
+                    "recipient": wake.recipient,
+                    "run_id": wake.run_id,
+                    "payload": payload,
+                    "state": UNDELIVERED,
+                    "owner": "",
+                    "lease_expiry": "0",
+                    "seq": str(seq),
+                },
+            )
+            self._r.zadd(self._k_recipient(wake.recipient), {wake.id: seq})
+            self._r.sadd(self._k_recipients, wake.recipient)
+            return True
+
+    def _release_expired_locked(self, now: float) -> int:
+        expired = self._r.zrangebyscore(self._k_claimed, "-inf", now)
+        count = 0
+        for raw in expired:
+            wid = _text(raw)
+            self._r.hset(self._k_wake(wid), mapping={"state": UNDELIVERED, "owner": ""})
+            self._r.zrem(self._k_claimed, wid)
+            count += 1
+        return count
+
+    def release_expired(self, *, now: float) -> int:
+        with self._dlock():
+            return self._release_expired_locked(now)
+
+    def claim(
+        self,
+        recipient: str,
+        *,
+        now: float,
+        lease: float,
+        owner: str,
+        limit: Optional[int] = None,
+    ) -> list[Wake]:
+        if lease <= 0:
+            raise ValueError("claim: lease must be > 0")
+        with self._dlock():
+            self._release_expired_locked(now)
+            ids = [_text(x) for x in self._r.zrange(self._k_recipient(recipient), 0, -1)]
+            out: list[Wake] = []
+            new_expiry = now + lease
+            for wid in ids:
+                if limit is not None and len(out) >= limit:
+                    break
+                h = self._hgetall(self._k_wake(wid))
+                if not h:
+                    # hash が TTL 等で消えた stale な index member。掃除して飛ばす。
+                    self._r.zrem(self._k_recipient(recipient), wid)
+                    continue
+                if h["state"] != UNDELIVERED:
+                    continue
+                self._r.hset(
+                    self._k_wake(wid),
+                    mapping={"state": CLAIMED, "owner": owner, "lease_expiry": repr(new_expiry)},
+                )
+                self._r.zadd(self._k_claimed, {wid: new_expiry})
+                out.append(
+                    _make_wake(h["id"], h["kind"], h["recipient"], h["run_id"], h["payload"])
+                )
+            return out
+
+    def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
+        with self._dlock():
+            h = self._hgetall(self._k_wake(wake_id))
+            if not h:
+                return False
+            if h["state"] != CLAIMED:
+                return False
+            if h["owner"] != owner:
+                return False
+            if float(h["lease_expiry"]) <= now:
+                return False
+            self._terminalize(wake_id, h["recipient"])
+            return True
+
+    def mark_delivered(self, wake_id: str) -> bool:
+        with self._dlock():
+            h = self._hgetall(self._k_wake(wake_id))
+            if not h:
+                return False
+            if h["state"] != UNDELIVERED:
+                return False
+            self._terminalize(wake_id, h["recipient"])
+            return True
+
+    def pending(self, recipient: Optional[str] = None) -> list[Wake]:
+        with self._lock:
+            if recipient is not None:
+                recipients = [recipient]
+            else:
+                recipients = sorted(_text(x) for x in self._r.smembers(self._k_recipients))
+            items: list[tuple[float, Wake]] = []
+            for rcp in recipients:
+                for raw, score in self._r.zrange(
+                    self._k_recipient(rcp), 0, -1, withscores=True
+                ):
+                    wid = _text(raw)
+                    h = self._hgetall(self._k_wake(wid))
+                    if not h or h["state"] == DELIVERED:
+                        continue
+                    items.append(
+                        (
+                            float(score),
+                            _make_wake(
+                                h["id"], h["kind"], h["recipient"], h["run_id"], h["payload"]
+                            ),
+                        )
+                    )
+            items.sort(key=lambda t: t[0])  # 全 recipient 横断で seq (= score) 順に整列。
+            return [w for _, w in items]
+
+    def state_of(self, wake_id: str) -> Optional[str]:
+        with self._lock:
+            st = self._r.hget(self._k_wake(wake_id), "state")
+            return _text(st) if st is not None else None
+
+
+def open_wake_queue(backend: str = "memory", **opts: Any) -> WakeQueue:
+    """backend 名から :class:`WakeQueue` を生成する便宜ファクトリ。
+
+    - ``"memory"`` (既定) : :class:`InMemoryWakeQueue` (単一プロセス内)。
+    - ``"sqlite"``        : :class:`SqliteWakeQueue` (``path`` / ``table`` 等を ``opts`` で)。
+    - ``"redis"``         : :class:`RedisWakeQueue` (``client`` か ``url`` を ``opts`` で)。
+
+    生成した queue を :class:`Transport` に渡せば、Public API を変えずに backend を選べる
+    (in-memory が既定、明示で SQLite/Redis)。
+    """
+    if backend == "memory":
+        if opts:
+            raise ValueError(f"open_wake_queue('memory') takes no options, got {sorted(opts)}")
+        return InMemoryWakeQueue()
+    if backend == "sqlite":
+        return SqliteWakeQueue(**opts)
+    if backend == "redis":
+        return RedisWakeQueue(**opts)
+    raise ValueError(f"unknown backend {backend!r} (expected 'memory' / 'sqlite' / 'redis')")
+
+
 __all__ = [
     # wake 種別
     "WAKE_LOOP_DONE",
@@ -567,6 +1146,9 @@ __all__ = [
     "NullPushBackend",
     "WakeQueue",
     "InMemoryWakeQueue",
+    "SqliteWakeQueue",
+    "RedisWakeQueue",
+    "open_wake_queue",
     "Transport",
     # role 別 cadence
     "CADENCE_SECONDS",
