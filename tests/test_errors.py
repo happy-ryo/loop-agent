@@ -13,12 +13,16 @@ from loop_agent import (
     AsyncSeamInSyncLoop,
     ConfigError,
     LoopError,
+    SeamTimeout,
     StateError,
+    UnsupportedTimeoutKill,
     run_loop,
 )
 from loop_agent.conditions import GoalMet, MaxIterations
 from loop_agent.errors import AsyncSeamInSyncLoop as _ErrAsync
 from loop_agent.errors import ConfigError as _ErrConfig
+from loop_agent.errors import SeamTimeout as _ErrSeamTimeout
+from loop_agent.errors import UnsupportedTimeoutKill as _ErrUnsupportedKill
 
 
 # -- 1. hierarchy shape ----------------------------------------------------
@@ -29,7 +33,13 @@ def test_loop_error_is_exception():
 
 
 def test_all_subtypes_derive_from_loop_error():
-    for sub in (ConfigError, StateError, AsyncSeamInSyncLoop):
+    for sub in (
+        ConfigError,
+        StateError,
+        AsyncSeamInSyncLoop,
+        SeamTimeout,
+        UnsupportedTimeoutKill,
+    ):
         assert issubclass(sub, LoopError)
 
 
@@ -53,11 +63,64 @@ def test_async_seam_builtin_base():
     assert not issubclass(AsyncSeamInSyncLoop, ValueError)
 
 
+def test_seam_timeout_hierarchy_and_builtin_bases():
+    # Issue #71: SeamTimeout is relocated under StateError (a kill-mode per-call
+    # timeout = a run-time invariant violation). It was a bare Exception before,
+    # so the StateError compat bases (ValueError / RuntimeError) only *widen*
+    # what catches it -- `except SeamTimeout` is unaffected.
+    assert issubclass(SeamTimeout, StateError)
+    assert issubclass(SeamTimeout, LoopError)
+    assert issubclass(SeamTimeout, RuntimeError)
+    assert issubclass(SeamTimeout, ValueError)
+    # ...but it is NOT a config error (a distinct, run-time-state failure).
+    assert not issubclass(SeamTimeout, ConfigError)
+
+
+def test_seam_timeout_constructs_with_unchanged_attributes():
+    # Behaviour-preserving relocation (Issue #71 scope): the `seam` / `seconds`
+    # attributes and the message are exactly as #42 established them.
+    exc = SeamTimeout("act", 1.5)
+    assert exc.seam == "act"
+    assert exc.seconds == 1.5
+    assert "act" in str(exc) and "hard kill" in str(exc)
+
+
+def test_unsupported_timeout_kill_hierarchy_and_builtin_bases():
+    # Issue #71: UnsupportedTimeoutKill is relocated under ConfigError (a seam/
+    # platform combination misconfigured for hard kill), so it gains the
+    # ConfigError surface (ValueError / TypeError). It ALSO keeps RuntimeError as
+    # an explicit base because it used to be a bare RuntimeError -- pre-#71
+    # `except RuntimeError` callers must keep catching it.
+    assert issubclass(UnsupportedTimeoutKill, ConfigError)
+    assert issubclass(UnsupportedTimeoutKill, LoopError)
+    assert issubclass(UnsupportedTimeoutKill, RuntimeError)  # back-compat base
+    assert issubclass(UnsupportedTimeoutKill, ValueError)
+    assert issubclass(UnsupportedTimeoutKill, TypeError)
+    # ...but it is NOT a state error (it is an up-front config/env refusal).
+    assert not issubclass(UnsupportedTimeoutKill, StateError)
+
+
+def test_timeout_exceptions_are_distinct_from_each_other():
+    # The two relocated types must stay tellable apart (one is run-time state,
+    # the other is up-front config), so neither over-catches the other.
+    assert not issubclass(SeamTimeout, UnsupportedTimeoutKill)
+    assert not issubclass(UnsupportedTimeoutKill, SeamTimeout)
+
+
 def test_mro_is_well_formed():
     # Multiple inheritance must linearise cleanly (no MRO conflict at import).
-    for sub in (ConfigError, StateError, AsyncSeamInSyncLoop):
+    for sub in (
+        ConfigError,
+        StateError,
+        AsyncSeamInSyncLoop,
+        SeamTimeout,
+        UnsupportedTimeoutKill,
+    ):
         assert sub.__mro__[0] is sub
-        assert sub.__mro__[1] is LoopError
+        assert sub.__mro__[1] is LoopError or sub.__mro__[1] in (
+            StateError,
+            ConfigError,
+        )
 
 
 # -- 2. canonical identity across re-export sites --------------------------
@@ -72,6 +135,18 @@ def test_config_error_canonical_across_modules():
 def test_async_seam_canonical_across_modules():
     assert AsyncSeamInSyncLoop is _ErrAsync
     assert loop_agent._async.AsyncSeamInSyncLoop is AsyncSeamInSyncLoop
+
+
+def test_timeout_exceptions_canonical_across_modules():
+    # Issue #71: the canonical home is loop_agent.errors; loop.py and the
+    # top-level package re-export the *same* class objects (so the raise site in
+    # loop.py and an `except loop_agent.SeamTimeout` catch one identity).
+    import loop_agent.loop  # ensure the re-exporting module is loaded
+
+    assert SeamTimeout is _ErrSeamTimeout
+    assert loop_agent.loop.SeamTimeout is SeamTimeout
+    assert UnsupportedTimeoutKill is _ErrUnsupportedKill
+    assert loop_agent.loop.UnsupportedTimeoutKill is UnsupportedTimeoutKill
 
 
 # -- 3. real raise paths produce the right type ----------------------------

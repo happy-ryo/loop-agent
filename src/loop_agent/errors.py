@@ -25,6 +25,17 @@ The leaves carve that surface into three intents:
   synchronous :func:`loop_agent.run_loop` (Issue #40). Relocated here so it
   shares the :class:`LoopError` base; still importable from
   :mod:`loop_agent._async` for backwards compatibility.
+- :class:`SeamTimeout` -- an ``act`` / ``verify`` seam overran its per-call
+  :class:`~loop_agent.loop.TimeoutPolicy` deadline under ``on_timeout="kill"``
+  (Issue #42). A :class:`StateError` (a run-time invariant -- the seam did not
+  finish in time). Relocated here for the unified hierarchy (Issue #71); still
+  importable from :mod:`loop_agent.loop` for backwards compatibility.
+- :class:`UnsupportedTimeoutKill` -- a hard-kill timeout was requested for a
+  *synchronous* seam that cannot be interrupted on this platform/thread (Issue
+  #42). A :class:`ConfigError` (the run's seam/platform combination is
+  misconfigured for hard kill). Relocated here for the unified hierarchy (Issue
+  #71); still importable from :mod:`loop_agent.loop` for backwards
+  compatibility.
 
 Backwards compatibility
 =======================
@@ -36,6 +47,13 @@ leaf *also* inherits the builtin(s) it used to raise (multiple inheritance):
 - ``ConfigError`` is a ``ValueError`` **and** a ``TypeError``
 - ``StateError`` is a ``ValueError`` **and** a ``RuntimeError``
 - ``AsyncSeamInSyncLoop`` is a ``RuntimeError``
+- ``SeamTimeout`` is a ``StateError`` (so transitively a ``ValueError`` and a
+  ``RuntimeError``); it was a bare ``Exception`` before #71, so this only
+  *widens* what catches it -- ``except SeamTimeout`` is unchanged.
+- ``UnsupportedTimeoutKill`` is a ``ConfigError`` **and** a ``RuntimeError``; it
+  used to be a bare ``RuntimeError``, so it explicitly keeps that base (via
+  multiple inheritance) to preserve pre-#71 ``except RuntimeError`` callers
+  while also joining the :class:`ConfigError` surface.
 
 So an ``except ValueError`` / ``except TypeError`` / ``except RuntimeError``
 written against the old API keeps working unchanged, while new code can catch
@@ -57,6 +75,8 @@ __all__ = [
     "ConfigError",
     "StateError",
     "AsyncSeamInSyncLoop",
+    "SeamTimeout",
+    "UnsupportedTimeoutKill",
 ]
 
 
@@ -109,4 +129,56 @@ class AsyncSeamInSyncLoop(LoopError, RuntimeError):
     for async seams (Issue #40). Inherits ``RuntimeError`` for backwards
     compatibility; canonical home is this module, re-exported from
     :mod:`loop_agent._async`.
+    """
+
+
+class SeamTimeout(StateError):
+    """A loop seam exceeded its per-call timeout under ``on_timeout="kill"``.
+
+    Raised *out of the loop* (so :func:`loop_agent.run_loop` /
+    :func:`loop_agent.async_run_loop` does not return a ``LoopResult``) when
+    ``act`` or ``verify`` overruns its configured
+    :class:`~loop_agent.loop.TimeoutPolicy` deadline in hard-kill mode. For an
+    async seam the underlying task has been cancelled (via :func:`asyncio.wait`
+    + ``task.cancel()``); for a synchronous seam on a POSIX main thread it was
+    interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
+    ``seconds`` the deadline that was exceeded.
+
+    A :class:`StateError` (a run-time invariant violation -- the seam did not
+    finish within its allotted time), so it is also a :class:`LoopError` and,
+    via :class:`StateError`'s compat bases, a ``RuntimeError`` and a
+    ``ValueError``. Before Issue #71 it was a bare ``Exception``; that only
+    widens what catches it, so ``except SeamTimeout`` callers are unaffected.
+    Introduced in Issue #42 (canonical home moved here in Issue #71;
+    re-exported from :mod:`loop_agent.loop`).
+    """
+
+    def __init__(self, seam: str, seconds: float) -> None:
+        self.seam = seam
+        self.seconds = seconds
+        super().__init__(
+            f"{seam!r} seam exceeded its {seconds:g}s per-call timeout (hard kill)"
+        )
+
+
+class UnsupportedTimeoutKill(ConfigError, RuntimeError):
+    """A hard-kill timeout was requested for a *synchronous* seam that cannot be
+    interrupted on this platform/thread.
+
+    Hard-killing a blocking synchronous call requires POSIX ``SIGALRM`` on the
+    main thread (:func:`signal.setitimer`). On Windows, or off the main thread,
+    that mechanism is unavailable, so a synchronous seam cannot be *guaranteed*
+    to be interrupted -- a genuinely hung call would never return. Rather than
+    silently hang, the driver refuses up front: use an async seam (cancelled via
+    the asyncio event loop, fully portable) or ``on_timeout="graceful"`` (which
+    detects an overrun *after* the call returns; it cannot bound a hung call).
+
+    A :class:`ConfigError` (the run's seam/platform combination is misconfigured
+    for hard kill), so it is also a :class:`LoopError`, a ``ValueError`` and a
+    ``TypeError``. It additionally keeps ``RuntimeError`` as an explicit base
+    (multiple inheritance) because it *was* a bare ``RuntimeError`` before Issue
+    #71 -- this preserves any pre-existing ``except RuntimeError`` callers while
+    also joining the :class:`ConfigError` surface. Introduced in Issue #42
+    (canonical home moved here in Issue #71; re-exported from
+    :mod:`loop_agent.loop`).
     """

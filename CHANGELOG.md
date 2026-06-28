@@ -52,6 +52,13 @@
   ため、既存の `except ValueError` 等はそのまま動作する。`prompt_template` の欠落
   フィールドが送出する `KeyError`（`str.format` 意味論を踏襲）は意図的に階層外。
   解説は [`docs/errors.md`](./docs/errors.md)。
+  - **#42 例外の階層統合（Issue #71）**: #42（per-call timeout/kill）で導入され当初
+    `LoopError` 階層の外にあった `SeamTimeout` / `UnsupportedTimeoutKill` を統一階層へ
+    再配置。`SeamTimeout` は `StateError` 派生（kill 発火 = 実行時の不変条件違反。素の
+    `Exception` だったので捕捉範囲が広がるだけで `except SeamTimeout` は不変）、
+    `UnsupportedTimeoutKill` は `ConfigError` 派生（seam/環境の設定不整合）かつ `RuntimeError`
+    も基底に保持（#71 以前の `except RuntimeError` 互換）。正準ホームは `loop_agent.errors`
+    に移り、`loop_agent.loop` から後方互換 re-export（挙動・attribute は完全不変）。
 - **multi-item 公平 scheduling `WorkListGather`**（Issue #56）: N 件を 1 本のループで
   公平に回す `gather` フック。公平 scheduling 戦略（`round_robin` / `fewest_attempts` /
   `fifo` / `priority` / custom callable）+ per-item 上限（`max_attempts_per_item` で
