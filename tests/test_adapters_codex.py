@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+import loop_agent.adapters.codex as codex_module
 from loop_agent.adapters import CodexAct, MockCodexAct, render_prompt
 
 # parse_tokens は codex サブモジュールから直接取る。``adapters.__init__`` が公開する
@@ -72,6 +73,7 @@ def test_build_command_includes_all_flags():
         effort="high",
         sandbox="workspace-write",
         allowed_args=["--add-dir", "/tmp/x"],
+        codex_bin="codex",
     )
     cmd = act.build_command("the prompt")
 
@@ -86,6 +88,26 @@ def test_build_command_includes_all_flags():
     # プロンプトは "--" 区切りの後ろの位置引数(値取りオプションに飲まれないため)。
     assert cmd[-2:] == ["--", "the prompt"]
 
+
+def test_default_codex_bin_prefers_cmd_shim_on_windows(monkeypatch):
+    monkeypatch.setattr(codex_module.os, "name", "nt")
+    monkeypatch.setattr(
+        codex_module.shutil,
+        "which",
+        lambda name: "C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd"
+        if name == "codex.cmd"
+        else None,
+    )
+
+    assert codex_module._default_codex_bin() == "C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd"
+    assert CodexAct().build_command("p")[0].endswith("codex.cmd")
+
+
+def test_default_codex_bin_falls_back_to_cmd_name_on_windows(monkeypatch):
+    monkeypatch.setattr(codex_module.os, "name", "nt")
+    monkeypatch.setattr(codex_module.shutil, "which", lambda name: None)
+
+    assert codex_module._default_codex_bin() == "codex.cmd"
 
 def test_build_command_minimal_omits_optional_flags():
     # json/skip を切ると付かない。sandbox 未指定なら -s も付かない。
@@ -241,6 +263,16 @@ def test_error_message_fallback_to_exit_code_when_all_empty():
     assert result.error == "exit=3"
 
 
+def test_subprocess_capture_uses_utf8_with_replacement():
+    runner = _completed(stdout=JSONL_OK)
+    act = CodexAct(runner=runner)
+    act({"prompt": "hi"})
+
+    _, kwargs = runner.calls[-1]
+    assert kwargs["text"] is True
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+
 def test_cwd_is_passed_to_subprocess():
     runner = _completed(stdout=JSONL_OK)
     act = CodexAct(cwd="/tmp/work", runner=runner)
@@ -387,5 +419,3 @@ def test_real_subprocess_inherits_and_overrides_env(tmp_path):
         assert act({"prompt": "x"}).observation.text == "from-parent|injected"
     finally:
         del os.environ["LOOP_AGENT_INHERITED"]
-
-

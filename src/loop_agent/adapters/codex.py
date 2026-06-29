@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Union
@@ -69,6 +70,15 @@ __all__ = [
 # Mock の各応答に許す形。str はそのまま応答テキスト、dict は CodexResult の
 # フィールド、CodexResult はそのまま使う。
 MockResponse = Union[str, Mapping[str, Any], "CodexResult"]
+
+
+def _default_codex_bin() -> str:
+    """Return the executable name/path to use for the default Codex CLI."""
+    if os.name == "nt":
+        # npm installs Codex as codex.cmd/codex.ps1 on Windows. subprocess with
+        # shell=False does not resolve PowerShell scripts, so prefer the cmd shim.
+        return shutil.which("codex.cmd") or "codex.cmd"
+    return "codex"
 
 
 @dataclass
@@ -323,7 +333,7 @@ class CodexAct:
             ``danger-full-access``)。``None`` で codex 既定に従う。
         skip_git_repo_check: ``True`` (既定)で ``--skip-git-repo-check`` を付け、
             git リポジトリ外でも起動失敗しないようにする(embeddability のため)。
-        codex_bin: 実行ファイル名/パス(既定 ``"codex"``)。テストで差し替え可。
+        codex_bin: 実行ファイル名/パス。既定は POSIX で ``"codex"``、Windows で npm の ``codex.cmd`` shim。テストで差し替え可。
         cwd: 子プロセスの作業ディレクトリ。``None`` で現在のディレクトリ。
         runner: ``subprocess.run`` 互換の実行関数(テスト用の注入点)。``None`` で
             ``subprocess.run`` を使う。
@@ -338,7 +348,7 @@ class CodexAct:
     json_output: bool = True
     sandbox: Optional[str] = None
     skip_git_repo_check: bool = True
-    codex_bin: str = "codex"
+    codex_bin: str = field(default_factory=_default_codex_bin)
     cwd: Optional[str] = None
     runner: Optional[Runner] = None
 
@@ -381,6 +391,8 @@ class CodexAct:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout,
                 env=self._build_env(),
                 cwd=self.cwd,
