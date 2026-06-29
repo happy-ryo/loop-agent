@@ -331,9 +331,13 @@ def test_render_prompt_missing_field_raises_helpful_error():
 
 
 def _write_fake_codex(tmp_path: Path, body: str) -> str:
-    """``sys.executable`` をインタプリタにした実行可能なフェイク codex を作る。"""
+    """Create a fake codex executable that works on Windows and POSIX."""
     script = tmp_path / "fake_codex.py"
     script.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    if sys.platform == "win32":
+        shim = tmp_path / "fake_codex.cmd"
+        shim.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return str(shim)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(script)
 
@@ -383,3 +387,5 @@ def test_real_subprocess_inherits_and_overrides_env(tmp_path):
         assert act({"prompt": "x"}).observation.text == "from-parent|injected"
     finally:
         del os.environ["LOOP_AGENT_INHERITED"]
+
+
