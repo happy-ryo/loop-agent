@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 from typing import Any, Callable, Optional, Sequence, Union
 
 from .conditions import AnyOf, StopCondition
@@ -298,13 +300,15 @@ def run_observed_loop(
         user_on_step = on_step
 
         def step_hook(record: StepRecord, state: LoopState):
+            # Let the caller's durable side effect (for the CLI, DBProgressLog)
+            # succeed before emitting derived observations. If the user hook
+            # raises or returns an invalid async seam on the sync path, the step
+            # event is not emitted ahead of the source of truth.
+            result = user_on_step(record, state)
+            if inspect.isawaitable(result):
+                return result
             observer.on_step(record, state)
-            # Return the user hook's result rather than swallowing it, so an
-            # awaitable (async on_step) reaches run_loop's strict-sync gate and is
-            # rejected with AsyncSeamInSyncLoop -- consistent with passing an async
-            # on_step to run_loop directly -- instead of being silently dropped.
-            # The observer's own on_step is synchronous (returns None).
-            return user_on_step(record, state)
+            return result
 
     # time_fn / initial_state は渡されたときだけ run_loop に転送し、既定（time.monotonic
     # / fresh start）を尊重する。
