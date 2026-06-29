@@ -373,6 +373,20 @@ def test_sync_seam_under_alarm_completes_normally_when_fast():
 # -- synchronous seam without SIGALRM (Windows / non-main-thread) ------------
 
 
+def test_default_kill_timeout_does_not_reject_fast_sync_verify_without_alarm(monkeypatch):
+    """Implicit default kill timeouts should not reject fast sync seams on Windows."""
+    monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
+    result = asyncio.run(
+        async_run_loop(
+            act=sleeping_aact(delay=0.0, tokens=1),
+            verify=done_after(2),
+            conditions=[MaxIterations(10)],
+            timeout=TimeoutPolicy(default=5.0, on_timeout=TIMEOUT_KILL),
+        )
+    )
+    assert result.succeeded is True
+    assert result.iterations == 2
+
 def test_sync_kill_unsupported_without_alarm(monkeypatch):
     """Hard-kill of a synchronous seam is refused up front where SIGALRM is absent."""
     monkeypatch.setattr(loop_mod, "_alarm_capable", lambda: False)
