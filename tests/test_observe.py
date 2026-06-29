@@ -277,6 +277,26 @@ def test_user_on_step_is_composed_with_observer():
     assert len(sink.of_kind(LOOP_STEP)) == 3  # 観測フックも生きている
 
 
+def test_observer_emits_step_only_after_user_on_step_succeeds():
+    sink = ListSink()
+
+    def fail_on_step(_record, _state):
+        raise RuntimeError("db write failed")
+
+    with pytest.raises(RuntimeError, match="db write failed"):
+        run_observed_loop(
+            act=acting(tokens=0),
+            verify=never_done,
+            conditions=[MaxIterations(1)],
+            sinks=[sink],
+            on_step=fail_on_step,
+            otel=False,
+        )
+    assert not sink.of_kind(LOOP_STEP)
+    end = _only(sink, LOOP_END)
+    assert end.payload["status"] == "error"
+
+
 # -- 例外パス: error の loop_end ------------------------------------------
 
 
