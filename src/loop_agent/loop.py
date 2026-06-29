@@ -205,6 +205,38 @@ class TimeoutPolicy:
 TimeoutArg = Union[TimeoutPolicy, float, int, None]
 
 
+def _effective_seam_timeout(
+    policy: TimeoutPolicy,
+    seam: str,
+    fn: Callable[[Any], Any],
+) -> Optional[float]:
+    """Return the timeout to apply to one seam, or None for the fast path.
+
+    On platforms without SIGALRM, hard-kill cannot preempt a synchronous seam.
+    An explicit per-seam kill timeout should still fail loudly in _run_seam, but
+    a broad default kill timeout should not make an otherwise-fast synchronous
+    seam unusable on Windows. Treat that implicit default as unenforceable for
+    this seam and leave it unbounded; async seams still get asyncio cancellation.
+    """
+    if seam == "act":
+        seconds = policy.act_seconds
+        explicit = policy.act is not None
+    elif seam == "verify":
+        seconds = policy.verify_seconds
+        explicit = policy.verify is not None
+    else:  # defensive; callers pass literals
+        raise StateError(f"unknown seam {seam!r}")
+    if seconds is None:
+        return None
+    if (
+        policy.on_timeout == TIMEOUT_KILL
+        and not explicit
+        and not _alarm_capable()
+        and not _looks_async(fn)
+    ):
+        return None
+    return seconds
+
 def _resolve_timeout(timeout: TimeoutArg) -> Optional[TimeoutPolicy]:
     """Normalise the ``timeout`` argument to a :class:`TimeoutPolicy` or ``None``.
 
@@ -963,14 +995,19 @@ async def _drive_loop(
         # act -- per-call timeout 適用可 (Issue #42)。policy 未設定なら従来どおり
         # maybe_await 直呼びで追加コストゼロ。graceful timeout は当該 step を failed
         # として記録し次 iteration へ (kill は SeamTimeout がループ外へ伝播)。
-        if policy is None or policy.act_seconds is None:
+        act_timeout = (
+            None
+            if policy is None
+            else _effective_seam_timeout(policy, "act", act)
+        )
+        if act_timeout is None:
             outcome = await maybe_await(act(context))
         else:
             try:
                 outcome = await _run_seam(
                     act,
                     context,
-                    seconds=policy.act_seconds,
+                    seconds=act_timeout,
                     mode=policy.on_timeout,
                     seam="act",
                     time_fn=time_fn,
@@ -981,7 +1018,7 @@ async def _drive_loop(
                     observation=ACT_TIMEOUT_OBSERVATION,
                     tokens=0,
                     goal_met=False,
-                    detail=f"act timed out after {policy.act_seconds:g}s",
+                    detail=f"act timed out after {act_timeout:g}s",
                 )
                 state.history.append(record)
                 state.iteration += 1
@@ -997,14 +1034,19 @@ async def _drive_loop(
 
         # verify -- 同上。act の outcome (tokens 計上済) はそのまま、verify が時間切れ
         # なら failed step を記録して次 iteration へ。
-        if policy is None or policy.verify_seconds is None:
+        verify_timeout = (
+            None
+            if policy is None
+            else _effective_seam_timeout(policy, "verify", verify)
+        )
+        if verify_timeout is None:
             verdict = await maybe_await(verify(outcome))
         else:
             try:
                 verdict = await _run_seam(
                     verify,
                     outcome,
-                    seconds=policy.verify_seconds,
+                    seconds=verify_timeout,
                     mode=policy.on_timeout,
                     seam="verify",
                     time_fn=time_fn,
@@ -1015,7 +1057,7 @@ async def _drive_loop(
                     observation=VERIFY_TIMEOUT_OBSERVATION,
                     tokens=outcome.tokens,
                     goal_met=False,
-                    detail=f"verify timed out after {policy.verify_seconds:g}s",
+                    detail=f"verify timed out after {verify_timeout:g}s",
                 )
                 state.history.append(record)
                 state.iteration += 1
