@@ -77,6 +77,11 @@ def write_toml(path: Path, text: str) -> Path:
     return path
 
 
+def toml_literal(value: str) -> str:
+    """Return a TOML literal string, suitable for Windows paths."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 # -- TOML parsing / validation ----------------------------------------------
 
 
@@ -389,7 +394,7 @@ def _run_toml(tmp_path: Path, *, run_id: str, db: str, max_iter: int,
         f'[loop]\ngoal="g"\nrun_id="{run_id}"\n'
         f'[conditions]\nmax_iterations={max_iter}\n'
         f'[act]\n{act}\n[verify]\n{verify}\n'
-        f'[state]\ndb="{db}"\n',
+        f"[state]\ndb={toml_literal(db)}\n",
     )
 
 
@@ -435,7 +440,7 @@ def test_cmd_run_python_callable(tmp_path, capsys):
         '[loop]\ngoal="g"\nrun_id="py"\n[conditions]\nmax_iterations=10\n'
         '[act]\npython="test_cli:act_ok"\n'
         '[verify]\npython="test_cli:verify_after_two"\n'
-        f'[state]\ndb="{db}"\n',
+        f"[state]\ndb={toml_literal(db)}\n",
     )
     rc = main(["run", str(toml)])
     out = capsys.readouterr().out
@@ -491,7 +496,7 @@ def test_cmd_resume_continues(tmp_path, capsys):
         '[loop]\ngoal="g"\nrun_id="r"\n[conditions]\nmax_iterations=2\n'
         '[act]\npython="test_cli:counting_act"\n'
         '[verify]\npython="test_cli:verify_never"\n'
-        f'[state]\ndb="{db}"\n',
+        f"[state]\ndb={toml_literal(db)}\n",
     )
     assert main(["run", str(toml)]) == 1
     capsys.readouterr()
@@ -627,3 +632,4 @@ def test_main_run_missing_file(tmp_path, capsys):
 def test_generate_run_id_is_unique():
     assert generate_run_id() != generate_run_id()
     assert generate_run_id().startswith("run-")
+
