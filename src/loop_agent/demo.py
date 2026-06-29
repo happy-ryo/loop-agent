@@ -1,21 +1,23 @@
-"""検証駆動デモのエンジン: 実テストの exit-code を ground truth に回す再利用フック。
+"""Verification-driven demo engine: reusable hooks using real test exit codes as ground truth.
 
-このモジュールは loop-agent のループコア(:func:`loop_agent.run_loop`)を、
-*実際のテスト実行* に当てるための最小の足場を提供する。検証(verify)は
-LLM judge ではなく、subprocess で起動したテストコマンドの ``returncode`` を
-唯一の真実として使う(report.md R1: ground truth 優先)。
+This module provides the minimal scaffolding needed to apply loop-agent's loop
+core (:func:`loop_agent.run_loop`) to *actual test execution*. Verification does
+not use an LLM judge; it treats the ``returncode`` from a subprocess-launched
+test command as the sole source of truth (report.md R1: ground truth first).
 
-3 つの注入可能フックを提供する:
+It provides three injectable hooks:
 
-- :class:`CandidateApplier` -- ``act``。反復ごとに「次の修正候補ソース」を
-  対象ファイルへ書き込む(LLM 修正役の決定的スタブ)。
-- :class:`ExitCodeVerifier`    -- ``verify``。sandbox 内でテストコマンドを実行し、
-  exit-code 0(green)で ``goal_met=True`` を返す。green でループは自然終了する。
-- :func:`attempt_index`    -- ``gather``。次に試す候補の番号(= 反復回数)を
-  context として act へ渡す最小の観測シーム。
+- :class:`CandidateApplier` -- ``act``. Writes the "next candidate fix source"
+  to the target file on each iteration (a deterministic stub for an LLM fixer).
+- :class:`ExitCodeVerifier`    -- ``verify``. Runs the test command in a
+  sandbox and returns ``goal_met=True`` for exit-code 0 (green). The loop exits
+  naturally on green.
+- :func:`attempt_index`    -- ``gather``. Passes the next candidate number
+  (= iteration count) to act as a minimal observation seam.
 
-具体シナリオ(壊れた関数を直すまで回す)は ``examples/verify_driven_demo.py``、
-pytest による実走検証は ``tests/test_verify_demo.py`` を参照。
+See ``examples/verify_driven_demo.py`` for the concrete scenario (loop until a
+broken function is fixed), and ``tests/test_verify_demo.py`` for live
+verification with pytest.
 """
 
 from __future__ import annotations
@@ -32,25 +34,32 @@ from .errors import ConfigError
 from .loop import ActOutcome, VerifyOutcome
 from .state import LoopState
 
-# sandbox のテストを最も素朴に「exit-code で」回すデフォルトコマンド。
+# Default command for running sandbox tests in the simplest possible way:
+# by exit code.
 #
-# ``-B`` は重要: 反復で書き換える対象ファイルは「同じ byte 長・粗い mtime 解像度」
-# だと CPython の .pyc 検証(mtime+size)をすり抜け、前反復の壊れた版の bytecode
-# キャッシュを読み続けてしまう(直したのに red が続く偽陰性)。毎回 source から
-# 再コンパイルさせるため bytecode 書き込みを全実行で無効化する。
+# ``-B`` is important: when the target file rewritten on each iteration has the
+# same byte length and coarse mtime resolution, it can slip past CPython's .pyc
+# validation (mtime+size) and keep reading cached bytecode for the broken
+# version from the previous iteration (a false negative where red persists after
+# the fix). Disable bytecode writes for every run so Python recompiles from
+# source each time.
 #
-# ``-B`` は bytecode の *書き込み* を抑止する(等 byte 長候補 + 粗い mtime 解像度で
-# stale .pyc を量産する偽陰性を防ぐ)。ただし *既存* の .pyc の *読み込み* は防げないため、
-# verify 前に sandbox の __pycache__ を毎回削除する(:func:`_clear_pycache`)。両者で
-# 「毎回 source から再コンパイル」を保証する。
+# ``-B`` prevents bytecode *writes* (avoiding false negatives from stale .pyc
+# files caused by equal-length candidates plus coarse mtime resolution). It does
+# not prevent *reading* existing .pyc files, so remove the sandbox __pycache__
+# before each verify (:func:`_clear_pycache`). Together they guarantee
+# recompilation from source on every run.
 #
-# 末尾の ``"."`` と ``-o addopts=`` は重要: workdir が(一時ディレクトリではなく)
-# 祖先に pytest 設定を持つ checkout 内に置かれた場合、位置引数なしの pytest は
-# 祖先を rootdir に選び ``testpaths`` で別スイートを収集したり ``addopts`` を適用したり
-# しうる。すると exit-code は「その sandbox の」ground truth でなくなる。
-#   - ``"."`` : 収集対象を cwd(= sandbox)に限定する。明示パスは ``testpaths`` を上書きする。
-#   - ``-o addopts=`` : 祖先 ini の ``addopts`` を空に上書きし、起動側設定の混入を断つ。
-# ``-p no:cacheprovider`` は pytest キャッシュ設定を拾わないため。
+# The trailing ``"."`` and ``-o addopts=`` are important: if workdir is placed
+# inside a checkout that has pytest configuration in an ancestor (rather than in
+# a temporary directory), pytest without a positional argument can choose that
+# ancestor as rootdir, collect another suite through ``testpaths``, or apply
+# ``addopts``. Then the exit code is no longer ground truth for this sandbox.
+#   - ``"."``: limit collection to cwd (= sandbox). An explicit path overrides
+#     ``testpaths``.
+#   - ``-o addopts=``: override ancestor ini ``addopts`` with an empty value and
+#     prevent caller configuration from leaking in.
+# ``-p no:cacheprovider`` avoids picking up pytest cache configuration.
 DEFAULT_TEST_COMMAND: tuple[str, ...] = (
     sys.executable,
     "-B",
@@ -64,24 +73,29 @@ DEFAULT_TEST_COMMAND: tuple[str, ...] = (
     ".",
 )
 
-# 1 回のテスト実行に課す上限(秒)。ハングする候補(例: 無限ループを入れた修正)で
-# verify が永久にブロックすると、ループ境界で評価される Timeout/MaxIterations すら
-# 効かなくなる。これを防ぐため subprocess に timeout を課し、超過は red 扱いにして
-# 制御をループへ戻す(暴走防止。本格実証は #7)。
+# Per-test-run limit in seconds. If verify blocks forever on a hanging
+# candidate (for example, a fix that introduces an infinite loop), even boundary
+# conditions such as Timeout/MaxIterations cannot take effect. Put a timeout on
+# the subprocess and treat overruns as red so control returns to the loop
+# (runaway prevention; full demonstration in #7).
 DEFAULT_TEST_TIMEOUT: float = 120.0
 
 
-# 子プロセスのテスト実行(exit-code = ground truth)を、起動側の環境に依存させ
-# ないための除外キー。これらは nested pytest に CLI オプション等を注入でき、green な
-# sandbox を false red/green に反転させて検証を非決定にしうる:
-#   - PYTEST_ADDOPTS: pytest 公式の「nested 実行へオプションを伝播」する仕組み。
-#     例えば外側を ``PYTEST_ADDOPTS='-m somemarker'`` で起動すると子の rc=5(no tests)
-#     になり、green な sandbox が false red になる(tox / CI / -W 付与で実際に起こる)。
-#   - PYTEST_PLUGINS: 特定プラグインを強制ロードさせる。
-#   - COV_CORE_*: 外側 --cov 実行が子へ計測を注入する。
-# これらを除いた os.environ のコピーを子へ渡す。
-# なお PYTEST_DISABLE_PLUGIN_AUTOLOAD は「除外」ではなく後で 1 に「強制」する
-# (除外すると起動側の =1 を取り消して周囲プラグインを再有効化してしまうため。下記参照)。
+# Denylisted keys that keep child-process test execution (exit-code = ground
+# truth) independent of the caller's environment. These can inject CLI options
+# or other behavior into nested pytest and flip a green sandbox to false
+# red/green, making verification nondeterministic:
+#   - PYTEST_ADDOPTS: pytest's official mechanism for propagating options to
+#     nested runs. For example, starting the outer process with
+#     ``PYTEST_ADDOPTS='-m somemarker'`` makes the child return rc=5 (no tests),
+#     turning a green sandbox into false red (this happens in practice with tox,
+#     CI, and -W injection).
+#   - PYTEST_PLUGINS: forces specific plugins to load.
+#   - COV_CORE_*: outer --cov runs inject coverage measurement into the child.
+# Pass a copy of os.environ with these removed to the child.
+# PYTEST_DISABLE_PLUGIN_AUTOLOAD is not removed; it is forced to 1 later instead
+# (removing it would undo a caller-side =1 and re-enable ambient plugins; see
+# below).
 _ENV_DENYLIST = (
     "PYTEST_ADDOPTS",
     "PYTEST_PLUGINS",
@@ -89,37 +103,39 @@ _ENV_DENYLIST = (
 
 
 def sandbox_env() -> dict[str, str]:
-    """sandbox のテスト実行に渡す、起動環境から隔離した環境変数を返す。"""
+    """Return environment variables isolated from the caller for sandbox tests."""
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in _ENV_DENYLIST and not key.startswith("COV_CORE_")
     }
-    # bytecode を一切書かせない(DEFAULT_TEST_COMMAND の -B と同趣旨。stale .pyc 回避)。
+    # Prevent all bytecode writes, matching DEFAULT_TEST_COMMAND's -B rationale.
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    # 周囲の pytest プラグインの autoload を一律無効化し、インストール済みプラグインの
-    # 有無に依存しない hermetic な実行にする。起動側が未設定/0 でも強制的に 1 にする
-    # (sandbox のテストは素の pytest core のみで完結する)。
+    # Disable ambient pytest plugin autoload so execution is hermetic and does
+    # not depend on installed plugins. Force 1 even if the caller leaves it
+    # unset or sets it to 0 (sandbox tests use only plain pytest core).
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return env
 
 
 def _clear_pycache(workdir: Path) -> None:
-    """``workdir`` 配下の ``__pycache__`` を全削除し、stale .pyc の読み込みを防ぐ。
+    """Remove all ``__pycache__`` dirs under ``workdir`` to avoid stale .pyc reads.
 
-    ``-B`` は .pyc の *書き込み* しか抑止せず、(非 -B の手動 pytest 実行などで)
-    既に存在する .pyc は読まれてしまう。等 byte 長候補 + 粗い mtime では (mtime,size)
-    検証をすり抜けて前反復の壊れた bytecode が使われうるため、verify ごとに消す。
-    削除対象は sandbox 内に限定される。
+    ``-B`` only prevents .pyc *writes*; existing .pyc files (for example from a
+    manual pytest run without -B) can still be read. With equal-byte-length
+    candidates plus coarse mtime, (mtime, size) validation can be bypassed and
+    broken bytecode from the previous iteration may be used, so remove caches on
+    every verify. Deletion is limited to the sandbox.
     """
     for cache in workdir.rglob("__pycache__"):
         shutil.rmtree(cache, ignore_errors=True)
 
 
 def write_sandbox(workdir: Path, files: Mapping[str, str]) -> None:
-    """``files``(相対パス -> 内容)を ``workdir`` 配下へ書き出す。
+    """Write ``files`` (relative path -> content) under ``workdir``.
 
-    日本語を含みうるので UTF-8 を明示する。中間ディレクトリは自動生成する。
+    UTF-8 is explicit because content may contain Japanese. Intermediate
+    directories are created automatically.
     """
     for rel, content in files.items():
         path = workdir / rel
@@ -128,25 +144,28 @@ def write_sandbox(workdir: Path, files: Mapping[str, str]) -> None:
 
 
 def attempt_index(state: LoopState) -> int:
-    """``gather`` フック: 次に試す候補の番号(= これまでの反復回数)を返す。
+    """``gather`` hook: return the next candidate number (= iterations so far).
 
-    検証(ground truth)は :class:`ExitCodeVerifier` の 1 回だけに集約したいので、
-    gather はテストを実行せず、どの候補を当てるかという軽い context のみを渡す。
+    Verification (ground truth) should be centralized in the single
+    :class:`ExitCodeVerifier` run, so gather does not run tests. It only passes
+    lightweight context about which candidate to apply.
     """
     return state.iteration
 
 
 @dataclass
 class CandidateApplier:
-    """``act`` フック: 反復ごとに次の修正候補ソースを ``target`` へ書き込む。
+    """``act`` hook: write the next candidate fix source to ``target`` each iteration.
 
-    実運用では LLM が失敗を見て修正パッチを生成する箇所。PoC では候補列を
-    決定的に当てるスタブとし、ループ機構と ground truth 検証の実証に集中する。
-    候補を使い切ったら最後の候補に張り付く(= "現状の最善手を試し続ける")ので、
-    直らないシナリオでもハード上限が止めるまで安全に反復できる。
+    In production this is where an LLM would inspect the failure and generate a
+    fix patch. In the PoC it is a deterministic stub that applies a sequence of
+    candidates, keeping focus on the loop mechanism and ground-truth
+    verification. Once candidates are exhausted it keeps reusing the final
+    candidate (= "keep trying the current best move"), so even unfixable
+    scenarios can iterate safely until a hard limit stops them.
 
-    ``cost_per_step`` は 1 ステップあたりに計上するトークン量で、
-    :class:`~loop_agent.conditions.TokenBudget` のデモに使える(既定は 0)。
+    ``cost_per_step`` is the token amount charged per step, useful for demos of
+    :class:`~loop_agent.conditions.TokenBudget` (default is 0).
     """
 
     target: Path
@@ -170,15 +189,16 @@ class CandidateApplier:
 
 @dataclass
 class ExitCodeVerifier:
-    """``verify`` フック: sandbox でテストを実行し exit-code を ground truth に使う。
+    """``verify`` hook: run tests in a sandbox and use exit code as ground truth.
 
-    ``returncode == 0`` を green と見なし ``goal_met=True`` を返す。これにより
-    ループは「テストが green になった瞬間に」自然終了する。各実行の returncode は
-    :attr:`exit_codes` に記録され、テストや観測から後で参照できる。
+    ``returncode == 0`` is treated as green and returns ``goal_met=True``. This
+    makes the loop exit naturally the moment tests turn green. Each run's
+    returncode is recorded in :attr:`exit_codes` for later tests or observation.
 
-    ``timeout`` を超えたテスト実行は子プロセスを kill し、番兵 exit-code(124)を
-    記録して red 扱い(``goal_met=False``)で返す。これによりハングする候補でも
-    制御がループへ戻り、境界の Timeout/MaxIterations が働く。``None`` で無制限。
+    A test run that exceeds ``timeout`` kills the child process, records the
+    sentinel exit-code (124), and returns red (``goal_met=False``). This returns
+    control to the loop even for hanging candidates, letting boundary
+    Timeout/MaxIterations conditions work. ``None`` means unlimited.
     """
 
     workdir: Path
@@ -186,12 +206,12 @@ class ExitCodeVerifier:
     timeout: Optional[float] = DEFAULT_TEST_TIMEOUT
     exit_codes: list[int] = field(default_factory=list)
 
-    # ハング(timeout)を表す番兵 exit-code。慣例的なタイムアウト終了コードに合わせる。
-    # ClassVar なので dataclass のフィールド(コンストラクタ引数)にはならない。
+    # Sentinel exit code for hangs (timeouts), matching the conventional timeout
+    # exit code. ClassVar keeps it out of dataclass fields (constructor args).
     TIMEOUT_EXIT_CODE: ClassVar[int] = 124
 
     def __call__(self, _outcome: ActOutcome) -> VerifyOutcome:
-        # 既存 .pyc を消してから走らせ、必ず source から再コンパイルさせる。
+        # Remove existing .pyc files before running so source is always recompiled.
         _clear_pycache(self.workdir)
         try:
             proc = subprocess.run(
@@ -203,7 +223,8 @@ class ExitCodeVerifier:
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
-            # 子は subprocess.run により kill 済み。green ではないので red 扱い。
+            # subprocess.run has already killed the child. It is not green, so
+            # treat it as red.
             self.exit_codes.append(self.TIMEOUT_EXIT_CODE)
             return VerifyOutcome(
                 goal_met=False, detail=f"red (timeout {self.timeout:g}s)"
