@@ -159,6 +159,26 @@ def test_jsonl_unicode_line_separators_do_not_split_a_record(tmp_path):
     assert len(records) == 2  # 末尾 record は裂けず無事
 
 
+def test_jsonl_sink_writes_strict_json_for_non_finite_floats(tmp_path):
+    path = tmp_path / "events.jsonl"
+    JsonlEventSink(path).emit(
+        LoopEvent(
+            kind=LOOP_STEP,
+            iteration=0,
+            elapsed=float("inf"),
+            payload={"nan": float("nan"), "nested": [float("-inf")]},
+        )
+    )
+
+    raw = path.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    records = read_events(path)
+    assert records[0]["elapsed"] == "inf"
+    assert records[0]["nan"] == "nan"
+    assert records[0]["nested"] == ["-inf"]
+
+
 # -- jsonable coercion ------------------------------------------------------
 
 

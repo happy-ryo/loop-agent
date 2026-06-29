@@ -19,6 +19,7 @@ report.md S4.6）。時刻はループの注入クロック由来の ``elapsed``
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -40,6 +41,8 @@ def _jsonable(value: Any) -> Any:
     :func:`loop_agent.progress._to_jsonable` と同じ方針で、保存される形を予測可能に
     する（``json.dumps(default=...)`` を eager に適用したもの）。
     """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, (list, tuple)):
@@ -140,7 +143,12 @@ class JsonlEventSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event: LoopEvent) -> None:
-        line = json.dumps(event.to_dict(), ensure_ascii=False, default=repr)
+        line = json.dumps(
+            _jsonable(event.to_dict()),
+            ensure_ascii=False,
+            allow_nan=False,
+            default=repr,
+        )
         # open-append-flush をレコード毎に行うことでライフサイクルを単純化し
         # （閉じるハンドル無し）、行を耐久性の単位にする。
         with self.path.open("a", encoding="utf-8") as fh:
