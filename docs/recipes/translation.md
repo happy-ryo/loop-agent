@@ -65,6 +65,27 @@ def verify(outcome):
     return VerifyOutcome(goal_met=len(done) == len(FILES), detail=f"{f}: done")
 ```
 
+## act prompt は lean に保つ（コスト設計）
+
+この recipe の制約は **verify で機械的に強制**し、`act` prompt へ毎回貼り付けない。反復ループでは prompt の肥大が iteration 数で掛け算されるため、`act` には「いま編集する 1 ファイル」と「そのファイルの翻訳対象」だけを渡す。
+
+推奨する prompt の形:
+
+```text
+Edit only: {file}
+Translate Japanese comments and docstrings in this file to English.
+Do not change code or non-docstring string literals.
+Do not edit other files. Do not run tests. Return after editing.
+```
+
+避ける anti-pattern:
+
+- verify の 5 段チェック本文を毎回 prompt に貼る。
+- 既完了ファイル一覧、全体の残りファイル一覧、テスト計画を毎回渡す。
+- `Do not inspect tests` と書きながら `adapter tests must pass` のような確認責務を `act` に渡す。
+
+それらは `verify` の仕事である。`act` が余計な repo 探索・diff 確認・test 実行を始めると、ファイル単位ループの失敗隔離メリットよりも prompt/tool cost が勝つことがある。dogfood では、一括 1 iteration が 801,370 tokens だった一方、過剰な `act` prompt を持つファイル単位 loop は 7 iterations / 2,470,874 tokens まで増えた。ファイル単位 loop を選ぶなら、実行前に「1 iteration あたり agent に読ませる情報量」を review する。
+
 ## PoC の実走結果（embeddability の実証）
 
 loop-agent 自身の 10 ファイル（合計 290 の日本語 hit）を `haiku` で英訳:

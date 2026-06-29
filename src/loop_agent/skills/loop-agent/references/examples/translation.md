@@ -68,6 +68,19 @@ def verify(outcome):                          # outcome: ActOutcome
     return VerifyOutcome(goal_met=all_files_done(), detail=f"{f}: done")
 ```
 
+## Keep the act prompt lean
+
+Do not paste the five verifier stages into every `act` prompt. They are policy enforced by the harness, not context the model needs to edit. For a file-by-file loop, pass only the selected file and the target spans or target rule:
+
+```text
+Edit only: {file}
+Translate Japanese comments and docstrings in this file to English.
+Do not change code or non-docstring string literals.
+Do not edit other files. Do not run tests. Return after editing.
+```
+
+Avoid giving the agent a global progress table, the full remaining-file list, or test instructions such as "adapter tests must pass" unless that information is required for the edit. Those details trigger repeated repo exploration and tool use in every iteration. Let `verify` enforce changed-file scope, AST equivalence, residual Japanese scans, and tests mechanically.
+
 Drive it with `run_loop(gather=WorkListGather(files, strategy="fewest_attempts", max_attempts_per_item=2),
 act=ClaudeCodeAct(model="haiku", allowed_tools=["Read","Edit"]), verify=verify,
 conditions=[MaxIterations(20), TokenBudget(...)])`.
