@@ -1,28 +1,29 @@
-"""アダプタ共通の土台: ``act`` シームが返す結果の形と、プロンプト整形ユーティリティ。
+"""Shared adapter foundation: result shape for the ``act`` seam and prompt rendering.
 
-このモジュールは「外部エージェント実行系(Claude Code / Codex 等)を loop-agent の
-``act`` フックに繋ぐ」アダプタが共有する **構造的な契約** を 1 か所に集約する。
-個々のアダプタ(:mod:`~loop_agent.adapters.claude_code` /
-:mod:`~loop_agent.adapters.codex`)は subprocess コマンド・フラグ・token/output 解析
-だけが異なり、結果オブジェクトの形(8 フィールド)とプロンプト整形は完全に同型で
-ある。重複定義を解消し、新しいアダプタが「同じ契約に従うべき形」をここから参照
-できるようにするのが狙い(Issue #52)。
+This module centralizes the **structural contract** shared by adapters that connect
+external agent runners (Claude Code, Codex, and similar tools) to loop-agent's
+``act`` hook. Individual adapters (:mod:`~loop_agent.adapters.claude_code` /
+:mod:`~loop_agent.adapters.codex`) differ only in subprocess commands, flags, and
+token/output parsing; the result object's shape (8 fields) and prompt rendering are
+otherwise identical. The goal is to remove duplicate definitions and give new
+adapters one place to reference for the shape they should follow (Issue #52).
 
-提供物:
+Provided objects:
 
-- :class:`ActResult` -- アダプタの結果が満たすべき **構造的契約** (Protocol)。
-  ``observation`` に載るオブジェクトが持つべきフィールド/メソッドを宣言する。
-  ``isinstance`` でも(``runtime_checkable``)構造適合を確かめられる。
-- :class:`ActResultBase` -- その契約を満たす具体 dataclass。8 フィールドと
-  ``__str__`` を持ち、:class:`~loop_agent.adapters.claude_code.ClaudeCodeResult` /
-  :class:`~loop_agent.adapters.codex.CodexResult` はこれを継承して **フィールド定義の
-  重複を持たない**。
-- :data:`Runner` -- ``subprocess.run`` 互換の実行関数シーム(テストでの注入点)。
-- :func:`render_prompt` / :func:`_format_fields` -- ``prompt_template`` を context
-  (gather の戻り値や :class:`~loop_agent.state.LoopState`)のフィールドで埋める
-  共通整形。
+- :class:`ActResult` -- the **structural contract** (Protocol) adapter results must
+  satisfy. It declares the fields/methods expected on objects stored in
+  ``observation``. ``runtime_checkable`` also allows structural compatibility checks
+  with ``isinstance``.
+- :class:`ActResultBase` -- a concrete dataclass that satisfies that contract. It
+  owns the 8 fields and ``__str__``; :class:`~loop_agent.adapters.claude_code.ClaudeCodeResult`
+  and :class:`~loop_agent.adapters.codex.CodexResult` inherit it so they do **not**
+  duplicate field definitions.
+- :data:`Runner` -- a ``subprocess.run``-compatible execution seam for tests.
+- :func:`render_prompt` / :func:`_format_fields` -- shared formatting that fills
+  ``prompt_template`` from fields on the context (the gather return value or
+  :class:`~loop_agent.state.LoopState`).
 
-新しいアダプタの書き方は ``docs/adapters/writing-an-adapter.md`` を参照。
+See ``docs/adapters/writing-an-adapter.md`` for how to write a new adapter.
 """
 
 from __future__ import annotations
@@ -31,39 +32,41 @@ import subprocess
 from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
-# subprocess.run 互換の実行関数シーム(テストで差し替えるための注入点)。
-# capture_output / text / timeout / env / cwd / stdin を受け取り、
-# ``returncode`` / ``stdout`` / ``stderr`` を持つオブジェクトを返す。
+# ``subprocess.run``-compatible execution seam used as a test injection point.
+# Accepts capture_output / text / timeout / env / cwd / stdin and returns an object
+# with ``returncode`` / ``stdout`` / ``stderr``.
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
 @runtime_checkable
 class ActResult(Protocol):
-    """アダプタ 1 回呼び出しの結果が満たすべき構造的契約(``ActOutcome.observation``)。
+    """Structural contract for one adapter call result (``ActOutcome.observation``).
 
-    :class:`~loop_agent.loop.ActOutcome` 自体は ``failed`` を持たないため、成否や
-    生出力といった「verify が判断に使いたい情報」はこの観測オブジェクトに集約する。
-    アダプタ間で結果の形を揃えることで、異種アダプタを合成しても verify 側を
-    書き換えずに済む(composability)。
+    :class:`~loop_agent.loop.ActOutcome` itself does not have ``failed``, so the
+    information verify may need for decisions, such as success/failure and raw output,
+    is collected on this observation object. Keeping the result shape consistent
+    across adapters lets verify compose heterogeneous adapters without rewrites.
 
-    フィールドの意味:
+    Field meanings:
 
-    - ``text`` -- アシスタント応答の本文。``str(result)`` も同じ本文を返す。
-    - ``tokens`` -- この呼び出しが消費したトークン総数(予算計上用)。
-    - ``failed`` -- 失敗(非 0 終了 / CLI が報告したエラー / timeout / 起動失敗)か。
-      例外ではなくこのフラグで失敗を表し、verify が続行/終了を判断できる。
-    - ``returncode`` -- 子プロセスの終了コード(起動失敗・timeout では ``None``)。
-    - ``error`` -- 失敗時の簡潔なエラー本文(成功時は空文字)。
-    - ``stdout`` / ``stderr`` -- 子プロセスの生出力(デバッグ・再解析用)。
-    - ``command`` -- 実際に実行したコマンド(引数列)。
+    - ``text`` -- assistant response body. ``str(result)`` returns the same text.
+    - ``tokens`` -- total tokens consumed by this call, for budget accounting.
+    - ``failed`` -- whether the call failed (non-zero exit, CLI-reported error,
+      timeout, or launch failure). Failures are represented by this flag instead of
+      exceptions so verify can decide whether to continue or stop.
+    - ``returncode`` -- child process exit code (``None`` for launch failure/timeout).
+    - ``error`` -- concise error text on failure (empty on success).
+    - ``stdout`` / ``stderr`` -- raw child process output for debugging/re-parsing.
+    - ``command`` -- command that was actually executed, as an argument tuple.
 
-    具体実装は :class:`ActResultBase`(およびそれを継承する各アダプタの Result)。
+    Concrete implementations are :class:`ActResultBase` and Result classes that
+    inherit it.
 
-    注意: ``@runtime_checkable`` の ``isinstance`` 判定は **属性名の有無のみ** を見る
-    (型も値の妥当性も検査しない。``__str__`` は全オブジェクトが持つので判定に寄与
-    しない)。つまり「契約の構造的ドキュメント」であって入力バリデーションではない。
-    アダプタ作者は ``isinstance(result, ActResult)`` を「正しい Result である」証明と
-    して過信しないこと。
+    Note: ``@runtime_checkable`` ``isinstance`` checks only for the presence of
+    attribute names. It does not validate types or values, and ``__str__`` is present
+    on all objects, so it does not contribute to the check. Treat this as structural
+    contract documentation, not input validation. Adapter authors should not overtrust
+    ``isinstance(result, ActResult)`` as proof that a Result is valid.
     """
 
     text: str
@@ -75,18 +78,19 @@ class ActResult(Protocol):
     stderr: str
     command: tuple[str, ...]
 
-    def __str__(self) -> str:  # テキストとして使われたとき応答本文を返す。
+    def __str__(self) -> str:  # Return the response body when used as text.
         ...
 
 
 @dataclass
 class ActResultBase:
-    """:class:`ActResult` 契約を満たす共通の具体 dataclass(各アダプタの Result の基底)。
+    """Shared concrete dataclass satisfying the :class:`ActResult` contract.
 
-    全フィールドに既定値があるので、サブクラスは ``@dataclass`` を付けてドキュメント
-    文字列を足すだけでよく(フィールド再定義は不要)、``Result(text=..., tokens=...)``
-    のキーワード生成・``str(result)`` -> 本文 がそのまま使える。新しいアダプタの
-    Result もこれを継承すれば 8 フィールドの形が自動的に揃う。
+    All fields have defaults, so subclasses only need ``@dataclass`` plus their own
+    docstring; they do not need to redefine fields. Keyword construction such as
+    ``Result(text=..., tokens=...)`` and ``str(result)`` -> response body work as-is.
+    New adapter Result classes can inherit this to automatically share the same
+    8-field shape.
     """
 
     text: str = ""
@@ -98,19 +102,19 @@ class ActResultBase:
     stderr: str = ""
     command: tuple[str, ...] = ()
 
-    def __str__(self) -> str:  # テキストとして使われたとき応答本文を返す。
+    def __str__(self) -> str:  # Return the response body when used as text.
         return self.text
 
 
 def _format_fields(context: Any) -> dict[str, Any]:
-    """``prompt_template.format(**...)`` に渡す名前付きフィールドを context から作る。
+    """Build named fields from context for ``prompt_template.format(**...)``.
 
-    - Mapping -> そのままのキー(``{"prompt": ...}`` など)
-    - dataclass(例: :class:`~loop_agent.state.LoopState`)-> 各フィールド名
-      (``iteration`` / ``tokens_used`` / ``elapsed`` ... をテンプレートに埋められる)
-    - str -> ``{"prompt": <その文字列>}``(プロンプト直渡しの最短経路)
-    - それ以外で ``__dict__`` を持つ -> その属性
-    - 最後の保険 -> ``{"prompt": <context>}``
+    - Mapping -> existing keys, such as ``{"prompt": ...}``
+    - dataclass, for example :class:`~loop_agent.state.LoopState` -> field names, so
+      templates can reference ``iteration`` / ``tokens_used`` / ``elapsed`` / ...
+    - str -> ``{"prompt": <that string>}``, the shortest direct-prompt path
+    - anything else with ``__dict__`` -> its attributes
+    - final fallback -> ``{"prompt": <context>}``
     """
     if isinstance(context, Mapping):
         return dict(context)
@@ -124,16 +128,16 @@ def _format_fields(context: Any) -> dict[str, Any]:
 
 
 def render_prompt(template: str, context: Any) -> str:
-    """``template`` を context のフィールドで埋めて最終プロンプト文字列を返す。
+    """Fill ``template`` from context fields and return the final prompt string.
 
-    テンプレートが context に無いフィールドを参照していた場合は、何が無くて何が
-    使えるのかを示す :class:`KeyError` を送出する(既定の ``"{prompt}"`` に対して
-    ``prompt`` を渡し忘れた、といった取り違えをすぐ気付けるようにする)。
+    If the template references a field missing from context, raise :class:`KeyError`
+    showing what was missing and what fields were available. This makes mistakes such
+    as using the default ``"{prompt}"`` without passing ``prompt`` immediately obvious.
     """
     field_map = _format_fields(context)
     try:
         return template.format(**field_map)
-    except KeyError as exc:  # .format は欠落キーを KeyError(key) で投げる。
+    except KeyError as exc:  # .format raises missing keys as KeyError(key).
         missing = exc.args[0] if exc.args else exc
         raise KeyError(
             f"prompt_template {template!r} references {missing!r}, "
