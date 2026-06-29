@@ -115,6 +115,52 @@ def test_user_destination_is_home_local(tmp_path: Path, monkeypatch: pytest.Monk
     assert (dest / "SKILL.md").is_file()
 
 
+def test_target_agent_codex_destination_is_project_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    rc = main(["install-skills", "--target-agent", "codex"])
+    assert rc == 0
+    dest = tmp_path / ".codex" / "skills" / "loop-agent"
+    assert (dest / "SKILL.md").is_file()
+    assert _tree(dest) == _tree(_bundled_skill_dir())
+
+
+def test_target_agent_cursor_destination_is_project_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    rc = main(["install-skills", "--target-agent", "cursor"])
+    assert rc == 0
+    dest = tmp_path / ".cursor" / "skills" / "loop-agent"
+    assert (dest / "SKILL.md").is_file()
+    assert _tree(dest) == _tree(_bundled_skill_dir())
+
+
+def test_target_agent_user_destinations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    assert main(["install-skills", "--target-agent", "codex", "--user"]) == 0
+    assert main(["install-skills", "--target-agent", "cursor", "--user"]) == 0
+
+    assert (fake_home / ".codex" / "skills" / "loop-agent" / "SKILL.md").is_file()
+    assert (fake_home / ".cursor" / "skills" / "loop-agent" / "SKILL.md").is_file()
+    assert not (fake_home / ".cursor" / "skills-cursor" / "loop-agent").exists()
+
+
+def test_target_agent_all_installs_each_project_local_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    rc = main(["install-skills", "--target-agent", "all"])
+    assert rc == 0
+    for root in (".claude", ".codex", ".cursor"):
+        dest = tmp_path / root / "skills" / "loop-agent"
+        assert (dest / "SKILL.md").is_file()
+        assert _tree(dest) == _tree(_bundled_skill_dir())
+
+
+def test_target_agent_all_cannot_use_exact_target(tmp_path: Path) -> None:
+    rc = main(["install-skills", "--target-agent", "all", "--target", str(tmp_path / "x")])
+    assert rc == 2
+
+
 def test_user_and_target_are_mutually_exclusive() -> None:
     # argparse rejects the combination with a usage error (exit code 2).
     with pytest.raises(SystemExit) as exc:
@@ -128,4 +174,4 @@ def test_install_skills_help_lists_options(capsys: pytest.CaptureFixture[str]) -
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "install-skills" in out
-    assert "--user" in out and "--target" in out
+    assert "--user" in out and "--target" in out and "--target-agent" in out

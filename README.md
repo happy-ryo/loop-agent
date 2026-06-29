@@ -84,17 +84,20 @@ print(result.status, result.reason)   # goal_met / goal met
 
 動線 E（coding-agent driven）を library 側で公式に支援するため、coding agent（Claude Code / Cursor / Codex 等）が loop-agent を最適に使うための **load-on-demand reference bundle** を skill として同梱している。`SKILL.md`（trigger +「どう設計するか」の能動的指示）と `references/`（5 シーム / adapter の 4 か条 / safety / async / errors などの reference + 発想例）から成り、agent は必要な reference だけを on-demand で読んで user の domain に 5 シームを synthesize する。recipe を丸写しさせる cookbook ではなく、agent の synthesize 能力を活かす reference-bundled 設計。
 
-skill 本体は Python package に同梱（`loop_agent/skills/loop-agent/`）されるので、loop-agent のバージョンと skill が常に一致する。`pip install` 後、coding agent が探す `.claude/skills/` へ `install-skills` でコピーする:
+skill 本体は Python package に同梱（`loop_agent/skills/loop-agent/`）されるので、loop-agent のバージョンと skill が常に一致する。`pip install` 後、coding agent が探す skills directory へ `install-skills` でコピーする。既定は後方互換で Claude Code 向け:
 
 ```bash
 pip install loop-agent
-loop-agent install-skills                    # ./.claude/skills/loop-agent/ に配置（プロジェクトローカル・既定）
-loop-agent install-skills --user             # ~/.claude/skills/loop-agent/ に配置（ユーザーグローバル）
-loop-agent install-skills --target <path>    # 任意パスに配置
+loop-agent install-skills                                  # ./.claude/skills/loop-agent/ に配置（プロジェクトローカル・既定）
+loop-agent install-skills --user                           # ~/.claude/skills/loop-agent/ に配置（ユーザーグローバル）
+loop-agent install-skills --target-agent codex              # ./.codex/skills/loop-agent/ に配置
+loop-agent install-skills --target-agent cursor             # ./.cursor/skills/loop-agent/ に配置（.cursor/skills-cursor は使わない）
+loop-agent install-skills --target-agent all                # Claude / Codex / Cursor の project-local skills にまとめて配置
+loop-agent install-skills --target-agent cursor --user      # ~/.cursor/skills/loop-agent/ に配置
+loop-agent install-skills --target <path>                   # 任意パスに配置
 ```
 
-`install-skills` は idempotent（再実行で同梱内容に収束）。配置後は coding agent（Claude Code 等）を再起動すると skill が有効になる。
-
+`install-skills` は idempotent（再実行で同梱内容に収束）。配置後は対象の coding agent を再起動すると skill が有効になる。
 > **メンテナ向け**: `references/` の verbatim bundle 8 本は `docs/` から派生する。`docs/` を更新したら `python scripts/sync_skill_references.py` を実行して references を再生成しコミットする（`SKILL.md` / `design-philosophy.md` / `examples/` は手書きで対象外）。CI（`sync-skill-references`）が `--check` で同期を検証し、ズレていれば fail する。
 
 ## docs/ ナビゲーション

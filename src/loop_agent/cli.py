@@ -12,7 +12,7 @@ Subcommands::
     loop-agent status <run-id>
     loop-agent resume <run-id> ./task.toml
     loop-agent logs   <run-id> [--follow]
-    loop-agent install-skills [--user | --target PATH]
+    loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
     loop-agent                       # quick help + a sample task.toml
 
 ``act`` and ``verify`` each work in one of two modes (report.md R1):
@@ -769,13 +769,19 @@ def cmd_logs(args: argparse.Namespace, out: Any = None) -> int:
 
 # -- install-skills ----------------------------------------------------------
 
-# The reference-bundled Claude Code skill (Issue #73) ships *inside* the package
-# at ``loop_agent/skills/loop-agent/`` so ``pip install loop-agent`` carries it.
-# ``install-skills`` copies it into a ``.claude/skills/`` directory a coding
-# agent will discover. The library code itself never imports these files; they
-# are docs-for-the-agent, distributed with the library so the agent always sees
-# the version that matches the installed loop-agent.
+# The reference-bundled coding-agent skill (Issue #73) ships *inside* the
+# package at ``loop_agent/skills/loop-agent/`` so ``pip install loop-agent``
+# carries it. ``install-skills`` copies it into the selected coding agent's
+# skill discovery directory. The library code itself never imports these files;
+# they are docs-for-the-agent, distributed with the library so the agent always
+# sees the version that matches the installed loop-agent.
 SKILL_NAME = "loop-agent"
+SKILL_TARGET_CLAUDE = "claude"
+SKILL_TARGET_CODEX = "codex"
+SKILL_TARGET_CURSOR = "cursor"
+SKILL_TARGET_ALL = "all"
+SKILL_TARGETS = (SKILL_TARGET_CLAUDE, SKILL_TARGET_CODEX, SKILL_TARGET_CURSOR)
+SKILL_TARGET_CHOICES = (*SKILL_TARGETS, SKILL_TARGET_ALL)
 
 
 def _bundled_skill_dir() -> Path:
@@ -789,18 +795,47 @@ def _bundled_skill_dir() -> Path:
     return Path(__file__).resolve().parent / "skills" / SKILL_NAME
 
 
-def _resolve_skill_dest(args: argparse.Namespace) -> Path:
-    """Pick the install destination: --target wins, else --user home, else cwd.
+def _skill_dest_for_agent(agent: str, base: Path) -> Path:
+    """Return the default skill destination for one coding-agent surface."""
+    if agent == SKILL_TARGET_CLAUDE:
+        return base / ".claude" / "skills" / SKILL_NAME
+    if agent == SKILL_TARGET_CODEX:
+        return base / ".codex" / "skills" / SKILL_NAME
+    if agent == SKILL_TARGET_CURSOR:
+        # Cursor's built-in skills live under ~/.cursor/skills-cursor/ and are
+        # managed by Cursor itself. Personal/project skills belong in skills/.
+        return base / ".cursor" / "skills" / SKILL_NAME
+    raise ConfigError(
+        f"unknown skill target agent {agent!r}; expected one of {SKILL_TARGET_CHOICES}"
+    )
 
-    Default and ``--user`` both land at ``<base>/.claude/skills/loop-agent`` (the
-    layout Claude Code discovers); ``--target`` is taken as the exact directory
-    to write the skill into.
+
+def _resolve_skill_dest(args: argparse.Namespace) -> Path:
+    """Pick the install destination for the selected target agent.
+
+    ``--target`` is an exact destination directory and preserves the original
+    Claude-oriented behaviour. Without ``--target``, the selected target agent's
+    project-local or user-global skills directory is used.
     """
     if getattr(args, "target", None) is not None:
         return Path(args.target).expanduser()
     base = Path.home() if getattr(args, "user", False) else Path.cwd()
-    return base / ".claude" / "skills" / SKILL_NAME
+    agent = getattr(args, "target_agent", SKILL_TARGET_CLAUDE)
+    if agent == SKILL_TARGET_ALL:
+        raise ConfigError("--target-agent all cannot be resolved to a single path")
+    return _skill_dest_for_agent(agent, base)
 
+
+def _resolve_skill_dests(args: argparse.Namespace) -> list[tuple[str, Path]]:
+    """Return all install destinations requested by the CLI args."""
+    agent = getattr(args, "target_agent", SKILL_TARGET_CLAUDE)
+    if getattr(args, "target", None) is not None:
+        if agent == SKILL_TARGET_ALL:
+            raise ConfigError("--target cannot be combined with --target-agent all")
+        return [(agent, Path(args.target).expanduser())]
+    base = Path.home() if getattr(args, "user", False) else Path.cwd()
+    agents = SKILL_TARGETS if agent == SKILL_TARGET_ALL else (agent,)
+    return [(a, _skill_dest_for_agent(a, base)) for a in agents]
 
 def _installed_skill_name(skill_md: Path) -> Optional[str]:
     """Return the ``name:`` from a SKILL.md YAML frontmatter, or None.
@@ -823,17 +858,8 @@ def _installed_skill_name(skill_md: Path) -> Optional[str]:
     return None
 
 
-def cmd_install_skills(args: argparse.Namespace, out: Any = None) -> int:
-    out = sys.stdout if out is None else out
-    source = _bundled_skill_dir()
-    if not source.is_dir():
-        # A wheel that somehow dropped the data files would land here; fail with
-        # an actionable message rather than silently installing nothing.
-        raise ConfigError(
-            f"bundled skill not found at {source}; the installed loop-agent "
-            "package appears to be missing its skill data files."
-        )
-    dest = _resolve_skill_dest(args)
+def _install_skill_tree(source: Path, dest: Path) -> int:
+    """Install the bundled skill tree to ``dest`` and return copied file count."""
     if dest.exists():
         if not dest.is_dir():
             raise ConfigError(
@@ -857,14 +883,30 @@ def cmd_install_skills(args: argparse.Namespace, out: Any = None) -> int:
     # Fresh copy of the bundle. Re-running is idempotent: an existing install is
     # removed above, so the second run lands the same tree as the first.
     shutil.copytree(source, dest)
-    file_count = sum(1 for p in dest.rglob("*") if p.is_file())
-    print(f"installed loop-agent skill -> {dest} ({file_count} files)", file=out)
+    return sum(1 for p in dest.rglob("*") if p.is_file())
+
+
+def cmd_install_skills(args: argparse.Namespace, out: Any = None) -> int:
+    out = sys.stdout if out is None else out
+    source = _bundled_skill_dir()
+    if not source.is_dir():
+        # A wheel that somehow dropped the data files would land here; fail with
+        # an actionable message rather than silently installing nothing.
+        raise ConfigError(
+            f"bundled skill not found at {source}; the installed loop-agent "
+            "package appears to be missing its skill data files."
+        )
+    for agent, dest in _resolve_skill_dests(args):
+        file_count = _install_skill_tree(source, dest)
+        print(
+            f"installed loop-agent skill for {agent} -> {dest} ({file_count} files)",
+            file=out,
+        )
     print(
-        "restart your coding agent (e.g. Claude Code) to pick up the skill.",
+        "restart your coding agent to pick up the skill.",
         file=out,
     )
     return 0
-
 
 # -- argparse wiring ---------------------------------------------------------
 
@@ -904,7 +946,7 @@ Usage:
   loop-agent status <run-id> [--db PATH]
   loop-agent resume <run-id> ./task.toml [--db PATH]
   loop-agent logs   <run-id> [--follow] [--db PATH]
-  loop-agent install-skills [--user | --target PATH]
+  loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
 
 Run 'loop-agent <command> --help' for per-command options.
 
@@ -984,18 +1026,24 @@ def build_parser() -> argparse.ArgumentParser:
         "install-skills",
         help="copy the bundled loop-agent coding-agent skill into a skills dir",
     )
+    p_install.add_argument(
+        "--target-agent",
+        choices=SKILL_TARGET_CHOICES,
+        default=SKILL_TARGET_CLAUDE,
+        help="coding-agent skill surface to install for (default: claude)",
+    )
     dest = p_install.add_mutually_exclusive_group()
     dest.add_argument(
         "--user",
         action="store_true",
-        help="install into ~/.claude/skills/loop-agent (user-global) "
-        "instead of the project's .claude/skills/",
+        help="install into the selected agent's user-global skills directory "
+        "instead of the project-local skills directory",
     )
     dest.add_argument(
         "--target",
         default=None,
-        help="install into this exact directory instead of "
-        ".claude/skills/loop-agent",
+        help="install into this exact directory instead of the selected agent's "
+        "default skills directory",
     )
     p_install.set_defaults(func=cmd_install_skills)
 
