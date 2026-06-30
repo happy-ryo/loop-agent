@@ -96,3 +96,4 @@ print(end.payload["status"], end.payload["stop"], end.payload["reason"])
 - [README](../README.md) — 全体の入口と動線サマリ
 - [reflexion.md](./reflexion.md) — 外側 Reflexion ループの仕組み
 - [seams.md](./seams.md) — act / verify などのシーム詳細
+- [operations-roadmap.md](./operations-roadmap.md) — summary / spike detection / throttling / circuit breaker の運用 follow-up

@@ -124,6 +124,7 @@ from .memory import (
     step_signature,
 )
 from .observe import LoopObserver, run_observed_loop
+from .operations import LOOP_SPIKE, Spike, SpikeDetector, detect_spikes
 from .reflexion import (
     EpisodeOutcome,
     EpisodeRecord,
@@ -211,8 +212,12 @@ __all__ = [
     "LOOP_BEGIN",
     "LOOP_STEP",
     "LOOP_END",
+    "LOOP_SPIKE",
     "LoopObserver",
     "run_observed_loop",
+    "Spike",
+    "SpikeDetector",
+    "detect_spikes",
     "LoopSpan",
     "otel_available",
     # state SoT (report.md S3.4 / S4.6 / S5 Phase 2)

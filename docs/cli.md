@@ -1,4 +1,4 @@
-# CLI ランチャ (loop-agent run / status / resume / logs)
+# CLI ランチャ (loop-agent run / status / summary / resume / logs)
 
 宣言的な `task.toml` から `gather -> act -> verify -> repeat` ループを起動する stdlib（argparse）製の CLI（Issue #31）。`act` / `verify` は **(1) subprocess command** か **(2) Python callable**（`module:attr`）のどちらでも書ける。各反復は state.db SoT（`DBProgressLog`）へ永続化されるので、run-id で進捗確認・**resume**・event 追跡ができる。
 
@@ -15,6 +15,8 @@ loop-agent run ./examples/task.toml --max-iter 5 --timeout 600
 # iterations : 3 / tokens : 0 / elapsed : 0.123s
 
 loop-agent status <run-id>            # state.db の進捗（status/iterations/tokens/stop 理由/pending）
+loop-agent summary                    # state.db 内の run 一覧（read-only）
+loop-agent summary --db loop-state.db --limit 10
 loop-agent resume <run-id> ./examples/task.toml   # 中断ループを途中から再開（復元 state を seed）
 loop-agent logs <run-id>              # LoopObserver の event（loop_begin/step/end）を表示
 loop-agent logs <run-id> --follow     # 新規 event を loop_end まで追尾（tail -f 風）
@@ -56,6 +58,7 @@ command = ["pytest", "-q"]
 - **必ず止まる条件を 1 つ以上**（R3）: `max_iterations` / `timeout_seconds` は必ず発火する。`token_budget` 単独は「トークンが毎ステップ増える」場合のみ有効（subprocess act では `cost_per_step > 0` が必要・既定 0 では発火しないため拒否）。`no_progress` 単独は同一行動の反復に依存し保証されないため拒否。いずれも満たさない設定は `ConfigError`（終了コード 2）。
 - **終了コード**: ゴール到達（`result.succeeded`）で `0`、ハード上限などで停止すると `1`、設定/使用法エラーは `2`（メッセージは stderr）。
 - **db は複数 run を 1 ファイルに保持**し run-id で識別する。`--db` で明示でき、既定は `[state].db`、無ければ `loop-state.db`。
+- **summary は read-only**: `loop-agent summary` は run 一覧・停止理由・pending 数・event 数を読むだけで、run 状態や判断ロジックは変更しない。
 - **subprocess の act/verify には必ず有限の timeout が掛かる**（`[act]`/`[verify]`.`timeout_seconds` > ループ `timeout_seconds` > 既定 3600s）。停止条件は反復境界でのみ評価され実行中ステップは中断しないため、無制限の subprocess が hang すると全 cap を無効化してしまうのを防ぐ。
 - `--help` の文字列は ASCII のみ（cp932 コンソールでもクラッシュしない）。
 

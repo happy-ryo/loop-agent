@@ -483,6 +483,47 @@ def test_cmd_status_missing_db(tmp_path, capsys):
     assert not (tmp_path / "nope.db").exists()
 
 
+def test_cmd_summary(tmp_path, capsys):
+    db = str(tmp_path / "summary.db")
+    main(["run", str(_run_toml(tmp_path, run_id="s1", db=db, max_iter=1,
+                               verify_exit=1))])
+    capsys.readouterr()
+    main(["run", str(_run_toml(tmp_path, run_id="s2", db=db, max_iter=1,
+                               verify_exit=0))])
+    capsys.readouterr()
+
+    rc = main(["summary", "--db", db])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "runs       : 2" in out
+    assert "s1" in out and "stopped" in out
+    assert "s2" in out and "goal_met" in out
+    assert "events" in out
+
+
+def test_cmd_summary_empty_db(tmp_path, capsys):
+    db = tmp_path / "empty.db"
+    conn = connect(db)
+    conn.close()
+    rc = main(["summary", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "runs       : 0" in out
+
+
+def test_cmd_summary_missing_db_and_bad_limit(tmp_path, capsys):
+    rc = main(["summary", "--db", str(tmp_path / "nope.db")])
+    assert rc == 2
+    assert "state.db not found" in capsys.readouterr().err
+
+    db = tmp_path / "bad-limit.db"
+    conn = connect(db)
+    conn.close()
+    rc = main(["summary", "--db", str(db), "--limit", "0"])
+    assert rc == 2
+    assert "--limit must be >= 1" in capsys.readouterr().err
+
+
 def test_cmd_resume_continues(tmp_path, capsys):
     # Pin that resume *continues* from the persisted iteration rather than
     # restarting at 0. A counting act lets us tell the two apart: the iteration
