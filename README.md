@@ -25,9 +25,9 @@ loop-agent は任意のエージェント / アプリに `pip install` で組み
 
 ## いつ使うか / 使わないか
 
-loop-agent が向いているのは、既存の CLI / Web アプリ / MCP サーバー / cron / coding-agent harness の内側に、**境界付きの反復・ground-truth verify・状態永続化・人間ゲート**を足したい場合。policy は呼び出し側が持ち、loop-agent は停止・記録・再開・配送・観測のランタイムを担当する。
+loop-agent が向いているのは、既存の CLI / Web アプリ / MCP サーバー / cron / coding-agent harness の内側に、**境界付きの反復・ground-truth verify・状態永続化・人間ゲート・運用観測**を足したい場合。policy は呼び出し側が持ち、loop-agent は停止・記録・再開・配送・観測・read-only dashboard のランタイムを担当する。
 
-向いていないのは、ホスト済み agent 製品、サンドボックス実行環境、ダッシュボード、全体オーケストレーション UI、あるいは成功判定を機械的に書けない曖昧なタスクを求める場合。0.1.0 は Beta のライブラリであり、dashboard / 自動スロットル / circuit breaker は [operations roadmap](./docs/operations-roadmap.md) の follow-up として扱う。
+向いていないのは、ホスト済み agent 製品、サンドボックス実行環境、全体オーケストレーション UI、あるいは成功判定を機械的に書けない曖昧なタスクを求める場合。0.1.0 は Beta のライブラリであり、`summary` / 静的 HTML dashboard / spike scan / circuit breaker / opt-in throttling helper は備えるが、Grafana 等の外部運用基盤や事業固有の閾値 policy は呼び出し側に置く。
 
 ## シーム — policy を注入する 5 つの口
 
@@ -118,19 +118,19 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/persistence-and-resume.md](./docs/persistence-and-resume.md) | 永続化と再開（progress file / state.db SoT / resume #14） |
 | [docs/safety.md](./docs/safety.md) | 安全装置（暴走防止 / 限定人間ゲート / 安全テンプレ） |
 | [docs/observability.md](./docs/observability.md) | 観測（loop events / OTel span / 外側 Reflexion 観測） |
-| [docs/operations-roadmap.md](./docs/operations-roadmap.md) | 運用 follow-up（dashboard / throttling / circuit breaker） |
+| [docs/operations-roadmap.md](./docs/operations-roadmap.md) | 運用（summary / dashboard / spike scan / throttling / circuit breaker） |
 | [docs/async.md](./docs/async.md) | async/await 対応（`async_run_loop`） |
 | [docs/transport.md](./docs/transport.md) | wake 配送 transport と work-discovery / WorkListGather |
 | [docs/reflexion.md](./docs/reflexion.md) | 外側 Reflexion ループ + RQGM epoch 安全核 |
 | [docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md) | Reflexion を使うべきか・blind retry で足りるかの判断 |
-| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`loop-agent run / status / resume / logs`） |
+| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`run / status / summary / dashboard / spikes / resume / logs`） |
 | [docs/api-reference.md](./docs/api-reference.md) | 全 API 概要表 + ループコアのスコープ + テスト |
 | [docs/errors.md](./docs/errors.md) | 例外階層（`LoopError` / `ConfigError` / `StateError`）と捕捉 |
 | [docs/releasing.md](./docs/releasing.md) | リリース手順 |
 
 ## 現在のステータス
 
-**0.1.0 Beta**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。残る運用面（dashboard・自動スロットル・circuit breaker 等）は [operations roadmap](./docs/operations-roadmap.md) の follow-up。各機能の詳細は上の docs/ ナビゲーションから辿れる。
+**0.1.0 Beta**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。運用面も read-only `summary` / 静的 HTML `dashboard` / post-hoc `spikes` scan / `SpikeDetector` / circuit breaker `StopCondition` helpers / opt-in throttling helpers まで実装済み。各機能の詳細は上の docs/ ナビゲーションから辿れる。
 
 ## 成果物
 
@@ -140,6 +140,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [`report.html`](./report.html) | 同内容の閲覧用単一 HTML（CSS インライン・ブラウザで直接開ける） |
 | [`src/loop_agent/`](./src/loop_agent) | ループコア（ループドライバ + 合成可能 stop 条件 + 各シーム実装） |
 | [`examples/`](./examples) | 検証駆動デモ / 観測デモ / Reflexion デモの実走スクリプト |
+| `loop-agent summary` / `dashboard` / `spikes` | state.db を読む read-only operations CLI（run 一覧 / 静的 HTML / spike scan） |
 
 レポートは Loop Engineering / LoopAgent の徹底調査（用語・系譜・第一世代の教訓・プロダクション harness・フレームワーク比較・ループ制御と安全性）、claude-org-ja 資産棚卸し、3 案比較に基づく設計（案 C 推奨）、段階ロードマップ（PoC → MVP → 本格）を含む。正本は `report.md`。
 

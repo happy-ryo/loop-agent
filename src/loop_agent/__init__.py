@@ -124,7 +124,22 @@ from .memory import (
     step_signature,
 )
 from .observe import LoopObserver, run_observed_loop
-from .operations import LOOP_SPIKE, Spike, SpikeDetector, detect_spikes
+from .operations import (
+    LOOP_SPIKE,
+    AdapterFailureBreaker,
+    LaunchThrottleDecision,
+    PerStepTokenCap,
+    Spike,
+    SpikeDetector,
+    TimeoutMarkerBreaker,
+    VerifyDetailBreaker,
+    detect_spikes,
+    launch_throttle_decision,
+    render_dashboard_html,
+    scan_spikes,
+    state_from_steps,
+    step_throttle,
+)
 from .reflexion import (
     EpisodeOutcome,
     EpisodeRecord,
@@ -218,6 +233,16 @@ __all__ = [
     "Spike",
     "SpikeDetector",
     "detect_spikes",
+    "scan_spikes",
+    "state_from_steps",
+    "render_dashboard_html",
+    "AdapterFailureBreaker",
+    "VerifyDetailBreaker",
+    "TimeoutMarkerBreaker",
+    "PerStepTokenCap",
+    "LaunchThrottleDecision",
+    "launch_throttle_decision",
+    "step_throttle",
     "LoopSpan",
     "otel_available",
     # state SoT (report.md S3.4 / S4.6 / S5 Phase 2)

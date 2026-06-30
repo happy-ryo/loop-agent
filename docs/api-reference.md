@@ -50,7 +50,9 @@ python3 -m pip install -e .[dev]   # + pytest（テスト実行用）
 | `ListSink` / `JsonlEventSink(path)` / `CallableSink(fn)` | event sink（in-memory / journal 風 JSONL / 任意関数アダプタ） |
 | `read_events(path)` | JSONL イベントを読み戻す（末尾の途中書きクラッシュ行は許容、途中の破損行は送出） |
 | `LoopSpan` / `otel_available()` | OTel GenAI span の薄いラッパ（未導入なら no-op）/ OTel 利用可否 |
-| `SpikeDetector(sinks, *, token_window=…, latency_window=…, multiplier=…, repeated_failure=…)` / `detect_spikes(state, …)` / `LOOP_SPIKE` | opt-in の運用 spike 検出。`on_step` observer として token / latency / repeated failure / timeout marker を `loop_spike` event へ emit する。**制御は変えない**（止めるかは別 StopCondition / application policy） |
+| `SpikeDetector(sinks, *, token_window=…, latency_window=…, multiplier=…, repeated_failure=…)` / `detect_spikes(state, …)` / `scan_spikes(steps, …)` / `LOOP_SPIKE` | opt-in の運用 spike 検出。live `on_step` observer または保存済み step scan として token / latency / repeated failure / timeout marker を検出する。**制御は変えない**（止めるかは別 StopCondition / application policy） |
+| `AdapterFailureBreaker(repeat)` / `VerifyDetailBreaker(repeat)` / `TimeoutMarkerBreaker(repeat)` / `PerStepTokenCap(limit)` | よく使う circuit breaker の `StopCondition` helper。adapter failure / verify detail / timeout marker / per-step spend を明示 policy として止める |
+| `launch_throttle_decision(...)` / `step_throttle(act, delay_seconds, sleep)` | opt-in throttling primitives。launch 判定は純粋関数、step throttling は注入された `sleep` を明示的に呼ぶ wrapper。`run_loop` 既定挙動は変えない |
 | `connect(path)` | loop 用 state DB を開き（無ければ作り）最小スキーマを適用した接続を返す（`":memory:"` 可） |
 | `LoopStore(conn)` | state.db の writer/reader。`transaction()`（atomic）/ `load_or_init(run_id)`（新規は空・既存は復元 = resume seed）/ `record_step` / `record_result` / `read_steps` / `read_events` / `get_run` / `get_stop_reason` / `request_decision` / `resolve_decision` / `get_decision` / `list_pending_decisions` / `claim_execution`（単一プロセス at-most-once）/ `acquire_lease` / `complete_execution`（複数プロセス同時 resume の in-progress リース, #21） |
 | `DBProgressLog(db, run_id)` | DB-backed の進捗記録。`ProgressLog` 互換の `on_step` / `record_result` を持つ drop-in（path か既存接続を受ける context manager）。`.state` が復元した `LoopState`（resume の seed） |
@@ -96,6 +98,8 @@ python3 -m pip install -e .[dev]   # + pytest（テスト実行用）
 | `cli.build_act(cfg)` / `cli.build_verify(cfg)` | act/verify フックを構築。subprocess（`{prompt}`/`{goal}`/`{iteration}` 置換・exit-code 0 = goal）か Python callable（`module:attr`）の両モード |
 | `cli.resolve_callable(spec)` | `module:attr`（または `module.attr`）参照を callable へ解決（Python モード用） |
 | `loop-agent summary [--db PATH] [--limit N]` | `state.db` の read-only run 一覧。run id / status / iterations / tokens / elapsed / pending 数 / event 数 / stop reason を表示する（判断ロジックは変更しない） |
+| `loop-agent dashboard --output PATH [--db PATH]` | `state.db` から read-only 静的 HTML dashboard を生成する。run list / step timeline / pending decisions / Reflexion summary を表示 |
+| `loop-agent spikes [run-id] [--db PATH]` | 保存済み step から token / latency / repeated failure / timeout marker spike を post-hoc scan する |
 
 - `conditions` は stop 条件のリスト（または `AnyOf`）。**宣言順**に OR 評価し、最初に発火したものを `result.stop` として報告する。
 - 終了条件は**各反復の先頭（while ガード）で評価**される。`TokenBudget` / `Timeout` は反復境界での判定で、実行中のステップは中断しないため、1 ステップ分だけ上限を超過しうる（消費済みのトークン・時間は取り消せない = "使い切ったら新規ステップを始めない"意味）。
