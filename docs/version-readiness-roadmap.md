@@ -61,3 +61,11 @@ loop-agent logs version-readiness-issues-final
 
 The task uses deterministic local hooks in `scripts/version_readiness_harness.py`.
 It does not change release state; it records an audit trail in `loop-state.db`.
+
+## LLM-act Smoke Audit
+
+- Run id: `claude-llm-act-version-readiness-smoke`
+- Act adapter: `ClaudeCodeAct`
+- Scope: one documentation-only edit (this section)
+- Purpose: verify that an LLM-backed LoopAgent act step can make a real
+  workspace change
