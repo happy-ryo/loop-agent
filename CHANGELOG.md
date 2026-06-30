@@ -17,6 +17,8 @@
   first stable release.
 - **Version-readiness dogfood loop**: added deterministic loop-agent tasks that
   verify the version-readiness issue plan and the issue-consumption gate.
+- **Review-driven release check**: added an optional review-loop recipe and
+  repository-maintenance script for post-act review before final verification.
 
 ### Changed
 

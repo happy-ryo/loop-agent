@@ -41,6 +41,30 @@ documented behavior. External provider CLI output can still change outside this
 project; adapter parsers are maintained on a best-effort basis with regression
 tests for known schemas.
 
+## Complete Top-level Export Classification
+
+Every symbol in `loop_agent.__all__` is classified here. A new top-level export
+must be added to one of these rows before release.
+
+| Classification | Symbols |
+|---|---|
+| Core loop driver | `run_loop`, `async_run_loop`, `ActOutcome`, `VerifyOutcome`, `LoopResult` |
+| Core state | `LoopState`, `StepRecord` |
+| Core stop conditions | `AnyOf`, `StopCondition`, `StopTrigger`, `MaxIterations`, `TokenBudget`, `Timeout`, `GoalMet`, `GoalCheck`, `NoProgress` |
+| Per-call timeout | `TimeoutPolicy`, `SeamTimeout`, `UnsupportedTimeoutKill`, `TIMEOUT_GRACEFUL`, `TIMEOUT_KILL`, `ACT_TIMEOUT_OBSERVATION`, `VERIFY_TIMEOUT_OBSERVATION` |
+| Persistence | `ProgressLog`, `read_progress`, `connect`, `LoopStore`, `DBProgressLog` |
+| Human gate | `ActionGate`, `GateReview`, `HumanGate`, `Decision`, `run_gated_loop`, `DECISION_KINDS` |
+| Observability | `LoopEvent`, `EventSink`, `ListSink`, `CallableSink`, `JsonlEventSink`, `read_events`, `LOOP_BEGIN`, `LOOP_STEP`, `LOOP_END`, `LOOP_SPIKE`, `LoopObserver`, `run_observed_loop` |
+| Operations helpers | `Spike`, `SpikeDetector`, `detect_spikes`, `scan_spikes`, `state_from_steps`, `render_dashboard_html`, `AdapterFailureBreaker`, `VerifyDetailBreaker`, `TimeoutMarkerBreaker`, `PerStepTokenCap`, `LaunchThrottleDecision`, `launch_throttle_decision`, `step_throttle` |
+| OpenTelemetry helpers | `LoopSpan`, `otel_available`, `ReflexionSpan` |
+| Notifications | `Notifier`, `ApprovalRequest`, `ApprovalDescriber`, `Redaction`, `redact_payload`, `DEFAULT_SENSITIVE_KEY_PARTS`, `REDACTED`, `WebhookNotifier`, `SlackNotifier`, `EmailNotifier`, `ConsoleNotifier`, `MultiNotifier` |
+| Reflexion driver | `run_reflexion`, `ReflexionContext`, `ReflexionState`, `ReflexiveResult`, `EpisodeRecord`, `EpochRecord`, `EpisodeOutcome`, `ReflexionStore`, `DBReflexionLog`, `ReflexionObserver`, `run_observed_reflexion` |
+| Reflexion events | `REFLEXION_BEGIN`, `EPISODE_BEGIN`, `EPISODE_END`, `LESSON_DECISION`, `EPOCH_BOUNDARY`, `REFLEXION_END` |
+| Evaluator and memory | `Score`, `GroundTruthSignal`, `Evaluator`, `Probe`, `HeldOut`, `agreement`, `admit_evaluator`, `AdmissionResult`, `Lesson`, `LessonVerdict`, `EpisodicMemory`, `default_admit`, `step_signature`, `OuterState`, `MaxEpisodes`, `RubricThreshold`, `ScorePlateau`, `ReflectionBudget`, `EvaluatorUpdateBudget`, `is_success_condition` |
+| Transport and wakes | `Wake`, `WAKE_LOOP_DONE`, `WAKE_NEXT_ITERATION`, `WAKE_DECISION_REQUEST`, `WAKE_KINDS`, `PushBackend`, `CallablePushBackend`, `NullPushBackend`, `WakeQueue`, `InMemoryWakeQueue`, `SqliteWakeQueue`, `RedisWakeQueue`, `open_wake_queue`, `Transport`, `CADENCE_SECONDS`, `DEFAULT_CADENCE_SECONDS`, `cadence_for`, `due_to_poll`, `LoopWaker`, `wakes_for_result`, `wake_id_for` |
+| Work discovery | `Candidate`, `BlockedCandidate`, `Triage`, `triage`, `Proposal`, `AdoptionResult`, `WorkDiscovery`, `discover_next`, `WorkItem`, `WorkListGather`, `WorkListProgress`, `WorkListDrained`, `ScheduleContext`, `Scheduler`, `Drained`, `DRAINED` |
+| Errors | `LoopError`, `ConfigError`, `StateError`, `AsyncSeamInSyncLoop` |
+
 ## Explicit Non-Contracts
 
 - Human-readable CLI formatting is best-effort unless a document says otherwise.

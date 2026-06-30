@@ -62,10 +62,15 @@ loop-agent logs version-readiness-issues-final
 The task uses deterministic local hooks in `scripts/version_readiness_harness.py`.
 It does not change release state; it records an audit trail in `loop-state.db`.
 
-## LLM-act Smoke Audit
+## Review-driven Follow-up
 
-- Run id: `claude-llm-act-version-readiness-smoke`
-- Act adapter: `ClaudeCodeAct`
-- Scope: one documentation-only edit (this section)
-- Purpose: verify that an LLM-backed LoopAgent act step can make a real
-  workspace change
+LLM-backed `act` steps should be reviewed before merge. The current stable core
+does not have a first-class post-act `review` seam yet; use the optional pattern
+in `docs/recipes/review-driven-loop.md` until Issue #128 decides whether to add a
+public `ReviewHook` / `ReviewOutcome` API.
+
+This release PR can be review-checked with:
+
+```bash
+python scripts/review_version_readiness_pr.py
+```

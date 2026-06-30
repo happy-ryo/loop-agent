@@ -87,7 +87,31 @@ def test_core_stable_imports_are_available_from_top_level():
     assert names <= set(loop_agent.__all__)
 
 
+def test_every_top_level_export_is_classified_in_stability_docs():
+    stability = _read("docs/stability.md")
+    missing = [
+        name for name in loop_agent.__all__
+        if f"`{name}`" not in stability
+    ]
+    assert missing == []
+
+
 def test_changelog_compare_links_are_consistent():
     changelog = _read("CHANGELOG.md")
     assert re.search(r"\[Unreleased\]: .*/compare/v1\.0\.0\.\.\.HEAD", changelog)
     assert re.search(r"\[1\.0\.0\]: .*/compare/v0\.1\.0\.\.\.v1\.0\.0", changelog)
+
+
+def test_review_followup_is_reproducible_not_one_off_local_artifact():
+    roadmap = _read("docs/version-readiness-roadmap.md")
+    recipe = _read("docs/recipes/review-driven-loop.md")
+    gitignore = _read(".gitignore")
+
+    assert "claude-llm-act-version-readiness-smoke" not in roadmap
+    assert "LLM-act Smoke Audit" not in roadmap
+    assert "review-driven-loop.md" in roadmap
+    assert "Issue #128" in roadmap
+    assert "HumanGate" in recipe
+    assert "ReviewHook" in recipe
+    assert "loop-state.db" in gitignore
+    assert "loop-state.db-*" in gitignore
