@@ -14,6 +14,7 @@
 | [translation.md](./translation.md) | docstring/コメントの一括翻訳（N ファイル） | 翻訳対象に対象言語が 0 + AST 不変 + 当該テスト pass |
 | [refactor.md](./refactor.md) | 挙動不変リファクタ（N module） | 既存テスト全 pass + AST レベルで挙動同値 |
 | [multi-item-work-list.md](./multi-item-work-list.md) | N 件を 1 本のループで公平に回す（横断） | （上記各 recipe の verify をそのまま per-item 適用） |
+| [self-maintenance.md](./self-maintenance.md) | loop-agent 自身の小さな整合性修正 | stale wording scan + docs link + pytest |
 
 > 「このタスクは loop-agent に向いているか?」の最初のフィルタは **verify が sharp に書けるか**。書けないタスク（「もっと良い文章にして」等、機械判定できない目標）は coding agent 側で triage 除外するのが規律です。
 

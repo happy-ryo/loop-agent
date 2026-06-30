@@ -1,7 +1,8 @@
-"""loop-agent PoC loop core.
+"""loop-agent embeddable loop runtime.
 
-A minimal, single-process ``gather -> act -> verify -> repeat`` driver with
-composable, reason-bearing stop conditions. See report.md S4.4 / S5 Phase 1.
+Public API for a bounded ``gather -> act -> verify -> repeat`` loop engine with
+composable stop conditions, persistence/resume, observability, human gates,
+Reflexion, transport, work discovery, and CLI/adapters.
 
 Quick start::
 

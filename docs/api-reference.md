@@ -1,27 +1,27 @@
 # API リファレンス
 
-LoopAgent が公開する API の索引ページ。ループコア（PoC）のスコープ、インストール手順、エクスポートされる全要素の一覧表、テストスイートのカバレッジをまとめる。
+LoopAgent が公開する API の索引ページ。0.1.0 Beta のスコープ、インストール手順、エクスポートされる全要素の一覧表、テストスイートのカバレッジをまとめる。
 
-## ループコア（PoC）のスコープ
+## 0.1.0 Beta のスコープ
 
-report.md §4.4 / §5 Phase 1 に忠実な最小実装。**単一エージェント・単一プロセス**で `gather → act → verify → repeat` を回し、**合成可能なハード上限**（`MaxIterations` / `TokenBudget` / `Timeout`）を OR 評価する。上限到達は**例外ではなく理由付きの制御出力**（`LoopResult`）で返る。
+report.md §4.4 から始まったループコアを、組み込み用 Beta ランタイムとして拡張した実装。**単一エージェント・単一プロセス**で `gather → act → verify → repeat` を回し、**合成可能なハード上限**（`MaxIterations` / `TokenBudget` / `Timeout`）を OR 評価する。上限到達は**例外ではなく理由付きの制御出力**（`LoopResult`）で返る。
 
 スコープ（欲張らない = *simpler loops win*）:
 
 - ✅ ループドライバ + 機械的な合成 stop 条件（発火した条件と理由を保持）
-- ✅ `act` / `verify` は**注入可能なフック**（PoC は in-memory スタブで駆動。LLM 実呼び出しは抽象境界のみ用意）
+- ✅ `act` / `verify` は**注入可能なフック**（in-memory 関数 / subprocess / Claude Code / Codex / 自作 adapter を同じシームに載せる）
 - ✅ **暴走防止の保証**: ゴール未達・無進捗・反復アクションでも、上限で必ず停止することを sandbox test で証明（`tests/test_runaway_guard.py`）
 - ✅ **二重終了条件（意味的 stop）**: 機械的上限に加え、`GoalMet`（検証可能ゴールの達成＝成功終了）と `NoProgress`（無進捗・反復アクションの検出＝打ち切り）を同じ `AnyOf` 合成に載せる
 - ✅ **最小状態（進捗ファイル）**: 各反復の記録を JSON Lines で外部ファイルに追記し、プロセスをまたいで進捗が残る（`ProgressLog` / state.db SoT の最小の前身）
 - ✅ **観測（構造化イベント + OTel span）**: `loop_begin/step/end` を sink へ流し、終了理由/メトリクスを事後解析できる（`run_observed_loop` / OTel GenAI span）
-- ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11 / MVP の基盤）
+- ✅ **ループ状態の SoT（state.db）**: loop 用最小 SQLite スキーマ（`run` / `step` / `event` / `stop_reason`）に各 step を **transaction で atomic 永続化**。`DBProgressLog` は `ProgressLog` の drop-in（Issue #11）
 - ✅ **中断 → 再開（resume）**: 永続化済み step から `LoopState` を復元し、`run_loop(initial_state=…)` で状態欠落なく途中から継続（iteration・コスト累積・`elapsed`・history を引き継ぐ）。中断して再開した結果が通し実行と一致することを回帰テストで実証（`tests/test_resume.py` / Issue #14）
 - ✅ **async/await 対応**: 非同期エントリポイント `async_run_loop`（`await async_run_loop(…)`）。同期 API `run_loop` は完全維持（内部は `asyncio.run` ラッパ）。`gather`/`act`/`verify`/`conditions`/`gate`/`on_step` の各シームは **同期 callable のまま受けつつ非同期（acallable）も受ける**（混在可・同期フックは追加コストなし）。`asyncio.gather` で複数ループを並行実行できる（`tests/test_async_loop.py` / Issue #40）
 - ✅ **限定人間ゲート**: 不可逆操作のみ approve/edit/reject/respond で interrupt（state 永続化で pause/resume・不可逆は exactly-once。Issue #15）
 - ✅ **複数プロセス同時 resume の協調（in-progress リース）**: 同一 `run_id` を複数プロセスで同時に resume しても、不可逆 action は **exactly-once + 順序整合**（`pending → resolved → executing → executed` 多段化 + リース single-winner）。敗者は `executed` まで pause、勝者クラッシュ時はリース失効で別プロセスが取り直し step も欠落しない。並行プロセス模擬で実証（`tests/test_concurrent_resume.py` / Issue #21）
 - ✅ **wake 配送 transport / 次反復入力選定 work-discovery**: 完了/次反復/判断要求 wake を push 一次 / pull fallback で配送（`tests/test_transport.py` / Issue #23）。次反復対象を計算層（決定的 triage）+ 配達層（propose-only 人間ゲート）で選定（`tests/test_discovery.py` / Issue #24）
 - ✅ **外側 Reflexion ループ + RQGM epoch 安全核**: 内側 ReAct を 1 episode として包み、失敗からの言語的指針を episodic memory へ取り込み次 context へ配線する self-improving（report.md §5 Phase 3 / Issue #22。下記）
-- ⛔ dashboard 化・3x スパイク自動スロットル・サーキットブレーカ・外側ループ永続化は**非スコープ**（report.md §5 Phase 3 残り / Issue #4）
+- ⛔ dashboard 化・3x スパイク自動スロットル・サーキットブレーカは**運用 follow-up**（[operations-roadmap.md](./operations-roadmap.md)）
 
 ## インストール
 
