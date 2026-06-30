@@ -25,6 +25,30 @@ loop-agent を PyPI へリリースする手順と方針をまとめる。発行
 「公開 API」とは `loop_agent/__init__.py` の `__all__` でエクスポートされる
 シンボルを指す。
 
+### 1.0.0 以降の互換性
+
+`1.0.0` 以降は [stability.md](./stability.md) を安定契約の正本とする。
+
+- 公開 API の削除・改名・非互換なシグネチャ変更は MAJOR。
+- 後方互換の機能追加・新 option・新 helper は MINOR。
+- bug fix・docs・内部改善・後方互換な metadata 修正は PATCH。
+- CLI のサブコマンド名・終了コード・TOML の主要キーは安定契約に含む。
+- state.db の非破壊 migration は MINOR/PATCH、既存 DB の読み取り互換を壊す変更は MAJOR。
+
+破壊変更は、可能な限り minor release で deprecation を告知し、後続 major release で削除する。安全性や正しさのために旧挙動を維持できない場合は、CHANGELOG に理由と移行手順を書く。
+
+### 1.0.0 release gate
+
+`1.0.0` を切る前に次を満たす:
+
+- README から [stability.md](./stability.md) が辿れる。
+- `pyproject.toml` classifier が `Development Status :: 5 - Production/Stable`。
+- `pyproject.toml` / `loop_agent.__version__` / `CHANGELOG.md` / tag が同一 version。
+- `python -m pytest` が pass。
+- `python -m build` が pass。
+- `python -m twine check dist/*` が pass。
+- `python scripts/verify_wheel_skill_bundle.py` が pass。
+
 ## 単一の version source
 
 version は 2 箇所に書く。リリース前に**必ず一致**させる:
@@ -50,8 +74,8 @@ version は 2 箇所に書く。リリース前に**必ず一致**させる:
 
    ```bash
    git checkout main && git pull
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v1.0.0
+   git push origin v1.0.0
    ```
 
    これは**人間が判断して行う最終ゲート**。タグ push が publish の引き金になる。

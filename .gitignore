@@ -8,3 +8,4 @@ dist/
 .pytest_cache/
 .venv/
 venv/
+loop-state.db

@@ -1,13 +1,13 @@
-# Operations Roadmap
+# Operations
 
-loop-agent 0.1.0 は、ループの判断ロジックを変えずに外へ出す **emit 層**を持つ:
+loop-agent 1.0.0 は、ループの判断ロジックを変えずに外へ出す **emit 層**と、その上に載る read-only / opt-in の運用 helper を持つ:
 
 - `loop_begin` / `loop_step` / `loop_end` の構造化イベント
 - 外側 Reflexion の `episode_*` / `epoch_boundary` / `lesson_decision`
 - OTel GenAI span
 - `state.db` の run / step / event / stop_reason
 
-このページは、その上に載せる運用機能をまとめる。ここで扱うものは loop core の必須条件ではなく、長時間運用や複数 loop 運用で必要になる policy / UI / 自動制御である。
+このページは、その上に載る運用機能をまとめる。ここで扱うものは loop core の必須条件ではなく、長時間運用や複数 loop 運用で必要になる policy / UI / 自動制御である。summary / dashboard / spike scan / common circuit breaker helpers / throttling primitives は実装済みで、事業固有の閾値や外部 observability 基盤は呼び出し側の policy として残る。
 
 ## Dashboard
 
