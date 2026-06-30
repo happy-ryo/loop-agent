@@ -11,6 +11,8 @@ Subcommands::
     loop-agent run ./task.toml [--max-iter N] [--token-budget N] [--timeout S]
     loop-agent status <run-id>
     loop-agent summary [--db PATH] [--limit N]
+    loop-agent dashboard --output dashboard.html [--db PATH]
+    loop-agent spikes [<run-id>] [--db PATH]
     loop-agent resume <run-id> ./task.toml
     loop-agent logs   <run-id> [--follow]
     loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
@@ -52,6 +54,7 @@ from .errors import ConfigError
 from .events import JsonlEventSink
 from .loop import ActOutcome, LoopResult, VerifyOutcome
 from .observe import run_observed_loop
+from .operations import render_dashboard_html, scan_spikes
 from .store import LoopStore, connect
 from .store import DBProgressLog
 
@@ -781,6 +784,127 @@ def cmd_summary(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+def _table_exists(conn: Any, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def cmd_dashboard(args: argparse.Namespace, out: Any = None) -> int:
+    """Export a standalone read-only HTML dashboard from state.db."""
+    out = sys.stdout if out is None else out
+    db_path = args.db or DEFAULT_DB
+    _require_existing_db(db_path)
+    conn = connect(db_path)
+    try:
+        store = LoopStore(conn)
+        runs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM run ORDER BY updated_at DESC, started_at DESC"
+            ).fetchall()
+        ]
+        steps_by_run = {run["run_id"]: store.read_steps(run["run_id"]) for run in runs}
+        pending_by_run = {
+            run["run_id"]: [
+                row
+                for row in (
+                    store._decode_decision(r)
+                    for r in conn.execute(
+                        "SELECT * FROM pending_decision WHERE run_id = ? "
+                        "ORDER BY id",
+                        (run["run_id"],),
+                    ).fetchall()
+                )
+            ]
+            for run in runs
+        }
+        events_by_run = {run["run_id"]: store.read_events(run["run_id"]) for run in runs}
+        stop_by_run = {run["run_id"]: store.get_stop_reason(run["run_id"]) for run in runs}
+
+        reflexion_runs: list[dict[str, Any]] = []
+        reflexion_episodes_by_run: dict[str, list[dict[str, Any]]] = {}
+        if _table_exists(conn, "reflexion_run"):
+            reflexion_runs = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM reflexion_run ORDER BY updated_at DESC, started_at DESC"
+                ).fetchall()
+            ]
+            if _table_exists(conn, "reflexion_episode"):
+                for run in reflexion_runs:
+                    reflexion_episodes_by_run[run["run_id"]] = [
+                        dict(row)
+                        for row in conn.execute(
+                            "SELECT * FROM reflexion_episode WHERE run_id = ? "
+                            "ORDER BY episode",
+                            (run["run_id"],),
+                        ).fetchall()
+                    ]
+    finally:
+        conn.close()
+
+    html = render_dashboard_html(
+        runs=runs,
+        steps_by_run=steps_by_run,
+        pending_by_run=pending_by_run,
+        events_by_run=events_by_run,
+        stop_by_run=stop_by_run,
+        reflexion_runs=reflexion_runs,
+        reflexion_episodes_by_run=reflexion_episodes_by_run,
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8")
+    print(f"dashboard  : {output}", file=out)
+    print(f"runs       : {len(runs)}", file=out)
+    print(f"reflexion  : {len(reflexion_runs)}", file=out)
+    return 0
+
+
+def cmd_spikes(args: argparse.Namespace, out: Any = None) -> int:
+    """Scan persisted run steps for operational spikes."""
+    out = sys.stdout if out is None else out
+    db_path = args.db or DEFAULT_DB
+    _require_existing_db(db_path)
+    conn = connect(db_path)
+    try:
+        store = LoopStore(conn)
+        if args.run_id is None:
+            run_ids = [
+                row["run_id"]
+                for row in conn.execute(
+                    "SELECT run_id FROM run ORDER BY updated_at DESC, started_at DESC"
+                ).fetchall()
+            ]
+        else:
+            if store.get_run(args.run_id) is None:
+                raise ConfigError(f"no run {args.run_id!r} found in {db_path}")
+            run_ids = [args.run_id]
+        rows: list[tuple[str, int, Any]] = []
+        for run_id in run_ids:
+            for iteration, spike in scan_spikes(
+                store.read_steps(run_id),
+                token_window=args.token_window,
+                latency_window=args.latency_window,
+                multiplier=args.multiplier,
+                repeated_failure=args.repeated_failure,
+            ):
+                rows.append((run_id, iteration, spike))
+    finally:
+        conn.close()
+
+    print(f"db         : {db_path}", file=out)
+    print(f"spikes     : {len(rows)}", file=out)
+    for run_id, iteration, spike in rows:
+        print(
+            f"{run_id} iter={iteration} spike={spike.kind} detail={spike.detail}",
+            file=out,
+        )
+    return 0
+
+
 def _format_event(event: dict[str, Any]) -> str:
     payload = {k: v for k, v in event["payload"].items()}
     return f"{event['occurred_at']}  {event['kind']:<10}  {payload}"
@@ -1012,6 +1136,8 @@ Usage:
   loop-agent run ./task.toml [--max-iter N] [--token-budget N] [--timeout S]
   loop-agent status <run-id> [--db PATH]
   loop-agent summary [--db PATH] [--limit N]
+  loop-agent dashboard --output dashboard.html [--db PATH]
+  loop-agent spikes [<run-id>] [--db PATH]
   loop-agent resume <run-id> ./task.toml [--db PATH]
   loop-agent logs   <run-id> [--follow] [--db PATH]
   loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
@@ -1084,6 +1210,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum runs to show (default: 20)",
     )
     p_summary.set_defaults(func=cmd_summary)
+
+    p_dashboard = sub.add_parser(
+        "dashboard", help="export a read-only static HTML operations dashboard"
+    )
+    _add_db_flag(p_dashboard)
+    p_dashboard.add_argument(
+        "--output",
+        required=True,
+        help="path to write the standalone HTML dashboard",
+    )
+    p_dashboard.set_defaults(func=cmd_dashboard)
+
+    p_spikes = sub.add_parser("spikes", help="scan persisted run steps for spikes")
+    p_spikes.add_argument("run_id", nargs="?", help="run-id to scan (default: all runs)")
+    _add_db_flag(p_spikes)
+    p_spikes.add_argument("--token-window", type=int, default=5)
+    p_spikes.add_argument("--latency-window", type=int, default=5)
+    p_spikes.add_argument("--multiplier", type=float, default=3.0)
+    p_spikes.add_argument("--repeated-failure", type=int, default=3)
+    p_spikes.set_defaults(func=cmd_spikes)
 
     p_resume = sub.add_parser("resume", help="resume an interrupted run")
     p_resume.add_argument("run_id", help="the run-id to resume")

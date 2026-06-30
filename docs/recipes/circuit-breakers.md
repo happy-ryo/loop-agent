@@ -10,17 +10,9 @@ Most adapters put structured details in `ActOutcome.observation`. For
 `ClaudeCodeAct` / `CodexAct`, the result has a `failed` flag.
 
 ```python
-from loop_agent import NoProgress
+from loop_agent import AdapterFailureBreaker
 
-adapter_failed = NoProgress(
-    window=3,
-    repeat=3,
-    key=lambda record: (
-        "adapter_failed"
-        if getattr(record.observation, "failed", False)
-        else f"ok:{record.iteration}"
-    ),
-)
+adapter_failed = AdapterFailureBreaker(repeat=3)
 ```
 
 This fires only when the failing signature repeats. Successful or different
@@ -32,11 +24,9 @@ Repeated verify detail is often a better signal than repeated observation,
 because verify owns ground truth.
 
 ```python
-verify_stuck = NoProgress(
-    window=4,
-    repeat=4,
-    key=lambda record: ("verify_detail", record.detail),
-)
+from loop_agent import VerifyDetailBreaker
+
+verify_stuck = VerifyDetailBreaker(repeat=4)
 ```
 
 Use this when a test runner, linter, or validator keeps returning the same
@@ -48,21 +38,9 @@ failure text after multiple attempts.
 out seams. A breaker can stop after repeated timeout markers:
 
 ```python
-from loop_agent import (
-    ACT_TIMEOUT_OBSERVATION,
-    VERIFY_TIMEOUT_OBSERVATION,
-    NoProgress,
-)
+from loop_agent import TimeoutMarkerBreaker
 
-timeout_breaker = NoProgress(
-    window=3,
-    repeat=3,
-    key=lambda record: (
-        "timeout"
-        if record.observation in {ACT_TIMEOUT_OBSERVATION, VERIFY_TIMEOUT_OBSERVATION}
-        else f"not-timeout:{record.iteration}"
-    ),
-)
+timeout_breaker = TimeoutMarkerBreaker(repeat=3)
 ```
 
 ## Spend Breakers
@@ -71,21 +49,7 @@ For one-step spend spikes, use a small custom condition. Keep it explicit so the
 application owns the threshold.
 
 ```python
-from dataclasses import dataclass
-from loop_agent import LoopState
-
-@dataclass(frozen=True)
-class PerStepTokenCap:
-    limit: int
-    name = "per_step_token_cap"
-
-    def check(self, state: LoopState):
-        if not state.history:
-            return None
-        latest = state.history[-1]
-        if latest.tokens > self.limit:
-            return f"step {latest.iteration} used {latest.tokens} tokens > {self.limit}"
-        return None
+from loop_agent import PerStepTokenCap
 ```
 
 Then compose it with the normal hard caps:

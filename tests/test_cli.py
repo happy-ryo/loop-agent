@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from loop_agent import ActOutcome, VerifyOutcome
+from loop_agent import ActOutcome, LoopState, StepRecord, VerifyOutcome
 from loop_agent.cli import (
     Config,
     ConfigError,
@@ -522,6 +522,87 @@ def test_cmd_summary_missing_db_and_bad_limit(tmp_path, capsys):
     rc = main(["summary", "--db", str(db), "--limit", "0"])
     assert rc == 2
     assert "--limit must be >= 1" in capsys.readouterr().err
+
+
+def _seed_spiky_run(db: str) -> None:
+    store = LoopStore(connect(db))
+    try:
+        state = store.load_or_init("spiky")
+        rows = [
+            StepRecord(0, "a", tokens=10, goal_met=False),
+            StepRecord(1, "b", tokens=10, goal_met=False),
+            StepRecord(2, "c", tokens=50, goal_met=False),
+        ]
+        for record, elapsed, tokens_used in zip(rows, [1.0, 2.0, 8.0], [10, 20, 70]):
+            state = LoopState(
+                iteration=record.iteration + 1,
+                tokens_used=tokens_used,
+                elapsed=elapsed,
+                goal_met=False,
+                history=[*state.history, record],
+            )
+            store.record_step("spiky", record, state)
+    finally:
+        store.conn.close()
+
+
+def test_cmd_spikes(tmp_path, capsys):
+    db = str(tmp_path / "spikes.db")
+    _seed_spiky_run(db)
+
+    rc = main([
+        "spikes",
+        "spiky",
+        "--db",
+        db,
+        "--token-window",
+        "2",
+        "--latency-window",
+        "2",
+        "--multiplier",
+        "3",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "spikes     : 2" in out
+    assert "spike=token" in out
+    assert "spike=latency" in out
+
+
+def test_cmd_spikes_missing_run(tmp_path, capsys):
+    db = str(tmp_path / "spikes-missing.db")
+    _seed_spiky_run(db)
+    rc = main(["spikes", "ghost", "--db", db])
+    assert rc == 2
+    assert "no run 'ghost'" in capsys.readouterr().err
+
+
+def test_cmd_dashboard(tmp_path, capsys):
+    db = str(tmp_path / "dashboard.db")
+    _seed_spiky_run(db)
+    output = tmp_path / "dashboard.html"
+
+    rc = main(["dashboard", "--db", db, "--output", str(output)])
+    out = capsys.readouterr().out
+    html = output.read_text(encoding="utf-8")
+    assert rc == 0
+    assert "dashboard  :" in out
+    assert "runs       : 1" in out
+    assert "loop-agent operations dashboard" in html
+    assert "spiky" in html
+    assert "Steps: spiky" in html
+
+
+def test_cmd_dashboard_empty_db(tmp_path, capsys):
+    db = tmp_path / "dashboard-empty.db"
+    conn = connect(db)
+    conn.close()
+    output = tmp_path / "empty.html"
+    rc = main(["dashboard", "--db", str(db), "--output", str(output)])
+    html = output.read_text(encoding="utf-8")
+    assert rc == 0
+    assert "runs       : 0" in capsys.readouterr().out
+    assert "loop-agent operations dashboard" in html
 
 
 def test_cmd_resume_continues(tmp_path, capsys):

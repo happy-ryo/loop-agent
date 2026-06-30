@@ -9,8 +9,9 @@ budgets by default.
 Use these before adding automatic control:
 
 - `loop-agent summary` for a read-only overview of run state.
-- `SpikeDetector` / `loop_spike` events for token, latency, timeout, and repeated
-  failure signals.
+- `loop-agent dashboard --output dashboard.html` for static HTML inspection.
+- `SpikeDetector` / `loop_spike` events and `loop-agent spikes` for token,
+  latency, timeout, and repeated failure signals.
 - explicit `StopCondition` / circuit breaker recipes for known bad patterns.
 
 ## Launch Throttling
@@ -25,6 +26,21 @@ Launch throttling decides whether to start a new run. Keep it outside
 This belongs in the scheduler, cron job, MCP server, or web app that creates
 runs.
 
+Use `launch_throttle_decision(...)` for the pure decision:
+
+```python
+from loop_agent import launch_throttle_decision
+
+decision = launch_throttle_decision(
+    running=active_runs,
+    max_running=4,
+    recent_spikes=spikes_last_hour,
+    max_recent_spikes=10,
+)
+if not decision.allow:
+    return f"delay launch: {decision.reason}"
+```
+
 ## Step Throttling
 
 Step throttling delays the next iteration. Prefer explicit policy in `gather` or
@@ -36,6 +52,15 @@ the outer scheduler:
 
 Do not hide sleeps inside the core loop; hidden sleeps make tests, timeouts, and
 resume behavior harder to reason about.
+
+When an application explicitly wants a delay before a costly `act`, wrap it with
+an injected sleep function:
+
+```python
+from loop_agent import step_throttle
+
+act = step_throttle(expensive_act, delay_seconds=5.0, sleep=time.sleep)
+```
 
 ## Model Throttling
 
