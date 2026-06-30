@@ -1,9 +1,8 @@
 """Minimal external state: an append-only progress file (report.md S5 Phase 1).
 
-The PoC keeps live loop state in memory (:mod:`loop_agent.state`); this module
-externalises a *record* of each completed iteration to a JSON Lines file so the
-loop's forward progress survives the process. It is the smallest possible
-stand-in for the ``state.db`` SoT that Phase 2 introduces (report.md S4.6): one
+This module externalises a *record* of each completed iteration to a JSON Lines
+file so the loop's forward progress survives the process. It remains as a
+dependency-free artifact alongside the richer ``state.db`` SoT: one
 self-contained JSON object per line, appended and flushed as each iteration
 completes, plus a final line describing why the loop ended.
 

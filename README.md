@@ -1,6 +1,6 @@
 # loop-agent
 
-**複数の LLM プロバイダーを差し替えられる、Embeddable な Loop Engine。** 本格的な **Loop Engineering** を実現する **LoopAgent** の設計・実装プロジェクト。
+**複数の LLM プロバイダーを差し替えられる、Embeddable な Loop Engine。** 本格的な **Loop Engineering** を既存アプリへ組み込むための **LoopAgent** ランタイム。
 
 > **Embeddable Loop Engine for Agents — Bring your own `gather` / `act` / `verify`. We provide the loop.**
 > （どこの宿主にも組み込める、エージェント用のループエンジン。policy はあなたが持ち、ループは私たちが回す。）
@@ -22,6 +22,12 @@ loop-agent は任意のエージェント / アプリに `pip install` で組み
 **組み込み先の例**: 自前 Python スクリプト / 既存の CLI ツール / Web アプリ / MCP サーバー / cron 常駐 / Slack bot / 自社 IDE / 別の AI フレームワーク — どれの内側にも後付けで組み込める。
 
 **立ち位置（取り込む側 vs 組み込まれる側）**: LangGraph / AutoGen / OpenAI Agents SDK が「アプリを自分の枠組みに**取り込む**」フレームワークなのに対し、loop-agent は既存アプリの中に**組み込まれる**ループエンジン。あなたのアーキテクチャを置き換えず、その内側に `while not goal: gather → act → verify` を一つ足すだけ。
+
+## いつ使うか / 使わないか
+
+loop-agent が向いているのは、既存の CLI / Web アプリ / MCP サーバー / cron / coding-agent harness の内側に、**境界付きの反復・ground-truth verify・状態永続化・人間ゲート**を足したい場合。policy は呼び出し側が持ち、loop-agent は停止・記録・再開・配送・観測のランタイムを担当する。
+
+向いていないのは、ホスト済み agent 製品、サンドボックス実行環境、ダッシュボード、全体オーケストレーション UI、あるいは成功判定を機械的に書けない曖昧なタスクを求める場合。0.1.0 は Beta のライブラリであり、dashboard / 自動スロットル / circuit breaker は [operations roadmap](./docs/operations-roadmap.md) の follow-up として扱う。
 
 ## シーム — policy を注入する 5 つの口
 
@@ -112,6 +118,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/persistence-and-resume.md](./docs/persistence-and-resume.md) | 永続化と再開（progress file / state.db SoT / resume #14） |
 | [docs/safety.md](./docs/safety.md) | 安全装置（暴走防止 / 限定人間ゲート / 安全テンプレ） |
 | [docs/observability.md](./docs/observability.md) | 観測（loop events / OTel span / 外側 Reflexion 観測） |
+| [docs/operations-roadmap.md](./docs/operations-roadmap.md) | 運用 follow-up（dashboard / throttling / circuit breaker） |
 | [docs/async.md](./docs/async.md) | async/await 対応（`async_run_loop`） |
 | [docs/transport.md](./docs/transport.md) | wake 配送 transport と work-discovery / WorkListGather |
 | [docs/reflexion.md](./docs/reflexion.md) | 外側 Reflexion ループ + RQGM epoch 安全核 |
@@ -123,7 +130,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 
 ## 現在のステータス
 
-**MVP → 本格（Phase 3）移行フェーズ**。`gather → act → verify → repeat` の最小ループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。残る本格化（dashboard・自動スロットル等）は今後（report.md §5 Phase 3 / Issue #4）。各機能の詳細は上の docs/ ナビゲーションから辿れる。
+**0.1.0 Beta**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。残る運用面（dashboard・自動スロットル・circuit breaker 等）は [operations roadmap](./docs/operations-roadmap.md) の follow-up。各機能の詳細は上の docs/ ナビゲーションから辿れる。
 
 ## 成果物
 

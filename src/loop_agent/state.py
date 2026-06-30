@@ -1,8 +1,8 @@
 """Loop state: the single mutable record threaded through the loop.
 
-For the PoC this lives in memory only. Phase 2 (report.md S4.6) externalises
-the same shape to a state.db so the loop becomes resumable; keeping the state
-in one explicit object now makes that migration mechanical.
+The in-memory state is the runtime view used by stop conditions and hooks.
+Persistence layers such as :mod:`loop_agent.store` externalise the same shape to
+state.db so runs can be inspected and resumed without changing loop policy.
 """
 
 from __future__ import annotations

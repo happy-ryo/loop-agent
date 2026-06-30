@@ -1,8 +1,8 @@
-"""The PoC loop driver: gather -> act -> verify -> repeat (report.md S4.4).
+"""The loop driver: gather -> act -> verify -> repeat (report.md S4.4).
 
 A single-agent, single-process driver. ``act`` and ``verify`` are injected
-callables (hooks), so the engine carries no LLM dependency -- the PoC drives it
-with in-memory stubs and the same seam later wraps a real model call.
+callables (hooks), so the engine carries no LLM dependency; the same seam can
+wrap in-memory functions, subprocesses, coding-agent CLIs, or custom adapters.
 
 Termination is graceful and reason-bearing:
 
