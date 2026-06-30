@@ -10,6 +10,7 @@ Subcommands::
 
     loop-agent run ./task.toml [--max-iter N] [--token-budget N] [--timeout S]
     loop-agent status <run-id>
+    loop-agent summary [--db PATH] [--limit N]
     loop-agent resume <run-id> ./task.toml
     loop-agent logs   <run-id> [--follow]
     loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
@@ -714,6 +715,72 @@ def cmd_status(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+def cmd_summary(args: argparse.Namespace, out: Any = None) -> int:
+    """Print a compact read-only summary of runs in state.db."""
+    out = sys.stdout if out is None else out
+    db_path = args.db or DEFAULT_DB
+    _require_existing_db(db_path)
+    if args.limit < 1:
+        raise ConfigError("--limit must be >= 1")
+    conn = connect(db_path)
+    try:
+        limit = args.limit
+        rows = conn.execute(
+            "SELECT run_id, status, goal_met, iterations, tokens_used, elapsed, "
+            "started_at, updated_at, ended_at FROM run "
+            "ORDER BY updated_at DESC, started_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if not rows:
+            print(f"db         : {db_path}", file=out)
+            print("runs       : 0", file=out)
+            return 0
+        pending_counts = {
+            row["run_id"]: row["count"]
+            for row in conn.execute(
+                "SELECT run_id, COUNT(*) AS count FROM pending_decision "
+                "WHERE status = 'pending' GROUP BY run_id"
+            ).fetchall()
+        }
+        stop_reasons = {
+            row["run_id"]: row
+            for row in conn.execute(
+                "SELECT run_id, name, reason FROM stop_reason"
+            ).fetchall()
+        }
+        event_counts = {
+            row["run_id"]: row["count"]
+            for row in conn.execute(
+                "SELECT run_id, COUNT(*) AS count FROM event GROUP BY run_id"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    print(f"db         : {db_path}", file=out)
+    print(f"runs       : {len(rows)}", file=out)
+    print(
+        "run-id                         status     iter  tokens   elapsed  pending  events  stop",
+        file=out,
+    )
+    for row in rows:
+        run_id = row["run_id"]
+        stop = stop_reasons.get(run_id)
+        stop_text = "-"
+        if stop is not None:
+            stop_text = stop["name"] or "-"
+            if stop["reason"]:
+                stop_text = f"{stop_text}: {stop['reason']}"
+        print(
+            f"{run_id:<30} {row['status']:<10} {row['iterations']:>4} "
+            f"{row['tokens_used']:>7} {row['elapsed']:>8.3f} "
+            f"{pending_counts.get(run_id, 0):>7} {event_counts.get(run_id, 0):>7} "
+            f"{stop_text}",
+            file=out,
+        )
+    return 0
+
+
 def _format_event(event: dict[str, Any]) -> str:
     payload = {k: v for k, v in event["payload"].items()}
     return f"{event['occurred_at']}  {event['kind']:<10}  {payload}"
@@ -944,6 +1011,7 @@ loop-agent - run a bounded gather->act->verify loop from a TOML task file.
 Usage:
   loop-agent run ./task.toml [--max-iter N] [--token-budget N] [--timeout S]
   loop-agent status <run-id> [--db PATH]
+  loop-agent summary [--db PATH] [--limit N]
   loop-agent resume <run-id> ./task.toml [--db PATH]
   loop-agent logs   <run-id> [--follow] [--db PATH]
   loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
@@ -1006,6 +1074,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("run_id", help="the run-id to inspect")
     _add_db_flag(p_status)
     p_status.set_defaults(func=cmd_status)
+
+    p_summary = sub.add_parser("summary", help="show a read-only run summary from state.db")
+    _add_db_flag(p_summary)
+    p_summary.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="maximum runs to show (default: 20)",
+    )
+    p_summary.set_defaults(func=cmd_summary)
 
     p_resume = sub.add_parser("resume", help="resume an interrupted run")
     p_resume.add_argument("run_id", help="the run-id to resume")
