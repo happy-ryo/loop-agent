@@ -2,7 +2,49 @@
 
 loop-agent は **first-class な act アダプタエコシステム**を同梱する。`ClaudeCodeAct`（headless の `claude --print`）/ `CodexAct`（headless の `codex exec`）/ `ActHook` / `ActResult` Protocol に適合する任意の**自作 adapter** の 3 系統が、いずれも `act` シームに**互換に差し込める**（callable → `ActOutcome`）。エコシステムは開かれていて、3 つ目以降のアダプタ（例 `GeminiAct`）も同じ契約に従えばそのまま `run_loop` の実行体になる。
 
-つまり `act` は特定の宿主に固定された口ではなく、`ActHook` 契約を満たす callable なら何でも受ける拡張点である。以下では同梱の 2 アダプタ（Claude Code / Codex）と、それらを混ぜて使う合成パターン（`ModelLadder`）、そして共通 API を示す。新しいアダプタの書き方と、外部 CLI の schema drift を監視する運用は [writing-an-adapter.md](./writing-an-adapter.md) を参照。
+つまり `act` は特定の宿主に固定された口ではなく、`ActHook` 契約を満たす callable なら何でも受ける拡張点である。以下では loop 開始前のモデル preflight、同梱の 2 アダプタ（Claude Code / Codex）、それらを混ぜて使う合成パターン（`ModelLadder`）、そして共通 API を示す。新しいアダプタの書き方と、外部 CLI の schema drift を監視する運用は [writing-an-adapter.md](./writing-an-adapter.md) を参照。
+
+## モデル preflight — ループ開始前に候補の可用性を見る
+
+`loop_agent.adapters` は、`run_loop` の前に Codex / Claude Code の候補モデルを一覧・smoke-test する薄い preflight surface を提供する。これは **visibility** であって policy ではない。loop core はモデルを選ばず、caller が結果を見て `CodexAct` / `ClaudeCodeAct` / `ModelLadder` をどう組むかを決める。
+
+```python
+from loop_agent.adapters import preflight_codex_models, preflight_claude_code_models
+
+codex = preflight_codex_models(smoke=True, timeout=60)
+claude = preflight_claude_code_models(smoke=True, include_full_names=True, timeout=60)
+
+for report in (codex, claude):
+    for item in report.results:
+        print(item.provider, item.model, item.status, item.tokens, item.error)
+```
+
+`status` は provider-neutral に揃えている:
+
+| status | 意味 |
+|---|---|
+| `available` | smoke run が adapter failure なしで完了した。 |
+| `unavailable` | CLI は起動したが、その候補モデルが拒否された / 失敗した。 |
+| `unknown` | CLI 未導入・起動不能・timeout などでモデル固有の可否を判断できない。 |
+| `skipped` | `smoke=False`。候補を列挙しただけで実行していない。 |
+
+Codex の既定候補は `gpt-5.5` / `gpt-5.4-mini` / `gpt-5.4` / `gpt-5.3-codex-spark`。Codex manual は `gpt-5.5` を通常タスクの開始点、`gpt-5.4-mini` を軽量タスク向け、`gpt-5.3-codex-spark` を ChatGPT Pro research preview として説明している。`gpt-5.4` はローカル観測で使えた候補として含めるが、全ユーザーでの利用可能性は smoke 結果を正とする。
+
+Claude Code の既定候補は alias の `sonnet` / `opus` / `haiku` / `fable`。`include_full_names=True` で `claude-sonnet-5` / `claude-opus-4-8` / `claude-haiku-4-5` / `claude-fable-5` も候補に足す。Claude Code は workspace / enterprise の `availableModels` / `enforceAvailableModels` 設定で選択可能モデルが制限されることがあるため、候補リストだけで可用性を断定しない。
+
+候補は追加・上書きできる:
+
+```python
+from loop_agent.adapters import preflight_codex_models
+
+report = preflight_codex_models(
+    models=["gpt-5.5", "my-provider/model"],
+    smoke=True,
+    timeout=30,
+)
+```
+
+preflight の結果は、loop の前段で dashboard / logs / issue comment に記録すると、`tokens=0` の浅い実行や stale model 設定を dogfooding の verify 段で検出しやすくなる。ただし自動 escalation は別責務で、必要なら preflight 後に caller が `ModelLadder` を組む。
 
 ## ModelLadder — 異種アダプタ合成の正準例（困難タスクで強いモデルへエスカレーション）
 
