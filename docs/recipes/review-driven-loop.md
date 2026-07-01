@@ -88,6 +88,55 @@ result = run_loop(
 )
 ```
 
+
+## Structured LLM Review
+
+`review` を LLM に任せる場合は、自然文ではなく JSON decision を要求します。`No findings` や `LGTM` の文字列一致で承認すると、review agent の文体が少し変わっただけで loop が誤停止したり、逆に曖昧な返答を成功扱いしたりします。
+
+```python
+import json
+
+
+def review_artifact(outcome):
+    prompt = f"""
+Review this change. Return JSON only:
+{{"decision":"approved|blocking","findings":["..."],"residual_risk":"..."}}
+
+Criteria:
+- scope matches the requested files
+- public API compatibility is preserved
+- docs and tests are consistent
+- no irreversible operation was performed
+
+Artifact summary:
+{outcome.observation}
+"""
+    review_result = review_act({"prompt": prompt}).observation
+    try:
+        decision = json.loads(review_result.text)
+    except json.JSONDecodeError:
+        return ReviewOutcome(False, "review did not return JSON", "blocking")
+
+    if not isinstance(decision, dict):
+        return ReviewOutcome(False, "review JSON was not an object", "blocking")
+
+    findings = decision.get("findings") or []
+    if isinstance(findings, str):
+        findings = [findings]
+    if not isinstance(findings, list):
+        findings = ["review findings had an invalid shape"]
+    residual_risk = decision.get("residual_risk", "")
+    if not isinstance(residual_risk, str):
+        residual_risk = ""
+
+    if decision.get("decision") != "approved":
+        feedback = findings or ["review did not approve"]
+        return ReviewOutcome(False, "; ".join(map(str, feedback)), "blocking")
+    return ReviewOutcome(True, residual_risk)
+```
+
+Dogfood harness では、review の JSON decision に加えて「実 adapter を使った」ことも検証します。たとえば Codex を `act` と `review` の両方に使うなら、act 側は `verify` で `CodexResult.command` が `codex exec` を含むことと `tokens > 0` を確認します。review 側は `review_artifact` の中で `review_act(...)` の結果をすぐ確認するか、command / tokens を外部記録に保存してから `verify` で読むようにします。`VerifyHook` が直接受け取るのは act の `ActOutcome` だけなので、review 側の adapter 結果を暗黙に参照できるとは考えないでください。これにより、手編集を後から `ActOutcome(tokens=0)` として記録するだけの post-hoc recorder を dogfood と誤認しません。
+
 ## Feedback Representation
 
 blocking review の場合、`ReviewOutcome` は `StepRecord.detail` の JSON に入ります。review が blocking でない場合は `verify` が走り、detail は従来どおり `verify.detail` の生文字列です。
