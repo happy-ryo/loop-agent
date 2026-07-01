@@ -6,7 +6,10 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.pytest-tmp/
 .venv/
 venv/
 loop-state.db
 loop-state.db-*
+.codex/
+.state/

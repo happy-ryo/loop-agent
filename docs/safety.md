@@ -76,6 +76,7 @@ result = run_loop(act=act, verify=verify, conditions=[MaxIterations(10)],
   - **トレードオフ**: 失効取り直しは `act` を再実行するので、勝者が *副作用を起こした後・`executed` 確定の前* に
     クラッシュした稀なケースでは副作用が重複する（**at-least-once**）。完全な exactly-once は副作用側の冪等鍵が
     要る（本モジュール範囲外）。`lease_ttl` を不可逆 action の最大所要より十分長くすれば失効取り直し自体を避けられる。
+    実運用では deploy / external API / ticket update などの action payload に `idempotency_key`（例: `run_id:gate_key`）を含め、受け側でも同じ key の再実行を no-op にする。loop-agent の lease は loop 内の順序整合を守るが、外部世界の exactly-once は外部副作用側の冪等性と組み合わせて初めて成立する。
   リース owner は既定でプロセス毎に一意なトークンを自動生成する（`HumanGate(owner=…)` で明示注入も可）。
   並行 resume の exactly-once / 順序整合 / クラッシュ復旧は `tests/test_concurrent_resume.py`（並行プロセス模擬）で実証。
 - `record_result` に `paused` の結果を渡しても run は `running` のまま残り、`stop_reason` も

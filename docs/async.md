@@ -107,3 +107,7 @@ results = await asyncio.gather(
 - [../README.md](../README.md) — LoopAgent 全体像と動線
 - [seams.md](./seams.md) — gather / act / verify / conditions / gate / on_step シームの型と契約
 - [recipes/timeout-and-kill.md](./recipes/timeout-and-kill.md) — per-call timeout（graceful / kill）の使い方
+
+## Timeout portability note
+
+Windows cannot hard-kill synchronous seams with POSIX `SIGALRM`. If a loop needs reliable interruption with `TimeoutPolicy(on_timeout="kill")`, prefer async seams and `await async_run_loop(...)`. In `graceful` mode, a blocking sync call can only be reported after it returns; it is not a force-stop for a hung native or blocking call.
