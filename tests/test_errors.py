@@ -213,6 +213,19 @@ def test_async_seam_raised_by_sync_loop_with_async_act():
         )
 
 
+def test_async_seam_raised_by_sync_loop_with_async_review():
+    async def async_review(_outcome):
+        return loop_agent.ReviewOutcome(approved=True)
+
+    with pytest.raises(AsyncSeamInSyncLoop):
+        run_loop(
+            act=lambda ctx: loop_agent.ActOutcome(observation="x", tokens=0),
+            review=async_review,
+            verify=lambda o: loop_agent.VerifyOutcome(goal_met=True),
+            conditions=[MaxIterations(3)],
+        )
+
+
 def test_unknown_gate_disposition_raises_state_error():
     # A gate returning an unrecognised disposition is a runtime protocol
     # violation -> StateError (still catchable as ValueError for compat).

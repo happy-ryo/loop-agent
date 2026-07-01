@@ -10,10 +10,10 @@ The stable core API is the small embeddable loop surface:
 
 | Area | Stable symbols |
 |---|---|
-| Loop driver | `run_loop`, `async_run_loop`, `ActOutcome`, `VerifyOutcome`, `LoopResult` |
+| Loop driver | `run_loop`, `async_run_loop`, `ActOutcome`, `ReviewOutcome`, `ReviewHook`, `VerifyOutcome`, `LoopResult` |
 | Loop state | `LoopState`, `StepRecord` |
 | Stop conditions | `AnyOf`, `StopCondition`, `StopTrigger`, `MaxIterations`, `TokenBudget`, `Timeout`, `GoalMet`, `GoalCheck`, `NoProgress` |
-| Per-call timeout | `TimeoutPolicy`, `SeamTimeout`, `UnsupportedTimeoutKill`, `TIMEOUT_GRACEFUL`, `TIMEOUT_KILL`, `ACT_TIMEOUT_OBSERVATION`, `VERIFY_TIMEOUT_OBSERVATION` |
+| Per-call timeout | `TimeoutPolicy`, `SeamTimeout`, `UnsupportedTimeoutKill`, `TIMEOUT_GRACEFUL`, `TIMEOUT_KILL`, `ACT_TIMEOUT_OBSERVATION`, `REVIEW_TIMEOUT_OBSERVATION`, `VERIFY_TIMEOUT_OBSERVATION` |
 | Persistence | `ProgressLog`, `read_progress`, `connect`, `LoopStore`, `DBProgressLog` |
 | Human gate | `ActionGate`, `GateReview`, `HumanGate`, `Decision`, `run_gated_loop` |
 | Observability | `LoopEvent`, `EventSink`, `ListSink`, `CallableSink`, `JsonlEventSink`, `read_events`, `LOOP_BEGIN`, `LOOP_STEP`, `LOOP_END`, `LoopObserver`, `run_observed_loop` |
@@ -49,11 +49,11 @@ must be added to one of these rows before release.
 
 | Classification | Symbols |
 |---|---|
-| Core loop driver | `run_loop`, `async_run_loop`, `ActOutcome`, `VerifyOutcome`, `LoopResult` |
+| Core loop driver | `run_loop`, `async_run_loop`, `ActOutcome`, `ReviewOutcome`, `ReviewHook`, `VerifyOutcome`, `LoopResult` |
 | Core state | `LoopState`, `StepRecord` |
 | Core stop conditions | `AnyOf`, `StopCondition`, `StopTrigger`, `MaxIterations`, `TokenBudget`, `Timeout`, `GoalMet`, `GoalCheck`, `NoProgress` |
 | Practical verifier helpers | `CommandVerifier`, `PytestVerifier`, `RegexVerifier` |
-| Per-call timeout | `TimeoutPolicy`, `SeamTimeout`, `UnsupportedTimeoutKill`, `TIMEOUT_GRACEFUL`, `TIMEOUT_KILL`, `ACT_TIMEOUT_OBSERVATION`, `VERIFY_TIMEOUT_OBSERVATION` |
+| Per-call timeout | `TimeoutPolicy`, `SeamTimeout`, `UnsupportedTimeoutKill`, `TIMEOUT_GRACEFUL`, `TIMEOUT_KILL`, `ACT_TIMEOUT_OBSERVATION`, `REVIEW_TIMEOUT_OBSERVATION`, `VERIFY_TIMEOUT_OBSERVATION` |
 | Persistence | `ProgressLog`, `read_progress`, `connect`, `LoopStore`, `DBProgressLog` |
 | Human gate | `ActionGate`, `GateReview`, `HumanGate`, `Decision`, `run_gated_loop`, `DECISION_KINDS` |
 | Observability | `LoopEvent`, `EventSink`, `ListSink`, `CallableSink`, `JsonlEventSink`, `read_events`, `LOOP_BEGIN`, `LOOP_STEP`, `LOOP_END`, `LOOP_SPIKE`, `LoopObserver`, `run_observed_loop` |

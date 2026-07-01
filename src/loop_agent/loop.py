@@ -1,4 +1,4 @@
-"""The loop driver: gather -> act -> verify -> repeat (report.md S4.4).
+"""The loop driver: gather -> act -> review? -> verify -> repeat (report.md S4.4).
 
 A single-agent, single-process driver. ``act`` and ``verify`` are injected
 callables (hooks), so the engine carries no LLM dependency; the same seam can
@@ -15,9 +15,10 @@ never raises to signal "limit reached".
 Two entry points share one control-flow implementation (Issue #40):
 
 - :func:`async_run_loop` -- the async driver and single source of truth. Each
-  seam (``gather`` / ``act`` / ``verify`` / ``conditions`` / ``gate`` /
-  ``on_step``) may be a synchronous callable *or* an async one; the driver awaits
-  results via :func:`loop_agent._async.maybe_await`, so sync and async hooks mix.
+  seam (``gather`` / ``act`` / ``review`` / ``verify`` / ``conditions`` /
+  ``gate`` / ``on_step``) may be a synchronous callable *or* an async one; the
+  driver awaits results via :func:`loop_agent._async.maybe_await`, so sync and
+  async hooks mix.
 - :func:`run_loop` -- the original synchronous API. It drives the shared
   coroutine to completion *in the caller's own context* (no event loop is
   created), so behaviour for synchronous hooks is byte-for-byte unchanged; it
@@ -29,12 +30,22 @@ Two entry points share one control-flow implementation (Issue #40):
 from __future__ import annotations
 
 import asyncio
+import json
 import inspect
 import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
 
 from ._async import (
     AsyncSeamInSyncLoop,
@@ -55,7 +66,7 @@ GATE_PROCEED = "proceed"
 GATE_SKIP = "skip"
 GATE_PAUSE = "pause"
 
-# act/verify の per-call timeout 超過時の挙動 (Issue #42)。
+# act/review/verify の per-call timeout 超過時の挙動 (Issue #42)。
 #   graceful: 当該シームを諦め、failed=True な合成 step を記録して **次 iteration** へ。
 #             ループは返り続ける (例外を投げない)。stop 条件 (MaxIterations / Timeout /
 #             NoProgress) が次の guard で繰り返し timeout を捕捉・収束させる。
@@ -70,6 +81,7 @@ _TIMEOUT_MODES = (TIMEOUT_GRACEFUL, TIMEOUT_KILL)
 # JSON ネイティブで hashable な文字列にしてあるので、永続化 / resume を通っても安定し、
 # NoProgress の既定 key (observation そのもの) で「timeout の繰り返し」を検出できる。
 ACT_TIMEOUT_OBSERVATION = "<seam-timeout:act>"
+REVIEW_TIMEOUT_OBSERVATION = "<seam-timeout:review>"
 VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
 
 
@@ -96,10 +108,11 @@ class _AlarmInterrupt(BaseException):
 
 @dataclass(frozen=True)
 class TimeoutPolicy:
-    """Per-call timeout for the ``act`` and ``verify`` seams (Issue #42).
+    """Per-call timeout for the ``act``, ``review``, and ``verify`` seams (Issue #42).
 
-    A timeout bounds a *single* ``act`` (or ``verify``) invocation -- distinct
-    from the whole-run :class:`~loop_agent.conditions.Timeout` *stop condition*,
+    A timeout bounds a *single* ``act``, ``review``, or ``verify`` invocation --
+    distinct from the whole-run :class:`~loop_agent.conditions.Timeout` *stop
+    condition*,
     which caps cumulative wall-clock at the iteration boundary and never
     interrupts an in-progress step. Use this to stop one runaway model/tool call
     without aborting the run.
@@ -110,7 +123,8 @@ class TimeoutPolicy:
 
     - :data:`TIMEOUT_GRACEFUL` (default) -- abandon the call, record a synthetic
       ``goal_met=False`` step (observation :data:`ACT_TIMEOUT_OBSERVATION` /
-      :data:`VERIFY_TIMEOUT_OBSERVATION`), and continue to the next iteration, so
+      :data:`REVIEW_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`),
+      and continue to the next iteration, so
       the stop conditions bound a stream of timeouts (``MaxIterations`` /
       ``NoProgress`` on the marker / a ``Timeout`` stop).
     - :data:`TIMEOUT_KILL` -- cancel the call and raise :class:`SeamTimeout` out
@@ -137,8 +151,8 @@ class TimeoutPolicy:
     likewise uninterruptible until it next awaits (the deadline is enforced at
     the await boundary).
 
-    **Per-call budget.** Each ``act`` / ``verify`` invocation gets one deadline
-    that spans its whole execution. For an unusual seam that does blocking
+    **Per-call budget.** Each ``act`` / ``review`` / ``verify`` invocation gets one
+    deadline that spans its whole execution. For an unusual seam that does blocking
     synchronous work *and then* returns an awaitable, the time spent in the
     synchronous prefix is subtracted from the awaited portion's budget (a prefix
     that already exhausts the deadline trips immediately), so the total is bounded
@@ -160,11 +174,12 @@ class TimeoutPolicy:
 
     default: Optional[float] = None
     act: Optional[float] = None
+    review: Optional[float] = None
     verify: Optional[float] = None
     on_timeout: str = TIMEOUT_GRACEFUL
 
     def __post_init__(self) -> None:
-        for name in ("default", "act", "verify"):
+        for name in ("default", "act", "review", "verify"):
             value = getattr(self, name)
             if value is None:
                 continue
@@ -192,16 +207,24 @@ class TimeoutPolicy:
         return self.act if self.act is not None else self.default
 
     @property
+    def review_seconds(self) -> Optional[float]:
+        return self.review if self.review is not None else self.default
+
+    @property
     def verify_seconds(self) -> Optional[float]:
         return self.verify if self.verify is not None else self.default
 
     def _is_noop(self) -> bool:
         """True when no seam has an effective deadline (fast path)."""
-        return self.act_seconds is None and self.verify_seconds is None
+        return (
+            self.act_seconds is None
+            and self.review_seconds is None
+            and self.verify_seconds is None
+        )
 
 
-# A timeout argument accepts a TimeoutPolicy, a bare number (applied to both act
-# and verify, graceful mode), or None (no per-call timeout).
+# A timeout argument accepts a TimeoutPolicy, a bare number (applied to act,
+# review, and verify, graceful mode), or None (no per-call timeout).
 TimeoutArg = Union[TimeoutPolicy, float, int, None]
 
 
@@ -221,6 +244,9 @@ def _effective_seam_timeout(
     if seam == "act":
         seconds = policy.act_seconds
         explicit = policy.act is not None
+    elif seam == "review":
+        seconds = policy.review_seconds
+        explicit = policy.review is not None
     elif seam == "verify":
         seconds = policy.verify_seconds
         explicit = policy.verify is not None
@@ -242,7 +268,7 @@ def _resolve_timeout(timeout: TimeoutArg) -> Optional[TimeoutPolicy]:
 
     ``None`` (or a policy with no effective deadline) returns ``None`` so the
     driver keeps its exact zero-overhead path. A bare number becomes
-    ``TimeoutPolicy(default=number)`` (graceful, both seams).
+    ``TimeoutPolicy(default=number)`` (graceful, all timed seams).
     """
     if timeout is None:
         return None
@@ -473,7 +499,7 @@ async def _run_seam(
             _abandon_awaitable(result)
             raise AsyncSeamInSyncLoop(
                 "run_loop() received an async (awaitable) seam "
-                "(act/verify/gather/condition/gate/on_step/on_complete); "
+                "(act/review/verify/gather/condition/gate/on_step/on_complete); "
                 "use `await async_run_loop(...)` for async seams"
             )
         # Carry the single per-call budget into the await: subtract the real
@@ -573,6 +599,32 @@ class VerifyOutcome:
     goal_met: bool
     detail: str = ""
 
+
+ReviewSeverity = Literal["info", "warning", "blocking"]
+_REVIEW_SEVERITIES = ("info", "warning", "blocking")
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """Post-act artifact review, evaluated before ground-truth ``verify``.
+
+    Review is optional and distinct from :class:`ActionGate`: a gate approves a
+    proposed irreversible action before it runs, while review evaluates the
+    artifact that ``act`` already produced. A non-approved ``"blocking"`` review
+    is recorded as a failed step and skips ``verify`` for that iteration so the
+    next ``gather`` can feed the feedback back into ``act``.
+    """
+
+    approved: bool
+    feedback: str = ""
+    severity: ReviewSeverity = "info"
+
+    def __post_init__(self) -> None:
+        if self.severity not in _REVIEW_SEVERITIES:
+            raise ConfigError(
+                f"ReviewOutcome severity must be one of {_REVIEW_SEVERITIES}, "
+                f"got {self.severity!r}"
+            )
 
 @dataclass
 class GateReview:
@@ -716,6 +768,7 @@ class LoopResult:
 GatherHook = Callable[[LoopState], Union[Any, Awaitable[Any]]]
 ActHook = Callable[[Any], Union[ActOutcome, Awaitable[ActOutcome]]]
 VerifyHook = Callable[[ActOutcome], Union[VerifyOutcome, Awaitable[VerifyOutcome]]]
+ReviewHook = Callable[[ActOutcome], Union[ReviewOutcome, Awaitable[ReviewOutcome]]]
 StepHook = Callable[[StepRecord, LoopState], Union[None, Awaitable[None]]]
 Conditions = Union[AnyOf, list[StopCondition], tuple[StopCondition, ...]]
 
@@ -725,12 +778,27 @@ def _default_gather(state: LoopState) -> LoopState:
     return state
 
 
+def _review_payload(review: ReviewOutcome) -> dict[str, Any]:
+    return {
+        "approved": review.approved,
+        "feedback": review.feedback,
+        "severity": review.severity,
+    }
+
+
+def _review_detail(review: ReviewOutcome) -> str:
+    return json.dumps(
+        {"review": _review_payload(review)}, ensure_ascii=False, sort_keys=True
+    )
+
+
 async def async_run_loop(
     *,
     act: ActHook,
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
@@ -740,15 +808,16 @@ async def async_run_loop(
     # maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
     _strict_sync: bool = False,
 ) -> LoopResult:
-    """Async driver: gather -> act -> verify -> repeat until the goal or a cap.
+    """Async driver: gather -> act -> review? -> verify -> repeat until the goal or a cap.
 
     This is the **single source of truth** for the loop's control flow; the
     synchronous :func:`run_loop` is a thin ``asyncio.run`` wrapper around it. Use
     this entry point when you are already inside an event loop (``await
     async_run_loop(...)``) or when any hook is a coroutine function.
 
-    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``, ``act``,
-    ``verify``, each ``conditions`` ``check``, ``gate.review``, ``on_step`` (and a
+    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``,
+    ``act``, ``review``, ``verify``, each ``conditions`` ``check``,
+    ``gate.review``, ``on_step`` (and a
     gate's ``on_complete``) -- may be a plain synchronous callable *or* an async
     one (returning an awaitable). The driver awaits each result via
     :func:`loop_agent._async.maybe_await`, so synchronous and asynchronous hooks
@@ -758,8 +827,9 @@ async def async_run_loop(
 
     **asyncio の使い方.** This coroutine performs no concurrency of its own: it
     ``await``\\s each seam *sequentially* to preserve the exact gather -> gate ->
-    act -> verify ordering and the stop-condition evaluation timing of the
-    synchronous loop. It runs on whatever event loop awaits it. To run several
+    act -> review? -> verify ordering and the stop-condition evaluation timing
+    of the synchronous loop. It runs on whatever event loop awaits it. To run
+    several
     independent loops concurrently, schedule them as tasks from the caller, e.g.
     ``await asyncio.gather(async_run_loop(...), async_run_loop(...))`` or
     ``asyncio.create_task(async_run_loop(...))`` -- each call owns its own
@@ -778,6 +848,11 @@ async def async_run_loop(
             sequence of stop conditions (wrapped in ``AnyOf`` automatically).
         gather: Hook building the context handed to ``act``. Defaults to passing
             the :class:`LoopState` through.
+        review: Optional post-act artifact review hook. It receives the
+            :class:`ActOutcome` before ground-truth ``verify``. A blocking
+            ``ReviewOutcome(approved=False, severity="blocking")`` records a
+            failed step, skips ``verify`` for that iteration, and leaves JSON
+            review feedback in ``StepRecord.detail`` for the next ``gather``.
         on_step: Optional observer invoked with ``(record, state)`` after each
             completed iteration (a minimal observability seam; report.md R7).
         gate: Optional limited human gate (report.md R6). When supplied, its
@@ -801,15 +876,16 @@ async def async_run_loop(
             *total* run time, not just this leg). ``None`` (the default) starts a
             fresh run; an empty :class:`LoopState` is equivalent to ``None``. The
             seed is copied, so the caller's object is not mutated.
-        timeout: Optional per-call timeout for the ``act`` and ``verify`` seams
+        timeout: Optional per-call timeout for the ``act``, ``review``, and ``verify`` seams
             (Issue #42). A :class:`TimeoutPolicy` (per-seam / ``default`` deadlines
-            and ``on_timeout`` mode), a bare number of seconds (applied to *both*
-            seams, ``graceful`` mode), or ``None`` (no per-call timeout -- the
+            and ``on_timeout`` mode), a bare number of seconds (applied to all
+            timed seams, ``graceful`` mode), or ``None`` (no per-call timeout -- the
             default, zero-overhead path). Distinct from the whole-run
             :class:`~loop_agent.conditions.Timeout` *stop condition*: this bounds
-            one ``act`` / ``verify`` call, not cumulative wall-clock. On overrun,
+            one ``act`` / ``review`` / ``verify`` call, not cumulative wall-clock. On overrun,
             ``graceful`` records a synthetic ``goal_met=False`` step (observation
-            :data:`ACT_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`)
+            :data:`ACT_TIMEOUT_OBSERVATION` / :data:`REVIEW_TIMEOUT_OBSERVATION` /
+            :data:`VERIFY_TIMEOUT_OBSERVATION`)
             and continues so the stop conditions bound a run of timeouts;
             ``kill`` raises :class:`SeamTimeout` out of the loop. An async seam is
             cancelled via the asyncio event loop; a synchronous seam by POSIX
@@ -861,6 +937,7 @@ async def async_run_loop(
             verify=verify,
             conditions=conditions,
             gather=gather,
+            review=review,
             on_step=on_step,
             gate=gate,
             time_fn=time_fn,
@@ -877,6 +954,7 @@ async def _drive_loop(
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
@@ -948,49 +1026,49 @@ async def _drive_loop(
         # step 永続化後に呼ぶため、ここで掴んでおく (非ゲート step では None のまま)。
         gate_on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
         if gate is not None:
-            review = await maybe_await(gate.review(context, state))
-            if review.disposition == GATE_PAUSE:
+            gate_review = await maybe_await(gate.review(context, state))
+            if gate_review.disposition == GATE_PAUSE:
                 # Interrupt before the irreversible side effect. No step is
                 # recorded for the un-executed action; the decision is persisted
                 # behind the gate so a resumed run honours it (report.md R6).
                 state.elapsed = time_fn() - start
                 return LoopResult(
-                    status="paused", stop=None, state=state, pending=review.pending
+                    status="paused", stop=None, state=state, pending=gate_review.pending
                 )
-            if review.disposition == GATE_SKIP:
+            if gate_review.disposition == GATE_SKIP:
                 # The human declined to execute (reject/respond): record the
                 # decision as a zero-cost step and re-enter the guard, so caps
                 # and NoProgress still see and bound the gated cycle.
                 record = StepRecord(
                     iteration=state.iteration,
-                    observation=review.observation,
+                    observation=gate_review.observation,
                     tokens=0,
                     goal_met=False,
-                    detail=review.detail,
+                    detail=gate_review.detail,
                 )
                 state.history.append(record)
                 state.iteration += 1
                 state.elapsed = time_fn() - start
                 # replay no-op な skip (review.persist=False) は on_step を呼ばない:
                 # 前 run が永続化した本来の step 行を上書きで壊さないため。
-                if on_step is not None and review.persist:
+                if on_step is not None and gate_review.persist:
                     await maybe_await(on_step(record, state))
                 continue
-            if review.disposition != GATE_PROCEED:
+            if gate_review.disposition != GATE_PROCEED:
                 # Fail closed: an unrecognised disposition (e.g. a typo'd
                 # "paused") must NOT silently fall through to executing the
                 # action -- for a safety gate that could run an irreversible
                 # side effect instead of pausing. Reject loudly instead.
                 raise StateError(
-                    f"gate returned unknown disposition {review.disposition!r}; "
+                    f"gate returned unknown disposition {gate_review.disposition!r}; "
                     f"expected one of {GATE_PROCEED!r}/{GATE_SKIP!r}/{GATE_PAUSE!r}"
                 )
             # GATE_PROCEED: execute the (possibly edited) action. An unset
             # context keeps the gathered action; only an explicit value (an
             # edit) replaces it -- so a bare proceed never passes None to act.
-            if review.context is not KEEP_CONTEXT:
-                context = review.context
-            gate_on_complete = review.on_complete
+            if gate_review.context is not KEEP_CONTEXT:
+                context = gate_review.context
+            gate_on_complete = gate_review.on_complete
 
         # act -- per-call timeout 適用可 (Issue #42)。policy 未設定なら従来どおり
         # maybe_await 直呼びで追加コストゼロ。graceful timeout は当該 step を failed
@@ -1031,6 +1109,58 @@ async def _drive_loop(
                     await maybe_await(gate_on_complete())
                 continue
         state.tokens_used += outcome.tokens
+
+        review_outcome: Optional[ReviewOutcome] = None
+        if review is not None:
+            review_timeout = (
+                None
+                if policy is None
+                else _effective_seam_timeout(policy, "review", review)
+            )
+            if review_timeout is None:
+                review_outcome = await maybe_await(review(outcome))
+            else:
+                try:
+                    review_outcome = await _run_seam(
+                        review,
+                        outcome,
+                        seconds=review_timeout,
+                        mode=policy.on_timeout,
+                        seam="review",
+                        time_fn=time_fn,
+                    )
+                except _GracefulTimeout:
+                    record = StepRecord(
+                        iteration=state.iteration,
+                        observation=REVIEW_TIMEOUT_OBSERVATION,
+                        tokens=outcome.tokens,
+                        goal_met=False,
+                        detail=f"review timed out after {review_timeout:g}s",
+                    )
+                    state.history.append(record)
+                    state.iteration += 1
+                    state.elapsed = time_fn() - start
+                    if on_step is not None:
+                        await maybe_await(on_step(record, state))
+                    if gate_on_complete is not None:
+                        await maybe_await(gate_on_complete())
+                    continue
+            if (not review_outcome.approved) and review_outcome.severity == "blocking":
+                record = StepRecord(
+                    iteration=state.iteration,
+                    observation=outcome.observation,
+                    tokens=outcome.tokens,
+                    goal_met=False,
+                    detail=_review_detail(review_outcome),
+                )
+                state.history.append(record)
+                state.iteration += 1
+                state.elapsed = time_fn() - start
+                if on_step is not None:
+                    await maybe_await(on_step(record, state))
+                if gate_on_complete is not None:
+                    await maybe_await(gate_on_complete())
+                continue
 
         # verify -- 同上。act の outcome (tokens 計上済) はそのまま、verify が時間切れ
         # なら failed step を記録して次 iteration へ。
@@ -1104,13 +1234,14 @@ def run_loop(
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
     timeout: TimeoutArg = None,
 ) -> LoopResult:
-    """Drive gather -> act -> verify -> repeat until the goal or a cap (sync).
+    """Drive gather -> act -> review? -> verify -> repeat until the goal or a cap (sync).
 
     This is the **synchronous entry point** and the original public API. It shares
     one control-flow implementation with :func:`async_run_loop` (which owns the
@@ -1161,6 +1292,7 @@ def run_loop(
         verify=verify,
         conditions=conditions,
         gather=gather,
+        review=review,
         on_step=on_step,
         gate=gate,
         time_fn=time_fn,

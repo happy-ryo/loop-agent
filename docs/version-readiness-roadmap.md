@@ -64,10 +64,11 @@ It does not change release state; it records an audit trail in `loop-state.db`.
 
 ## Review-driven Follow-up
 
-LLM-backed `act` steps should be reviewed before merge. The current stable core
-does not have a first-class post-act `review` seam yet; use the optional pattern
-in `docs/recipes/review-driven-loop.md` until Issue #128 decides whether to add a
-public `ReviewHook` / `ReviewOutcome` API.
+LLM-backed `act` steps should be reviewed before merge. Issue #128 is addressed by
+the optional post-act `review` seam: pass a `ReviewHook` via `review=` and
+return `ReviewOutcome`. Blocking review feedback is stored in `StepRecord.detail`; non-blocking steps keep `verify.detail` unchanged
+and state.db `step.detail`; use `docs/recipes/review-driven-loop.md` for the
+harness shape.
 
 This release PR can be review-checked with:
 

@@ -1,6 +1,6 @@
-# Recipe — act / verify の per-call timeout / kill（Issue #42）
+# Recipe — act / review / verify の per-call timeout / kill（Issue #42）
 
-1 回の `act` / `verify` 呼び出し（モデル呼び出しやツール実行）が暴走したときに、**ループ全体を諦めずに**その 1 回だけを打ち切る機構です。`run_loop` / `async_run_loop` の `timeout=` 引数に渡します。全実装は async-first core（`_drive_loop`）に入っているので **sync / async 両 API へ同一挙動で効きます**。
+1 回の `act` / `review` / `verify` 呼び出し（モデル呼び出しやツール実行）が暴走したときに、**ループ全体を諦めずに**その 1 回だけを打ち切る機構です。`run_loop` / `async_run_loop` の `timeout=` 引数に渡します。全実装は async-first core（`_drive_loop`）に入っているので **sync / async 両 API へ同一挙動で効きます**。
 
 > **whole-run `Timeout` *stop 条件* との違い** — `loop_agent.Timeout(seconds)` は累積 wall-clock を **iteration 境界で**上限化する stop 条件で、**進行中の step は中断しません**（「締切を過ぎたら新しい仕事を始めない」）。本 recipe の `timeout=` は **1 回の呼び出し**を中断するもので、別物です。両方を併用できます。
 
@@ -12,13 +12,13 @@ from loop_agent import run_loop, TimeoutPolicy, MaxIterations
 result = run_loop(
     act=my_act, verify=my_verify,
     conditions=[MaxIterations(20)],
-    # act は 30s、verify は 10s で打ち切り。超過したシームは諦めて次 iteration へ。
-    timeout=TimeoutPolicy(act=30.0, verify=10.0, on_timeout="graceful"),
+    # act は 30s、review は 20s、verify は 10s で打ち切り。超過したシームは諦めて次 iteration へ。
+    timeout=TimeoutPolicy(act=30.0, review=20.0, verify=10.0, on_timeout="graceful"),
 )
 ```
 
-- `TimeoutPolicy(act=, verify=, default=, on_timeout=)` — シーム別の秒数。各シームは自分の値、無ければ `default`、それも無ければ無制限。
-- `timeout=30.0`（裸の秒数）— 両シームに `default=30.0` の **graceful** を適用する短縮形。
+- `TimeoutPolicy(act=, review=, verify=, default=, on_timeout=)` — シーム別の秒数。各シームは自分の値、無ければ `default`、それも無ければ無制限。
+- `timeout=30.0`（裸の秒数）— 全 timed seam に `default=30.0` の **graceful** を適用する短縮形。
 - `timeout=None`（既定）— per-call timeout なし（追加コストゼロの従来パス）。
 
 ## 2 つのモード
@@ -28,7 +28,7 @@ result = run_loop(
 | `"graceful"`（既定） | 当該シームを諦め、`goal_met=False` の **合成 step** を記録して **次 iteration** へ。ループは返り続ける（例外を投げない）。 |
 | `"kill"` | 当該シームを cancel し、`SeamTimeout` を **ループ外へ送出**（`LoopResult` は返らない）。 |
 
-graceful の合成 step は observation がマーカー文字列（`ACT_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`）になります。これは JSON ネイティブで hashable なので **永続化 / resume を通っても安定**し、`NoProgress` の既定 key（observation そのもの）で「timeout の連続」を検出できます:
+graceful の合成 step は observation がマーカー文字列（`ACT_TIMEOUT_OBSERVATION` / `REVIEW_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`）になります。これは JSON ネイティブで hashable なので **永続化 / resume を通っても安定**し、`NoProgress` の既定 key（observation そのもの）で「timeout の連続」を検出できます:
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations, NoProgress

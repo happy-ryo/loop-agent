@@ -1,6 +1,6 @@
 """loop-agent embeddable loop runtime.
 
-Public API for a bounded ``gather -> act -> verify -> repeat`` loop engine with
+Public API for a bounded ``gather -> act -> review? -> verify -> repeat`` loop engine with
 composable stop conditions, persistence/resume, observability, human gates,
 Reflexion, transport, work discovery, and CLI/adapters.
 
@@ -88,12 +88,15 @@ from .errors import (
 from .gate import Decision, HumanGate, run_gated_loop
 from .loop import (
     ACT_TIMEOUT_OBSERVATION,
+    REVIEW_TIMEOUT_OBSERVATION,
     TIMEOUT_GRACEFUL,
     TIMEOUT_KILL,
     VERIFY_TIMEOUT_OBSERVATION,
     ActionGate,
     ActOutcome,
     GateReview,
+    ReviewHook,
+    ReviewOutcome,
     LoopResult,
     SeamTimeout,
     TimeoutPolicy,
@@ -196,6 +199,8 @@ __all__ = [
     "AsyncSeamInSyncLoop",
     "ActOutcome",
     "VerifyOutcome",
+    "ReviewOutcome",
+    "ReviewHook",
     "LoopResult",
     "LoopState",
     "StepRecord",
@@ -205,13 +210,14 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
-    # act/verify の per-call timeout / kill (Issue #42)
+    # act/review/verify の per-call timeout / kill (Issue #42)
     "TimeoutPolicy",
     "SeamTimeout",
     "UnsupportedTimeoutKill",
     "TIMEOUT_GRACEFUL",
     "TIMEOUT_KILL",
     "ACT_TIMEOUT_OBSERVATION",
+    "REVIEW_TIMEOUT_OBSERVATION",
     "VERIFY_TIMEOUT_OBSERVATION",
     "GoalMet",
     "GoalCheck",

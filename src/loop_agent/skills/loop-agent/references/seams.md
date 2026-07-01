@@ -1,32 +1,34 @@
 > This file is a load-on-demand bundled copy of `docs/seams.md`. The canonical source is `docs/seams.md` in the repository.
 
-# シーム詳細 — gather / act / verify / conditions / gate
+# シーム詳細 — gather / act / review / verify / conditions / gate
 
-loop-agent が「持つ」のはオーケストレーション本体だけで、policy は全部シームに注入する。このページは 5 つのシームの型・契約と、`run_loop` での具体的な書き方（基本利用・暴走防止・二重終了条件・検証駆動デモ）を 1 箇所にまとめた canonical な解説。
+loop-agent が「持つ」のはオーケストレーション本体だけで、policy は全部シームに注入する。このページは 5 つの必須シームと任意の `review` シームの型・契約、`run_loop` での具体的な書き方（基本利用・暴走防止・二重終了条件・検証駆動デモ）を 1 箇所にまとめた canonical な解説。
 
 ## シーム一覧
 
-ループが「持つ」のはオーケストレーション本体だけ。policy は全部この 5 つのシームに注入する:
+ループが「持つ」のはオーケストレーション本体だけ。policy はこれらのシームに注入する。`review` は post-act artifact review が必要な loop だけで使う任意シーム:
 
 | シーム | 型 | あなたが決めること |
 |---|---|---|
 | `gather` | `Callable[[state], ctx]` | 次に何をやるか（候補選定・triage・キュー戦略） |
 | `act` | `Callable[[ctx], ActOutcome]` | どう実行するか（モデル選択・LLM provider・subprocess・ローカル fn） |
+| `review` | `Callable[[ActOutcome], ReviewOutcome]`（任意） | `act` が作った成果物を受け入れるか（scope / API fit / intent match）。blocking の場合は verify をスキップして feedback を次 iteration へ残す |
 | `verify` | `Callable[[ActOutcome], VerifyOutcome]` | 何を「成功」とするか（pytest / AST / regex / 何でも。技術的には何でも差せるが成功判定は **ground truth 推奨**） |
 | `conditions` | `list[StopCondition]`（`MaxIterations` 等の stop 条件。`AnyOf` で OR 合成） | いつ止めるか（回数 / 予算 / 目標 / 時間） |
 | `gate` | `ActionGate`（`HumanGate` 等。`review(context, state)` 実装。対象選定は `on=Callable[[action], bool]`） | 何に人間承認を要求するか（commit / push / 任意） |
 
-> **verify は ground truth で書く（推奨）**: 何でも差せるのがシームの本質だが、成功判定を LLM-as-judge に委ねるとループは「成功したフリ」に収束しやすい（report.md R1）。pytest の exit-code / AST / 文字列スキャンなど機械的に判定できるものを使う。具体例は [recipes/](https://github.com/happy-ryo/loop-agent/tree/main/docs/recipes/)。
+> **verify は ground truth で書く（推奨）**: 何でも差せるのがシームの本質だが、成功判定を LLM-as-judge に委ねるとループは「成功したフリ」に収束しやすい（report.md R1）。LLM-backed な設計・scope 判断は `review` に寄せ、成功判定は pytest の exit-code / AST / 文字列スキャンなど機械的に判定できるものを使う。具体例は [recipes/](https://github.com/happy-ryo/loop-agent/tree/main/docs/recipes/)。
 
 ```python
 while not goal_met and conditions_ok:
     ctx = gather(state)        # 何を      (gather)
     outcome = act(ctx)         # どう実行  (act)
+    r = review(outcome)        # 成果物評価  (review, 任意)
     v = verify(outcome)        # 何が成功  (verify)
     state.update(v)
 ```
 
-このループ本体だけが loop-agent。5 つのシームを書けば、それがあなたの domain の loop になる。
+このループ本体だけが loop-agent。必須シームを書き、必要なときだけ `review` を足せば、それがあなたの domain の loop になる。
 
 `act` シームには、`ClaudeCodeAct` / `CodexAct` / 自作 adapter（`ActHook` Protocol）が first-class な act adapter として既に揃っている。`ActHook` に準拠した callable であれば何でも act シームに差し込めるので、モデル・LLM provider・subprocess・ローカル関数を自由に選べる。adapter の書き方は [adapters/writing-an-adapter.md](writing-an-adapter.md) を参照。
 
@@ -35,7 +37,7 @@ while not goal_met and conditions_ok:
 `act`（行動）と `verify`（検証 = ground truth）を渡し、終了条件を合成して `run_loop` に渡すだけ:
 
 ```python
-from loop_agent import run_loop, ActOutcome, VerifyOutcome, MaxIterations, TokenBudget, Timeout
+from loop_agent import run_loop, ActOutcome, ReviewOutcome, VerifyOutcome, MaxIterations, TokenBudget, Timeout
 
 state = {"n": 0}
 
@@ -44,6 +46,11 @@ def act(ctx):
     state["n"] += 1
     return ActOutcome(observation=f"did work #{state['n']}", tokens=10)
 
+def review(outcome):
+    """任意: post-act artifact review。"""
+    return ReviewOutcome(approved=True, feedback="scope ok")
+
+
 def verify(outcome):
     """ground truth 検証。goal_met=True でループは自然終了する。"""
     done = state["n"] >= 3
@@ -51,6 +58,7 @@ def verify(outcome):
 
 result = run_loop(
     act=act,
+    review=review,
     verify=verify,
     conditions=[MaxIterations(5), TokenBudget(1000), Timeout(30.0)],  # OR 評価
 )
@@ -119,5 +127,6 @@ python3 examples/verify_driven_demo.py
 
 - [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) — 入口（positioning / シーム概要 / 動線サマリ）
 - [adapters/writing-an-adapter.md](writing-an-adapter.md) — `ActHook` Protocol で act adapter を書く
+- [review.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/review.md) — optional post-act review の API と retry/state の扱い
 - [recipes/](https://github.com/happy-ryo/loop-agent/tree/main/docs/recipes/) — ground truth verify の具体例集
 - [safety.md](safety.md) — `gate` シームと HumanGate の射程

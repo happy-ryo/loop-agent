@@ -15,6 +15,7 @@
 | [refactor.md](./refactor.md) | 挙動不変リファクタ（N module） | 既存テスト全 pass + AST レベルで挙動同値 |
 | [multi-item-work-list.md](./multi-item-work-list.md) | N 件を 1 本のループで公平に回す（横断） | （上記各 recipe の verify をそのまま per-item 適用） |
 | [self-maintenance.md](./self-maintenance.md) | loop-agent 自身の小さな整合性修正 | stale wording scan + docs link + pytest |
+| [review-driven-loop.md](./review-driven-loop.md) | LLM-backed edit の post-act review | review approval + ground-truth verify |
 | [circuit-breakers.md](./circuit-breakers.md) | 同じ失敗の繰り返しを早く止める | `NoProgress` / custom `StopCondition` |
 
 > 「このタスクは loop-agent に向いているか?」の最初のフィルタは **verify が sharp に書けるか**。書けないタスク（「もっと良い文章にして」等、機械判定できない目標）は coding agent 側で triage 除外するのが規律です。
@@ -42,14 +43,14 @@ result = run_loop(
 
 ## 暴走する 1 回の呼び出しを止める（per-call timeout / kill）
 
-`act` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
+`act` / `review` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations
 
 result = run_loop(
     act=my_act, verify=my_verify, conditions=[MaxIterations(20)],
-    timeout=TimeoutPolicy(act=30.0, verify=10.0, on_timeout="graceful"),
+    timeout=TimeoutPolicy(act=30.0, review=20.0, verify=10.0, on_timeout="graceful"),
 )
 ```
 
