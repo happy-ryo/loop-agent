@@ -126,3 +126,47 @@ def test_review_followup_is_reproducible_not_one_off_local_artifact():
     assert "ReviewHook" in recipe
     assert "loop-state.db" in gitignore
     assert "loop-state.db-*" in gitignore
+
+
+def test_public_api_groups_partition_top_level_exports():
+    groups = loop_agent.PUBLIC_API_GROUPS
+
+    assert set(groups) == {"core", "harness", "advanced", "operations"}
+    assert groups["core"] is loop_agent.CORE_API
+    assert groups["harness"] is loop_agent.HARNESS_API
+    assert groups["advanced"] is loop_agent.ADVANCED_API
+    assert groups["operations"] is loop_agent.OPERATIONS_API
+
+    grouped = [name for names in groups.values() for name in names]
+    assert len(grouped) == len(set(grouped))
+
+    metadata = [
+        "CORE_API",
+        "HARNESS_API",
+        "ADVANCED_API",
+        "OPERATIONS_API",
+        "PUBLIC_API_GROUPS",
+    ]
+    assert set(loop_agent.__all__) == set(grouped) | set(metadata)
+    assert loop_agent.__all__ == grouped + metadata
+
+
+def test_public_api_group_docs_exist_for_humans_and_coding_agents():
+    stability = _read("docs/stability.md")
+    first_harness = _read("docs/first-harness-api.md")
+    ai_map = _read("docs/ai-api-map.md")
+    skill = _read("src/loop_agent/skills/loop-agent/SKILL.md")
+    skill_map = _read("src/loop_agent/skills/loop-agent/references/api-map.md")
+
+    for name in ("CORE_API", "HARNESS_API", "ADVANCED_API", "OPERATIONS_API"):
+        assert f"`{name}`" in stability
+        assert name in ai_map
+    assert "CORE_API" in first_harness
+    assert "HARNESS_API" in first_harness
+    assert "references/api-map.md" in skill
+    assert "If The Loop Must Resume After Interruption" in skill_map
+    assert "If Act Needs Artifact Review Before Verify" in skill_map
+    assert "ReviewOutcome" in skill_map
+    assert "generated-AI adapter" in skill_map
+    assert '"decision":"blocking"' in skill_map
+    assert "`HumanGate` runs before `act`" in skill_map

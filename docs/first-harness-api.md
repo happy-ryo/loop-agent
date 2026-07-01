@@ -1,13 +1,14 @@
 # First Harness API
 
-This page is the shortest import map for a first production-style loop. The full
-public surface stays documented in [stability.md](./stability.md) and
-[api-reference.md](./api-reference.md); this page is only the daily starting
-surface.
+This page is the shortest import map for a first production-style loop. The
+full public surface stays documented in [stability.md](./stability.md) and
+[api-reference.md](./api-reference.md). When a coding agent is choosing
+production harness helpers, use [ai-api-map.md](./ai-api-map.md) as the
+capability map. This page is only the daily starting surface.
 
 ## The Daily Surface
 
-Start with these symbols:
+Start with the `CORE_API` shape. In code, import only the symbols you need:
 
 ```python
 from loop_agent import (
@@ -58,7 +59,7 @@ result = run_loop(
 
 ## Add Helpers Only When Needed
 
-After the first loop works, add one practical helper at a time:
+After the first loop works, add one practical `HARNESS_API` helper at a time:
 
 | Need | Import |
 |---|---|

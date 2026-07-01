@@ -14,6 +14,9 @@ loop-agent は任意のエージェント / アプリに `pip install` で組み
 
 `1.0.0` の互換性契約は **[docs/stability.md](./docs/stability.md)** が canonical source。README は使い始めるための入口で、安定 API / 高度機能 / 非契約の境界は stability contract を正とする。
 
+
+まずは **最小の loop harness** と判断軸から始められる。coding agent に harness を組み立てさせる場合は、同梱 skill の `references/api-map.md`（リポジトリ上では [docs/ai-api-map.md](./docs/ai-api-map.md)）が API 選択の地図になる。top-level API は AI が発見しやすいよう広めに残しつつ、`CORE_API` / `HARNESS_API` / `ADVANCED_API` / `OPERATIONS_API` に分類している。
+
 > Loop Engineering とは、人間がエージェントに一手ずつプロンプトを打つのをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する「システム（=ループ）そのもの」を設計する**実践。`prompt engineering → context engineering → loop engineering` という 3 層スタックの最上位（制御層）に位置する。
 
 ## 安定 API とスコープ
@@ -137,6 +140,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 |---|---|
 | [docs/quickstart.md](./docs/quickstart.md) | 30 分で動かす動線（E primary + 監視 / resume / トラブルシュート） |
 | [docs/first-harness-api.md](./docs/first-harness-api.md) | 初回 harness で使う最小 API surface（daily imports / 追加 helper の順序） |
+| [docs/ai-api-map.md](./docs/ai-api-map.md) | coding agent 向け capability map（用途 → import → seam 配線） |
 | [docs/seams.md](./docs/seams.md) | シーム詳細（型・ground-truth の鉄則・二重終了条件・検証駆動デモ） |
 | [docs/verifiers.md](./docs/verifiers.md) | ground-truth verify helper（CommandVerifier / PytestVerifier / RegexVerifier） |
 | [docs/review.md](./docs/review.md) | optional post-act review (`review=` / `ReviewOutcome`) |
