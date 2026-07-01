@@ -15,6 +15,7 @@ Subcommands::
     loop-agent spikes [<run-id>] [--db PATH]
     loop-agent resume <run-id> ./task.toml
     loop-agent logs   <run-id> [--follow]
+    loop-agent init-harness [--template light|claude|codex] [--output DIR] [--force]
     loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
     loop-agent                       # quick help + a sample task.toml
 
@@ -958,6 +959,227 @@ def cmd_logs(args: argparse.Namespace, out: Any = None) -> int:
     return 0
 
 
+# -- init-harness ------------------------------------------------------------
+
+HARNESS_TEMPLATE_LIGHT = "light"
+HARNESS_TEMPLATE_CLAUDE = "claude"
+HARNESS_TEMPLATE_CODEX = "codex"
+HARNESS_TEMPLATE_CHOICES = (
+    HARNESS_TEMPLATE_LIGHT,
+    HARNESS_TEMPLATE_CLAUDE,
+    HARNESS_TEMPLATE_CODEX,
+)
+
+LIGHT_HARNESS_PY = '''\
+"""Lightweight loop-agent harness.
+
+Use this when the action is an in-process Python function or a small local
+script. Replace `act` and `verify` with domain policy; keep the mechanical caps.
+"""
+
+from loop_agent import ActOutcome, MaxIterations, Timeout, VerifyOutcome, run_loop
+
+
+GOAL = "Replace this with the concrete task goal."
+
+
+def act(_context):
+    # TODO: Do one bounded, reversible unit of work.
+    return ActOutcome(observation=f"not implemented: {GOAL}", tokens=0)
+
+
+def verify(_outcome):
+    # TODO: Replace with a machine oracle: pytest, compiler, AST check, probe, etc.
+    return VerifyOutcome(goal_met=False, detail="replace verify with ground truth")
+
+
+if __name__ == "__main__":
+    result = run_loop(
+        act=act,
+        verify=verify,
+        conditions=[MaxIterations(5), Timeout(300)],
+    )
+    print(result.status, result.reason)
+'''
+
+CLAUDE_HARNESS_PY = '''\
+"""Claude Code loop-agent harness.
+
+The agent is limited to reversible file editing. Commit, push, and deploy stay
+outside the loop unless you model them as gated discrete actions.
+"""
+
+from loop_agent import MaxIterations, PytestVerifier, Timeout, TokenBudget, run_loop
+from loop_agent.adapters import ClaudeCodeAct
+
+
+TASK_PROMPT = """\
+Replace this with one concrete bounded task.
+
+Rules:
+- Make only the smallest needed file edits.
+- Do not commit, push, deploy, or mutate external services.
+- Stop after one coherent attempt; verify will run separately.
+"""
+
+act = ClaudeCodeAct(
+    allowed_tools=["Read", "Edit"],
+    model="sonnet",
+    timeout=600,
+)
+verify = PytestVerifier(["tests", "-q"], timeout=120)
+
+
+if __name__ == "__main__":
+    result = run_loop(
+        gather=lambda state: {"prompt": f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}"},
+        act=act,
+        verify=verify,
+        conditions=[MaxIterations(10), Timeout(1800), TokenBudget(500_000)],
+    )
+    print(result.status, result.reason)
+'''
+
+CODEX_HARNESS_PY = '''\
+"""Codex loop-agent harness.
+
+The Codex subprocess receives the prompt as a positional argument and stdin is
+closed by the adapter. Keep irreversible operations outside the loop unless you
+model them as gated discrete actions.
+"""
+
+from loop_agent import MaxIterations, PytestVerifier, Timeout, TokenBudget, run_loop
+from loop_agent.adapters import CodexAct
+
+
+TASK_PROMPT = """\
+Replace this with one concrete bounded task.
+
+Rules:
+- Make only the smallest needed file edits.
+- Do not commit, push, deploy, or mutate external services.
+- Stop after one coherent attempt; verify will run separately.
+"""
+
+act = CodexAct(
+    model="gpt-5.5",
+    effort="medium",
+    sandbox="workspace-write",
+    timeout=600,
+)
+verify = PytestVerifier(["tests", "-q"], timeout=120)
+
+
+if __name__ == "__main__":
+    result = run_loop(
+        gather=lambda state: {"prompt": f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}"},
+        act=act,
+        verify=verify,
+        conditions=[MaxIterations(10), Timeout(1800), TokenBudget(500_000)],
+    )
+    print(result.status, result.reason)
+'''
+
+LIGHT_HARNESS_README = '''\
+# Light loop-agent harness
+
+This scaffold is for an in-process or local-script loop. Edit `harness.py`:
+
+1. Replace `act` with one bounded, reversible unit of work.
+2. Replace `verify` with ground truth such as pytest, a compiler, an AST check,
+   a schema check, or a smoke probe.
+3. Keep at least one mechanical cap such as `MaxIterations` or `Timeout`.
+
+Run:
+
+```bash
+python harness.py
+```
+'''
+
+CLAUDE_HARNESS_README = '''\
+# Claude Code loop-agent harness
+
+This scaffold uses `ClaudeCodeAct` as the `act` seam and `PytestVerifier` as the
+initial ground-truth `verify` seam.
+
+Before running:
+
+1. Edit `TASK_PROMPT` in `harness.py`.
+2. Narrow `verify = PytestVerifier([...])` to the real oracle for the task.
+3. Keep `allowed_tools=["Read", "Edit"]` unless you intentionally model an
+   irreversible action as a gated loop action.
+
+Run:
+
+```bash
+python harness.py
+```
+'''
+
+CODEX_HARNESS_README = '''\
+# Codex loop-agent harness
+
+This scaffold uses `CodexAct` as the `act` seam and `PytestVerifier` as the
+initial ground-truth `verify` seam.
+
+Before running:
+
+1. Edit `TASK_PROMPT` in `harness.py`.
+2. Narrow `verify = PytestVerifier([...])` to the real oracle for the task.
+3. Keep irreversible actions outside the loop unless they are explicit gated
+   actions.
+
+Run:
+
+```bash
+python harness.py
+```
+'''
+
+
+def _harness_files(template: str) -> dict[str, str]:
+    if template == HARNESS_TEMPLATE_LIGHT:
+        return {"harness.py": LIGHT_HARNESS_PY, "README.md": LIGHT_HARNESS_README}
+    if template == HARNESS_TEMPLATE_CLAUDE:
+        return {"harness.py": CLAUDE_HARNESS_PY, "README.md": CLAUDE_HARNESS_README}
+    if template == HARNESS_TEMPLATE_CODEX:
+        return {"harness.py": CODEX_HARNESS_PY, "README.md": CODEX_HARNESS_README}
+    raise ConfigError(
+        f"unknown harness template {template!r}; expected one of {HARNESS_TEMPLATE_CHOICES}"
+    )
+
+
+def _write_harness_files(output: Path, files: dict[str, str], *, force: bool) -> list[Path]:
+    output.mkdir(parents=True, exist_ok=True)
+    targets = [output / name for name in files]
+    existing = [p for p in targets if p.exists()]
+    if existing and not force:
+        names = ", ".join(str(p) for p in existing)
+        raise ConfigError(f"refusing to overwrite existing scaffold file(s): {names}")
+    written: list[Path] = []
+    for name, content in files.items():
+        target = output / name
+        target.write_text(content, encoding="utf-8")
+        written.append(target)
+    return written
+
+
+def cmd_init_harness(args: argparse.Namespace, out: Any = None) -> int:
+    """Create starter harness files for the common production entry points."""
+    out = sys.stdout if out is None else out
+    output = Path(args.output).expanduser()
+    written = _write_harness_files(
+        output,
+        _harness_files(args.template),
+        force=args.force,
+    )
+    print(f"template   : {args.template}", file=out)
+    print(f"output     : {output}", file=out)
+    for path in written:
+        print(f"created    : {path}", file=out)
+    return 0
+
 # -- install-skills ----------------------------------------------------------
 
 # The reference-bundled coding-agent skill (Issue #73) ships *inside* the
@@ -1140,6 +1362,7 @@ Usage:
   loop-agent spikes [<run-id>] [--db PATH]
   loop-agent resume <run-id> ./task.toml [--db PATH]
   loop-agent logs   <run-id> [--follow] [--db PATH]
+  loop-agent init-harness [--template light|claude|codex] [--output DIR] [--force]
   loop-agent install-skills [--target-agent claude|codex|cursor|all] [--user | --target PATH]
 
 Run 'loop-agent <command> --help' for per-command options.
@@ -1245,6 +1468,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_db_flag(p_logs)
     p_logs.set_defaults(func=cmd_logs)
+
+    p_init = sub.add_parser(
+        "init-harness", help="create starter harness files"
+    )
+    p_init.add_argument(
+        "--template",
+        choices=HARNESS_TEMPLATE_CHOICES,
+        default=HARNESS_TEMPLATE_LIGHT,
+        help="starter harness template (default: light)",
+    )
+    p_init.add_argument(
+        "--output",
+        default=".",
+        help="directory to write harness.py and README.md (default: current directory)",
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing scaffold files",
+    )
+    p_init.set_defaults(func=cmd_init_harness)
 
     p_install = sub.add_parser(
         "install-skills",

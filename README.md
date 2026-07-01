@@ -139,7 +139,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/transport.md](./docs/transport.md) | wake 配送 transport と work-discovery / WorkListGather |
 | [docs/reflexion.md](./docs/reflexion.md) | 外側 Reflexion ループ + RQGM epoch 安全核 |
 | [docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md) | Reflexion を使うべきか・blind retry で足りるかの判断 |
-| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`run / status / summary / dashboard / spikes / resume / logs`） |
+| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`run / status / summary / dashboard / spikes / resume / logs / init-harness`） |
 | [docs/api-reference.md](./docs/api-reference.md) | 全 API 概要表 + ループコアのスコープ + テスト |
 | [docs/api-surface.md](./docs/api-surface.md) | API surface を小さく保つための分類と追加基準 |
 | [docs/errors.md](./docs/errors.md) | 例外階層（`LoopError` / `ConfigError` / `StateError`）と捕捉 |

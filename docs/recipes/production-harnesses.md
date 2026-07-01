@@ -3,6 +3,19 @@
 Use this page when you want a production starting point instead of a catalog of
 patterns. The recipes directory has supporting examples, but most deployments
 should start from one of these three harness shapes.
+## Scaffold First
+
+Generate the starter files before hand-writing a harness:
+
+```bash
+loop-agent init-harness --template light  --output ./harness-light
+loop-agent init-harness --template claude --output ./harness-claude
+loop-agent init-harness --template codex  --output ./harness-codex
+```
+
+Each template writes `harness.py` and `README.md`. The generated files are not a
+policy engine: edit the prompt, the verifier, the caps, and any gate predicate
+for your domain. Existing files are preserved unless `--force` is passed.
 
 ## 1. Single Verified Edit Loop
 
