@@ -128,7 +128,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/review.md](./docs/review.md) | optional post-act review (`review=` / `ReviewOutcome`) |
 | [docs/adapters/README.md](./docs/adapters/README.md) | act アダプタ（`ClaudeCodeAct` / `CodexAct` / ModelLadder + API 比較表） |
 | [docs/adapters/writing-an-adapter.md](./docs/adapters/writing-an-adapter.md) | 自作 adapter の書き方（`ActHook` 契約・token 二重計上の回避） |
-| [docs/recipes/](./docs/recipes/README.md) | 動線 E の prose intent → harness 具体例（flaky test / 翻訳 / リファクタ） |
+| [docs/recipes/](./docs/recipes/README.md) | 動線 E の prose intent → harness 具体例（代表 production harness / flaky test / 翻訳 / リファクタ） |
 | [docs/persistence-and-resume.md](./docs/persistence-and-resume.md) | 永続化と再開（progress file / state.db SoT / resume #14） |
 | [docs/safety.md](./docs/safety.md) | 安全装置（暴走防止 / 限定人間ゲート / 安全テンプレ） |
 | [docs/observability.md](./docs/observability.md) | 観測（loop events / OTel span / 外側 Reflexion 観測） |
