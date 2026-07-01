@@ -142,6 +142,28 @@ final ground-truth verifier, especially when the feedback should guide the next
 iteration. A blocking review records a failed step and skips `verify` for that
 iteration, so the next `gather` can feed the review feedback back into `act`.
 
+The review seam may itself call a generated-AI adapter, including
+`ClaudeCodeAct`, `CodexAct`, or a custom `ActHook`. When you do this, control the
+reviewer's output format. Prefer a small JSON object over free text, and treat
+parse failures or unknown fields as blocking so the loop does not accept an
+ambiguous "looks good" response:
+
+```json
+{"decision":"approved","findings":[],"residual_risk":"pytest still runs in verify"}
+```
+
+```json
+{"decision":"blocking","findings":["public API docs omit ReviewOutcome"],"residual_risk":"AI map may guide agents to skip review"}
+```
+
+This pattern lets a generated-AI reviewer produce targeted feedback, while
+`verify` still catches the final result with ground truth. For example, review can
+require JSON shape, scope, API fit, or documentation consistency; verify can then
+run pytest, an AST/schema check, or a regex that mechanically rejects outputs that
+did not satisfy the required format. If review output is meant to be inspected by
+`verify`, persist or encode it in a deterministic shape rather than relying on
+natural-language phrasing.
+
 Distinctions:
 
 - `HumanGate` runs before `act` and protects irreversible proposed actions.
