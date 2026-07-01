@@ -60,7 +60,7 @@ Issues = "https://github.com/happy-ryo/loop-agent/issues"
 #   otel  -> OTel GenAI span integration (loop_agent.otel; degrades to no-op when absent)
 #   redis -> Redis-backed cross-process WakeQueue (loop_agent.transport.RedisWakeQueue; Issue #41)
 #   test  -> running the suite (incl. OTel SDK for in-memory-exporter span assertions)
-#   dev   -> test deps + release tooling (build/twine)
+#   dev   -> test deps + lint/type/release tooling (ruff/mypy/build/twine)
 # NOTE: the loop core and the default in-memory / SQLite (stdlib `sqlite3`)
 # transports stay dependency-free. `redis` is required only by the optional
 # cross-process RedisWakeQueue backend, which import-gates `redis` and raises a
@@ -76,6 +76,8 @@ test = [
 dev = [
     "loop-agent[test]",
     "build>=1.0",
+    "mypy>=1.10",
+    "ruff>=0.6",
     "twine>=5.0",
 ]
 
@@ -98,3 +100,27 @@ addopts = "-q"
 # editable install that might point at a sibling worktree, so the suite always
 # tests the code in this tree regardless of the ambient environment.
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F821", "F822", "F823"]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "src/loop_agent/conditions.py",
+    "src/loop_agent/convergence.py",
+    "src/loop_agent/errors.py",
+    "src/loop_agent/events.py",
+    "src/loop_agent/memory.py",
+    "src/loop_agent/progress.py",
+    "src/loop_agent/state.py",
+    "src/loop_agent/transport.py",
+]
+ignore_missing_imports = true
+warn_unused_configs = true
+check_untyped_defs = false
+disallow_untyped_defs = false

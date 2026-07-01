@@ -111,6 +111,8 @@ Before a release, these must agree:
 The release gate is:
 
 ```bash
+python -m ruff check .
+python -m mypy
 python -m pytest
 python -m build
 python -m twine check dist/*

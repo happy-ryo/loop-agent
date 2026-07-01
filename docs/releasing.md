@@ -44,6 +44,8 @@ loop-agent を PyPI へリリースする手順と方針をまとめる。発行
 - README から [stability.md](./stability.md) が辿れる。
 - `pyproject.toml` classifier が `Development Status :: 5 - Production/Stable`。
 - `pyproject.toml` / `loop_agent.__version__` / `CHANGELOG.md` / tag が同一 version。
+- `python -m ruff check .` が pass。
+- `python -m mypy` が pass。
 - `python -m pytest` が pass。
 - `python -m build` が pass。
 - `python -m twine check dist/*` が pass。
@@ -89,7 +91,10 @@ version は 2 箇所に書く。リリース前に**必ず一致**させる:
 タグを打つ前に、ワークフローと同じ検証をローカルで実行できる:
 
 ```bash
-python -m pip install --upgrade build twine   # もしくは: pip install -e .[dev]
+python -m pip install -e .[dev]
+python -m ruff check .
+python -m mypy
+python -m pytest
 python -m build                                # dist/ に wheel と sdist を生成
 python -m twine check dist/*                   # メタデータ / long description を検証
 ```
