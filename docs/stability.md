@@ -24,6 +24,14 @@ These symbols are available from `import loop_agent`. Removing them, renaming
 them, or changing their call signatures incompatibly requires a major release.
 Adding optional parameters with compatible defaults is allowed in a minor release.
 
+## Typed Package Contract
+
+loop-agent ships a `py.typed` marker in the wheel and declares `Typing :: Typed`
+metadata. The inline annotations for the stable public API are therefore part of
+the downstream type-checking surface under PEP 561. Runtime behavior remains the
+compatibility authority; annotation-only fixes that make the documented behavior
+more accurately typed may ship in minor or patch releases.
+
 ## Advanced Stable API
 
 The following surfaces are stable but advanced. They are still compatibility

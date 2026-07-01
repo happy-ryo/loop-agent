@@ -35,8 +35,19 @@ def test_stability_docs_are_linked_and_not_beta_wording():
     assert "1.0.0 Stable" in api
     assert "0.1.0 Beta" not in api
     assert "Stable Public API" in stability
+    assert "Typed Package Contract" in stability
     assert "Advanced Stable API" in stability
     assert "Deprecation Policy" in stability
+
+
+def test_package_declares_pep_561_typing_contract():
+    pyproject = _read("pyproject.toml")
+    marker = ROOT / "src" / "loop_agent" / "py.typed"
+
+    assert marker.is_file()
+    assert marker.read_text(encoding="utf-8") == ""
+    assert '"Typing :: Typed"' in pyproject
+    assert '"src/loop_agent/py.typed"' in pyproject
 
 
 def test_cli_and_state_db_contract_sections_exist():

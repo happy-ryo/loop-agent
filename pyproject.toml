@@ -34,6 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -88,7 +89,7 @@ packages = ["src/loop_agent"]
 # dropped from the wheel. The sdist carries it too via hatchling's default
 # (VCS-tracked) file selection, so the release (which builds the wheel from the
 # sdist) keeps the bundle end to end.
-artifacts = ["src/loop_agent/skills/**/*.md"]
+artifacts = ["src/loop_agent/skills/**/*.md", "src/loop_agent/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
