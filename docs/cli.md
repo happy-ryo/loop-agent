@@ -1,4 +1,4 @@
-# CLI ランチャ (loop-agent run / status / summary / dashboard / spikes / resume / logs)
+# CLI ランチャ (loop-agent run / status / summary / dashboard / spikes / resume / logs / init-harness)
 
 宣言的な `task.toml` から `gather -> act -> verify -> repeat` ループを起動する stdlib（argparse）製の CLI（Issue #31）。`act` / `verify` は **(1) subprocess command** か **(2) Python callable**（`module:attr`）のどちらでも書ける。各反復は state.db SoT（`DBProgressLog`）へ永続化されるので、run-id で進捗確認・**resume**・event 追跡ができる。
 
@@ -22,6 +22,9 @@ loop-agent spikes <run-id> --db loop-state.db
 loop-agent resume <run-id> ./examples/task.toml   # 中断ループを途中から再開（復元 state を seed）
 loop-agent logs <run-id>              # LoopObserver の event（loop_begin/step/end）を表示
 loop-agent logs <run-id> --follow     # 新規 event を loop_end まで追尾（tail -f 風）
+loop-agent init-harness --template light  --output ./harness-light
+loop-agent init-harness --template claude --output ./harness-claude
+loop-agent init-harness --template codex  --output ./harness-codex
 ```
 
 `task.toml`（[`examples/task.toml`](../examples/task.toml) も参照）:
@@ -61,6 +64,7 @@ command = ["pytest", "-q"]
 - **終了コード**: ゴール到達（`result.succeeded`）で `0`、ハード上限などで停止すると `1`、設定/使用法エラーは `2`（メッセージは stderr）。
 - **db は複数 run を 1 ファイルに保持**し run-id で識別する。`--db` で明示でき、既定は `[state].db`、無ければ `loop-state.db`。
 - **operations 系は read-only**: `loop-agent summary` / `dashboard` / `spikes` は run 一覧・停止理由・pending 数・event 数・step timeline・spike 候補を読むだけで、run 状態や判断ロジックは変更しない。
+- **scaffold は policy を所有しない**: `init-harness` は `harness.py` / `README.md` の出発点を生成するだけ。prompt、verify command、caps、gate 対象は生成後に caller が編集する。既存ファイルは `--force` なしでは上書きしない。
 - **subprocess の act/verify には必ず有限の timeout が掛かる**（`[act]`/`[verify]`.`timeout_seconds` > ループ `timeout_seconds` > 既定 3600s）。停止条件は反復境界でのみ評価され実行中ステップは中断しないため、無制限の subprocess が hang すると全 cap を無効化してしまうのを防ぐ。
 - `--help` の文字列は ASCII のみ（cp932 コンソールでもクラッシュしない）。
 
@@ -68,7 +72,7 @@ command = ["pytest", "-q"]
 
 `1.0.0` 以降、次の CLI 面は安定契約に含める:
 
-- サブコマンド名: `run` / `status` / `summary` / `dashboard` / `spikes` / `resume` / `logs` / `install-skills`
+- サブコマンド名: `run` / `status` / `summary` / `dashboard` / `spikes` / `resume` / `logs` / `init-harness` / `install-skills`
 - `run` の TOML セクションと主要キー: `[loop]` / `[conditions]` / `[act]` / `[verify]` / `[state]`
 - 終了コード: 成功 `0`、停止 `1`、設定/使用法エラー `2`
 - `state.db` を run-id で読む基本動作

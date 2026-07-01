@@ -734,6 +734,62 @@ def test_cmd_logs_missing_run(tmp_path, capsys):
     assert "no run 'ghost'" in capsys.readouterr().err
 
 
+# -- init-harness scaffold ---------------------------------------------------
+
+
+def test_cmd_init_harness_light_template(tmp_path, capsys):
+    out_dir = tmp_path / "light-harness"
+
+    rc = main(["init-harness", "--template", "light", "--output", str(out_dir)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "template   : light" in out
+    harness = out_dir / "harness.py"
+    readme = out_dir / "README.md"
+    assert harness.exists()
+    assert readme.exists()
+    text = harness.read_text(encoding="utf-8")
+    assert "ActOutcome" in text
+    assert "VerifyOutcome" in text
+    assert "MaxIterations(5)" in text
+
+
+@pytest.mark.parametrize(
+    ("template", "needle"),
+    [
+        ("claude", "ClaudeCodeAct"),
+        ("codex", "CodexAct"),
+    ],
+)
+def test_cmd_init_harness_agent_templates(tmp_path, capsys, template, needle):
+    out_dir = tmp_path / template
+
+    rc = main(["init-harness", "--template", template, "--output", str(out_dir)])
+    capsys.readouterr()
+
+    assert rc == 0
+    text = (out_dir / "harness.py").read_text(encoding="utf-8")
+    assert needle in text
+    assert "PytestVerifier" in text
+    assert "TokenBudget" in text
+
+
+def test_cmd_init_harness_refuses_overwrite_without_force(tmp_path, capsys):
+    out_dir = tmp_path / "harness"
+    assert main(["init-harness", "--output", str(out_dir)]) == 0
+    capsys.readouterr()
+
+    rc = main(["init-harness", "--output", str(out_dir)])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "refusing to overwrite" in err
+
+    rc = main(["init-harness", "--output", str(out_dir), "--force"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "created    :" in out
 # -- top-level main ----------------------------------------------------------
 
 

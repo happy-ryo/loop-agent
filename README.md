@@ -75,6 +75,19 @@ while not goal_met and conditions_ok:
 | **D: 応用パターン** | 経験者 | ModelLadder / Reflexion 合成 / WorkListGather — シームで**自分でも書ける**正準例 |
 | **E: coding-agent driven（推奨）** | 意図を持つ全ユーザー | prose intent → coding agent が harness を組む → 実行 |
 
+### まず scaffold する（推奨）
+
+production harness の出発点は CLI で生成できます。生成されるのは `harness.py` と短い `README.md` だけで、prompt / verify / 停止条件 / gate 対象は呼び出し側が編集します。
+
+```bash
+pip install loop-agent
+loop-agent init-harness --template light  --output ./harness-light   # 軽い in-process / local script 用
+loop-agent init-harness --template claude --output ./harness-claude  # Claude Code adapter 用
+loop-agent init-harness --template codex  --output ./harness-codex   # Codex adapter 用
+python ./harness-light/harness.py
+```
+
+既存ファイルは `--force` なしでは上書きしません。代表 production harness の選び方は [docs/recipes/production-harnesses.md](./docs/recipes/production-harnesses.md)、初回 API の最小 import は [docs/first-harness-api.md](./docs/first-harness-api.md)。
 ### 動線 A: 最短デモ（5 行 Python）
 
 `act`（行動）と `verify`（検証 = ground truth）と止め方（`conditions`）を渡して `run_loop` を呼ぶだけ。
@@ -139,7 +152,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/transport.md](./docs/transport.md) | wake 配送 transport と work-discovery / WorkListGather |
 | [docs/reflexion.md](./docs/reflexion.md) | 外側 Reflexion ループ + RQGM epoch 安全核 |
 | [docs/reflexion-when-to-use.md](./docs/reflexion-when-to-use.md) | Reflexion を使うべきか・blind retry で足りるかの判断 |
-| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`run / status / summary / dashboard / spikes / resume / logs`） |
+| [docs/cli.md](./docs/cli.md) | CLI ランチャ（`run / status / summary / dashboard / spikes / resume / logs / init-harness`） |
 | [docs/api-reference.md](./docs/api-reference.md) | 全 API 概要表 + ループコアのスコープ + テスト |
 | [docs/api-surface.md](./docs/api-surface.md) | API surface を小さく保つための分類と追加基準 |
 | [docs/errors.md](./docs/errors.md) | 例外階層（`LoopError` / `ConfigError` / `StateError`）と捕捉 |
