@@ -24,7 +24,7 @@ Where to draw the line: a "one-off, single-pass operation" or a "task that needs
 Proceed through the following 5 steps. For each step, the reference to read is called out explicitly. Don't read everything at once -- read only the references relevant to the issue you hit, on demand.
 
 1. **Grasp the core first** -- read `references/design-philosophy.md` and internalize the 5 seams (gather / act / verify / conditions / gate) and the embeddable core (policy is injected; only the loop body itself is the library). **This one file is the only thing to read first.**
-2. **Design the seams your user's domain needs** -- map the user's request (database / DevOps / scientific computing / document processing / anything) onto the 5 seams. Follow the "5-seam design checklist" below for each seam's design questions. If you need to dig into seam types, contracts, the dual termination condition, and the ground-truth iron rule, see `references/seams.md`.
+2. **Design the seams your user's domain needs** -- map the user's request (database / DevOps / scientific computing / document processing / anything) onto the 5 seams. For API selection, read `references/api-map.md` when you need to choose imports or production harness helpers. Follow the "5-seam design checklist" below for each seam's design questions. If you need to dig into seam types, contracts, the dual termination condition, and the ground-truth iron rule, see `references/seams.md`.
 3. **Read only the references you need, on demand** -- don't read them all. Pick from the table below according to the issue your seam design hits.
 4. **Read `examples/` as inspiration (no literal copying)** -- `references/examples/{translation,flaky-test,refactor}.md` are illustrations of "intent -> seam design." Even if the user's domain matches, **do not copy them verbatim**. Borrow the **design principles** -- the sharpness of verify, fair scheduling, commit isolation -- and rewrite the code for the user's domain.
 5. **Present design decisions to the user before implementing** -- briefly present to the user how you filled in the 5 seams (especially the ground-truth basis for verify, the stopping conditions, and the gate targets), get agreement, and then write the harness.
@@ -34,6 +34,7 @@ Proceed through the following 5 steps. For each step, the reference to read is c
 | Situation | Reference to read |
 |---|---|
 | The initial core (always first) | `references/design-philosophy.md` |
+| Choosing imports / matching a user need to the right helper | `references/api-map.md` |
 | Seam types, contracts, the dual termination condition, the ground-truth iron rule | `references/seams.md` |
 | Making act an external CLI subprocess / a custom adapter / the 4 clauses / token double-counting | `references/writing-an-adapter.md` |
 | Gate scope / isolating irreversible operations / `allowed_tools` discipline / runaway prevention | `references/safety.md` |

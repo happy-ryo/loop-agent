@@ -19,6 +19,7 @@ The stable core API is the small embeddable loop surface:
 | Observability | `LoopEvent`, `EventSink`, `ListSink`, `CallableSink`, `JsonlEventSink`, `read_events`, `LOOP_BEGIN`, `LOOP_STEP`, `LOOP_END`, `LoopObserver`, `run_observed_loop` |
 | Verifier helpers | `CommandVerifier`, `PytestVerifier`, `RegexVerifier` |
 | Errors | `LoopError`, `ConfigError`, `StateError`, `AsyncSeamInSyncLoop` |
+| API grouping metadata | `CORE_API`, `HARNESS_API`, `ADVANCED_API`, `OPERATIONS_API`, `PUBLIC_API_GROUPS` |
 
 These symbols are available from `import loop_agent`. Removing them, renaming
 them, or changing their call signatures incompatibly requires a major release.
@@ -31,6 +32,25 @@ metadata. The inline annotations for the stable public API are therefore part of
 the downstream type-checking surface under PEP 561. Runtime behavior remains the
 compatibility authority; annotation-only fixes that make the documented behavior
 more accurately typed may ship in minor or patch releases.
+
+
+## Public API Groups
+
+The top-level namespace intentionally remains broad for coding-agent discovery,
+but it is not flat. These machine-readable lists classify the surface:
+
+| Group | Intended use |
+|---|---|
+| `CORE_API` | Daily loop construction: driver, outcome dataclasses, stop conditions, verifier helpers, and errors. |
+| `HARNESS_API` | Production harness helpers: persistence/resume, human gates, and multi-item work-list scheduling. |
+| `ADVANCED_API` | Opt-in advanced composition: per-call timeout primitives, notifications, Reflexion, evaluator/memory, transport, and work discovery. |
+| `OPERATIONS_API` | Read-only and observational helpers: events, observed loop runners, OTel, dashboards, spikes, throttling, and wake helpers. |
+| `PUBLIC_API_GROUPS` | Mapping from group name to the corresponding list for tools and coding agents. |
+
+`__all__` is the concatenation of these groups plus the group names themselves.
+New top-level exports must be placed in exactly one group, then documented in the
+classification table below. Human-facing docs should lead with `CORE_API`; coding
+agent docs should expose `CORE_API` plus `HARNESS_API` before advanced surfaces.
 
 ## Advanced Stable API
 
@@ -74,6 +94,7 @@ must be added to one of these rows before release.
 | Transport and wakes | `Wake`, `WAKE_LOOP_DONE`, `WAKE_NEXT_ITERATION`, `WAKE_DECISION_REQUEST`, `WAKE_KINDS`, `PushBackend`, `CallablePushBackend`, `NullPushBackend`, `WakeQueue`, `InMemoryWakeQueue`, `SqliteWakeQueue`, `RedisWakeQueue`, `open_wake_queue`, `Transport`, `CADENCE_SECONDS`, `DEFAULT_CADENCE_SECONDS`, `cadence_for`, `due_to_poll`, `LoopWaker`, `wakes_for_result`, `wake_id_for` |
 | Work discovery | `Candidate`, `BlockedCandidate`, `Triage`, `triage`, `Proposal`, `AdoptionResult`, `WorkDiscovery`, `discover_next`, `WorkItem`, `WorkListGather`, `WorkListProgress`, `WorkListDrained`, `ScheduleContext`, `Scheduler`, `Drained`, `DRAINED` |
 | Errors | `LoopError`, `ConfigError`, `StateError`, `AsyncSeamInSyncLoop` |
+| API grouping metadata | `CORE_API`, `HARNESS_API`, `ADVANCED_API`, `OPERATIONS_API`, `PUBLIC_API_GROUPS` |
 
 ## API Surface Discipline
 
