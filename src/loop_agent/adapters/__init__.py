@@ -2,9 +2,10 @@
 
 Provides :class:`ClaudeCodeAct`, which plugs Claude Code (headless
 ``claude --print``) into ``run_loop`` in one line; :class:`CodexAct`, which does the
-same for Codex CLI (headless ``codex exec``); and subprocess-free test doubles
-:class:`MockClaudeCodeAct` / :class:`MockCodexAct`. All can be used as ``ActHook``
-(``Callable[[context], ActOutcome]``).
+same for Codex CLI (headless ``codex exec``); subprocess-free test doubles
+:class:`MockClaudeCodeAct` / :class:`MockCodexAct`; and optional model preflight
+helpers for checking adapter model candidates before a loop starts. All act adapters
+can be used as ``ActHook`` (``Callable[[context], ActOutcome]``).
 
 Usage::
 
@@ -43,6 +44,20 @@ from .model_ladder import (
     after_attempts,
     on_failure,
 )
+from .model_preflight import (
+    CLAUDE_CODE_FULL_MODEL_CANDIDATES,
+    CLAUDE_CODE_MODEL_ALIASES,
+    CODEX_MODEL_CANDIDATES,
+    DEFAULT_SMOKE_PROMPT,
+    AvailabilityStatus,
+    ModelAvailability,
+    ModelAvailabilityReport,
+    ProviderName,
+    claude_code_model_candidates,
+    codex_model_candidates,
+    preflight_claude_code_models,
+    preflight_codex_models,
+)
 
 __all__ = [
     # Shared foundation: contract for new adapters, result base, rendering/execution seams.
@@ -59,6 +74,19 @@ __all__ = [
     "CodexAct",
     "CodexResult",
     "MockCodexAct",
+    # Model preflight: adapter-layer visibility, not loop-core policy.
+    "AvailabilityStatus",
+    "ProviderName",
+    "ModelAvailability",
+    "ModelAvailabilityReport",
+    "CODEX_MODEL_CANDIDATES",
+    "CLAUDE_CODE_MODEL_ALIASES",
+    "CLAUDE_CODE_FULL_MODEL_CANDIDATES",
+    "DEFAULT_SMOKE_PROMPT",
+    "codex_model_candidates",
+    "claude_code_model_candidates",
+    "preflight_codex_models",
+    "preflight_claude_code_models",
     # ModelLadder: canonical act-composition example, not a subprocess adapter.
     "ModelLadder",
     "EscalationContext",
