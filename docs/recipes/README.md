@@ -7,9 +7,21 @@
 3. **要点** — そのタスク特有の落とし穴と、verify を ground truth で sharp に書くコツ。
 
 共通する設計の芯は 1 つ: **verify は機械的な ground truth で書く**（pytest の exit-code / AST / 文字列スキャン等）。LLM-as-judge に成功判定を委ねると、ループが「成功したフリ」に収束します。
+## Canonical production harnesses
+
+If you need a production starting point, start with [production-harnesses.md](./production-harnesses.md). It narrows the catalog to three first-choice shapes:
+
+| Harness | Use when | Primary docs |
+|---|---|---|
+| Single verified edit loop | One bounded task has one machine oracle. | [production-harnesses.md](./production-harnesses.md#1-single-verified-edit-loop) |
+| Multi-item work queue | N independent items need fair scheduling and per-item caps. | [production-harnesses.md](./production-harnesses.md#2-multi-item-work-queue) |
+| Gated irreversible action flow | The loop may deploy, publish, push, or mutate external state. | [production-harnesses.md](./production-harnesses.md#3-gated-irreversible-action-flow) |
+
+The rest of this directory is supporting material for those shapes.
 
 | Recipe | タスク種別 | verify の ground truth |
 |---|---|---|
+| [production-harnesses.md](./production-harnesses.md) | 代表 production harness の選択ガイド | single verified edit / multi-item / gated irreversible action |
 | [flaky-test-stabilization.md](./flaky-test-stabilization.md) | flaky test の安定化（N 件） | 修正後に対象テストが N 回連続 pass |
 | [translation.md](./translation.md) | docstring/コメントの一括翻訳（N ファイル） | 翻訳対象に対象言語が 0 + AST 不変 + 当該テスト pass |
 | [refactor.md](./refactor.md) | 挙動不変リファクタ（N module） | 既存テスト全 pass + AST レベルで挙動同値 |

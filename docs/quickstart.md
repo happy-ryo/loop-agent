@@ -79,7 +79,7 @@ result = run_loop(
 
 4. 結果を観察し、必要なら Claude Code に「verify を 10 回 → 20 回に上げて」「act を haiku に下げてコスト削減して」と指示すれば、policy を書き直して再実行します。**進化するのは loop-agent ではなく、あなたの policy**です。
 
-> 完全な recipe（flaky test / 翻訳 / リファクタ）は [docs/recipes/](./recipes/) にあります。Claude Code にそのまま渡せる prose intent 例つきです。
+> production の出発点は [docs/recipes/production-harnesses.md](./recipes/production-harnesses.md) の 3 パターン（single verified edit / multi-item work queue / gated irreversible action）から選びます。完全な recipe（flaky test / 翻訳 / リファクタ）は [docs/recipes/](./recipes/) にあります。Claude Code にそのまま渡せる prose intent 例つきです。
 
 ---
 
@@ -267,6 +267,7 @@ result = run_loop(
 
 ## 次に読む
 
+- [docs/recipes/production-harnesses.md](./recipes/production-harnesses.md) — 代表 production harness 3 パターンの選択ガイド
 - [docs/recipes/](./recipes/) — 動線 E の prose intent → harness の具体例（flaky test / 翻訳 / リファクタ）
 - [docs/first-harness-api.md](./first-harness-api.md) — 初回 harness で使う最小 API surface
 - [docs/reflexion-when-to-use.md](./reflexion-when-to-use.md) — Reflexion が効くタスク / 効かないタスクの判断基準（PoC 実証データ）
