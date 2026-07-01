@@ -184,6 +184,7 @@ from .transport import (
     due_to_poll,
     open_wake_queue,
 )
+from .verifiers import CommandVerifier, PytestVerifier, RegexVerifier
 from .waker import LoopWaker, wake_id_for, wakes_for_result
 
 __all__ = [
@@ -215,6 +216,9 @@ __all__ = [
     "GoalMet",
     "GoalCheck",
     "NoProgress",
+    "CommandVerifier",
+    "PytestVerifier",
+    "RegexVerifier",
     "ProgressLog",
     "read_progress",
     # observability (report.md S4.5 / S5 Phase 2)

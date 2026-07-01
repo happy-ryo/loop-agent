@@ -21,6 +21,7 @@ python3 -m pip install -e '.[dev]'   # + pytest（テスト実行用。動線 E/
 ```bash
 loop-agent          # クイックヘルプ + サンプル task.toml が出れば OK
 python3 -m pytest   # 全件 green を一度確認しておくと、self-improvement 系の verify が安定する
+# Windows で user Temp の権限に詰まる場合: python3 -m pytest --basetemp .pytest-tmp
 ```
 
 Claude Code の認証は **claude CLI にそのまま委譲**されます（loop-agent は `os.environ` を継承）。既に `claude` でログイン済み（`~/.claude`）か `ANTHROPIC_API_KEY` が通っていれば、追加設定は不要です。
@@ -128,6 +129,20 @@ from loop_agent.adapters import CodexAct
 act = CodexAct(model="gpt-5.5", effort="medium", timeout=600)   # allowed_tools は CodexAct には無い
 # 観測は CodexResult（.text/.failed/.tokens/.returncode/.error）。verify はそのまま使える
 ```
+
+### verify helper を使う
+
+既存の機械的 oracle がある場合は `verify` を一から書かず、薄い helper を使えます。
+
+```python
+from loop_agent import PytestVerifier, CommandVerifier, RegexVerifier
+
+verify = PytestVerifier(["tests/test_loop.py", "-q"], timeout=60)
+# or: verify = CommandVerifier(["python", "-m", "ruff", "check", "src"], timeout=60)
+# or: verify = RegexVerifier(r"\bDONE\b")
+```
+
+これらは LLM-as-judge ではありません。exit-code や regex といった機械的 signal を `VerifyOutcome` に変換するだけです。
 
 ### TOML + CLI で回す（コードを書かない最小形）
 
