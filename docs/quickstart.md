@@ -2,7 +2,7 @@
 
 このページは、Claude Code を日常的に使っているあなたが loop-agent を **30 分で実走させる**ための動線です。最短は **動線 E（coding-agent driven）** — 自然言語で「こういうループを回したい」と書けば、Claude Code 自身が `gather / act / verify / conditions / gate` を組み立てて実行まで持っていきます。手で組みたい場合の最小形（動線 A / B）もあとに置いてあります。
 
-前提知識は [docs/seams.md](./seams.md) のシーム一覧だけ。ループが「持つ」のはオーケストレーション本体だけで、policy（何を選び・どう実行し・何を成功とするか）は全部あなた（または coding agent）が書きます。
+前提知識は [docs/seams.md](./seams.md) のシーム一覧だけ。初回 harness で触る API は [first-harness-api.md](./first-harness-api.md) に絞ってあります。ループが「持つ」のはオーケストレーション本体だけで、policy（何を選び・どう実行し・何を成功とするか）は全部あなた（または coding agent）が書きます。
 
 ---
 
@@ -268,6 +268,7 @@ result = run_loop(
 ## 次に読む
 
 - [docs/recipes/](./recipes/) — 動線 E の prose intent → harness の具体例（flaky test / 翻訳 / リファクタ）
+- [docs/first-harness-api.md](./first-harness-api.md) — 初回 harness で使う最小 API surface
 - [docs/reflexion-when-to-use.md](./reflexion-when-to-use.md) — Reflexion が効くタスク / 効かないタスクの判断基準（PoC 実証データ）
 - [docs/api-reference.md](./api-reference.md) — 全 API 概要・ループコアのスコープ
 - [docs/persistence-and-resume.md](./persistence-and-resume.md) / [docs/transport.md](./transport.md) / [docs/reflexion.md](./reflexion.md) — state.db / transport / work-discovery / 外側 Reflexion の詳細
