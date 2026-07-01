@@ -2,6 +2,8 @@
 
 loop-agent is an embeddable loop engine, so the core API should stay small even
 when advanced helpers exist. The stable surface is split into three layers.
+For the beginner-facing import map, see [first-harness-api.md](./first-harness-api.md);
+this page is the maintainer discipline for keeping that first path small.
 
 | Layer | What belongs here | Compatibility expectation |
 |---|---|---|
