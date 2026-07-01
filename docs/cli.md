@@ -64,9 +64,22 @@ command = ["pytest", "-q"]
 - **subprocess の act/verify には必ず有限の timeout が掛かる**（`[act]`/`[verify]`.`timeout_seconds` > ループ `timeout_seconds` > 既定 3600s）。停止条件は反復境界でのみ評価され実行中ステップは中断しないため、無制限の subprocess が hang すると全 cap を無効化してしまうのを防ぐ。
 - `--help` の文字列は ASCII のみ（cp932 コンソールでもクラッシュしない）。
 
+## 互換性契約
+
+`1.0.0` 以降、次の CLI 面は安定契約に含める:
+
+- サブコマンド名: `run` / `status` / `summary` / `dashboard` / `spikes` / `resume` / `logs` / `install-skills`
+- `run` の TOML セクションと主要キー: `[loop]` / `[conditions]` / `[act]` / `[verify]` / `[state]`
+- 終了コード: 成功 `0`、停止 `1`、設定/使用法エラー `2`
+- `state.db` を run-id で読む基本動作
+- `summary` / `dashboard` / `spikes` が read-only であること
+
+人間向けの表示レイアウト（空白、列幅、文言の細部）は best-effort であり、機械連携の安定契約ではない。機械連携が必要な場合は state.db / JSONL event / Python API を使う。既存 option の削除・意味変更は major release を要する。後方互換な option 追加は minor / patch release で行える。
+
 ## 関連
 
 - [../README.md](../README.md) — プロジェクト全体の入口
 - [./seams.md](./seams.md) — gather / act / verify / conditions / gate の 5 シーム詳細
 - [./adapters/README.md](./adapters/README.md) — ClaudeCodeAct / CodexAct / 自作 adapter（ActHook Protocol）の act adapter エコシステム
 - [./persistence-and-resume.md](./persistence-and-resume.md) — state.db SoT・run-id・resume の仕組み
+- [./stability.md](./stability.md) — `1.0.0` の安定契約

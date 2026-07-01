@@ -1,0 +1,17 @@
+# Dogfood task: verify the version-readiness issue plan with loop-agent itself.
+
+[loop]
+goal = "verify version-readiness issue drafts"
+run_id = "version-readiness-issues-final"
+
+[conditions]
+max_iterations = 1
+
+[act]
+command = ["python", "scripts/version_readiness_harness.py", "act"]
+
+[verify]
+command = ["python", "scripts/version_readiness_harness.py", "verify"]
+
+[state]
+db = "loop-state.db"

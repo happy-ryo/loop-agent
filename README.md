@@ -27,7 +27,7 @@ loop-agent は任意のエージェント / アプリに `pip install` で組み
 
 loop-agent が向いているのは、既存の CLI / Web アプリ / MCP サーバー / cron / coding-agent harness の内側に、**境界付きの反復・ground-truth verify・状態永続化・人間ゲート・運用観測**を足したい場合。policy は呼び出し側が持ち、loop-agent は停止・記録・再開・配送・観測・read-only dashboard のランタイムを担当する。
 
-向いていないのは、ホスト済み agent 製品、サンドボックス実行環境、全体オーケストレーション UI、あるいは成功判定を機械的に書けない曖昧なタスクを求める場合。0.1.0 は Beta のライブラリであり、`summary` / 静的 HTML dashboard / spike scan / circuit breaker / opt-in throttling helper は備えるが、Grafana 等の外部運用基盤や事業固有の閾値 policy は呼び出し側に置く。
+向いていないのは、ホスト済み agent 製品、サンドボックス実行環境、全体オーケストレーション UI、あるいは成功判定を機械的に書けない曖昧なタスクを求める場合。`summary` / 静的 HTML dashboard / spike scan / circuit breaker / opt-in throttling helper は備えるが、Grafana 等の外部運用基盤や事業固有の閾値 policy は呼び出し側に置く。`1.0.0` の安定契約は **[docs/stability.md](./docs/stability.md)** に定義する。
 
 ## シーム — policy を注入する 5 つの口
 
@@ -119,6 +119,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/safety.md](./docs/safety.md) | 安全装置（暴走防止 / 限定人間ゲート / 安全テンプレ） |
 | [docs/observability.md](./docs/observability.md) | 観測（loop events / OTel span / 外側 Reflexion 観測） |
 | [docs/operations-roadmap.md](./docs/operations-roadmap.md) | 運用（summary / dashboard / spike scan / throttling / circuit breaker） |
+| [docs/stability.md](./docs/stability.md) | `1.0.0` の安定 API / CLI / state.db / release gate 契約 |
 | [docs/async.md](./docs/async.md) | async/await 対応（`async_run_loop`） |
 | [docs/transport.md](./docs/transport.md) | wake 配送 transport と work-discovery / WorkListGather |
 | [docs/reflexion.md](./docs/reflexion.md) | 外側 Reflexion ループ + RQGM epoch 安全核 |
@@ -130,7 +131,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 
 ## 現在のステータス
 
-**0.1.0 Beta**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。運用面も read-only `summary` / 静的 HTML `dashboard` / post-hoc `spikes` scan / `SpikeDetector` / circuit breaker `StopCondition` helpers / opt-in throttling helpers まで実装済み。各機能の詳細は上の docs/ ナビゲーションから辿れる。
+**1.0.0 Stable**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。運用面も read-only `summary` / 静的 HTML `dashboard` / post-hoc `spikes` scan / `SpikeDetector` / circuit breaker `StopCondition` helpers / opt-in throttling helpers まで実装済み。安定 API と高度機能の互換範囲は [docs/stability.md](./docs/stability.md) を参照。
 
 ## 成果物
 

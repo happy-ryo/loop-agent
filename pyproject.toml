@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loop-agent"
-version = "0.1.0"
+version = "1.0.0"
 description = "loop-agent: an embeddable loop engine for agents (gather -> act -> verify -> repeat, with composable stop conditions, persisted state, limited human gates, and an outer Reflexion loop)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,7 +24,7 @@ keywords = [
 license = { file = "LICENSE" }
 authors = [{ name = "happy-ryo" }]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
