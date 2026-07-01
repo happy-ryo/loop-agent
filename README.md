@@ -8,9 +8,21 @@
 > **Designed to be driven by coding agents — describe your loop in prose, let your agent assemble it.**
 > （第一の使い手は人間でなく coding agent。「こういうループを回したい」と書けば、エージェントがシームを組み立てる。）
 
-loop-agent は任意のエージェント / アプリに `pip install` で組み込めるループエンジンだ。提供するのは `gather → act → verify → repeat` のオーケストレーション本体と安全装置だけで、**policy（何を選び・どう実行し・何を成功とするか）は全部呼び出し側に置く**。`act`（実行体）は **`ClaudeCodeAct` / `CodexAct` / 自作 adapter（`ActHook` Protocol）** から選んで差し込める — 複数の LLM プロバイダーが最初から first-class に揃い、`ActHook` に適合する callable なら何でも同じ `act` シームに載る。だから loop-agent は自分の domain を何も知らないまま、user app の中に小さく住んで「安全にループだけ回すエンジン」として機能する。これが "Embeddable" の本物の意味。
+loop-agent は任意のエージェント / アプリに `pip install` で組み込める、小さいループエンジンだ。Stable core が提供するのは `gather → act → verify → repeat` のオーケストレーション、停止条件、状態記録、人間ゲート、基本 verifier まで。**policy（何を選び・どう実行し・何を成功とするか）は全部呼び出し側に置く**。だから loop-agent は自分の domain を何も知らないまま、user app の中に小さく住んで「安全にループだけ回すエンジン」として機能する。
+
+`ClaudeCodeAct` / `CodexAct` / ModelLadder / Reflexion / transport / dashboard / notifier などは、core を置き換えるものではなく **advanced stable surface** だ。必要な caller だけが opt-in して差し込む。loop-agent は hosted agent framework でも sandbox でもなく、provider 選択・権限境界・実行 policy を勝手に所有しない。
+
+`1.0.0` の互換性契約は **[docs/stability.md](./docs/stability.md)** が canonical source。README は使い始めるための入口で、安定 API / 高度機能 / 非契約の境界は stability contract を正とする。
 
 > Loop Engineering とは、人間がエージェントに一手ずつプロンプトを打つのをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する「システム（=ループ）そのもの」を設計する**実践。`prompt engineering → context engineering → loop engineering` という 3 層スタックの最上位（制御層）に位置する。
+
+## 安定 API とスコープ
+
+| 区分 | README での扱い | 互換性の正本 |
+|---|---|---|
+| Stable core | `run_loop` / `async_run_loop`、5 シーム、stop conditions、state/progress、human gate、verifier helpers、errors | [docs/stability.md](./docs/stability.md#stable-public-api) |
+| Advanced stable surface | adapters、Reflexion、transport / work discovery、observability、operations helpers、notifier integrations | [docs/stability.md](./docs/stability.md#advanced-stable-api) |
+| Non-contract | provider CLI の human-readable 出力、dashboard HTML DOM/CSS、外部 observability convention の細部 | [docs/stability.md](./docs/stability.md#explicit-non-contracts) |
 
 ## 設計原則
 
@@ -134,7 +146,11 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 
 ## 現在のステータス
 
-**1.0.0 Stable**。`gather → act → verify → repeat` のループコア（`src/loop_agent/`）に加え、状態の SoT（state.db）・中断 → 再開（resume）・限定人間ゲート・外側 Reflexion ループ + RQGM epoch 安全核・wake 配送 transport・work-discovery・async/await・CLI ランチャ・act アダプタ（Claude Code / Codex）を実装済み。運用面も read-only `summary` / 静的 HTML `dashboard` / post-hoc `spikes` scan / `SpikeDetector` / circuit breaker `StopCondition` helpers / opt-in throttling helpers まで実装済み。安定 API と高度機能の互換範囲は [docs/stability.md](./docs/stability.md) を参照。
+**1.0.0 Stable**。互換性の正本は [docs/stability.md](./docs/stability.md)。README では概要だけを示す。
+
+- **Stable core**: `gather → act → verify → repeat` の同期 / async ループドライバ、5 シーム、停止条件、state/progress、human gate、基本 verifier、errors。
+- **Advanced stable surface**: state.db SoT / resume、外側 Reflexion + RQGM epoch 安全核、wake 配送 transport、work-discovery、CLI ランチャ、Claude Code / Codex adapters、read-only `summary` / 静的 HTML `dashboard` / post-hoc `spikes` scan、circuit breaker / opt-in throttling helpers。
+- **Non-goals**: hosted agent framework、sandbox、全体オーケストレーション UI、provider / model policy の自動所有。
 
 ## 成果物
 
