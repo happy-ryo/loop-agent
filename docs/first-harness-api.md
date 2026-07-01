@@ -1,10 +1,10 @@
 # First Harness API
 
-This page is the shortest human-facing import map for a first production-style
-loop. The full public surface stays documented in [stability.md](./stability.md)
-and [api-reference.md](./api-reference.md); coding agents should also use
-[ai-api-map.md](./ai-api-map.md) when choosing production harness helpers. This
-page is only the daily starting surface.
+This page is the shortest import map for a first production-style loop. The
+full public surface stays documented in [stability.md](./stability.md) and
+[api-reference.md](./api-reference.md). When a coding agent is choosing
+production harness helpers, use [ai-api-map.md](./ai-api-map.md) as the
+capability map. This page is only the daily starting surface.
 
 ## The Daily Surface
 

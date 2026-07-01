@@ -15,7 +15,7 @@ loop-agent は任意のエージェント / アプリに `pip install` で組み
 `1.0.0` の互換性契約は **[docs/stability.md](./docs/stability.md)** が canonical source。README は使い始めるための入口で、安定 API / 高度機能 / 非契約の境界は stability contract を正とする。
 
 
-README は人間向けの入口として、まず **最小の loop harness** と判断軸を示す。coding agent が harness を組み立てる場合は、同梱 skill の `references/api-map.md`（リポジトリ上では [docs/ai-api-map.md](./docs/ai-api-map.md)）を API 選択の地図として使う。top-level API は AI が発見しやすいよう広めに残しつつ、`CORE_API` / `HARNESS_API` / `ADVANCED_API` / `OPERATIONS_API` に分類している。
+まずは **最小の loop harness** と判断軸から始められる。coding agent に harness を組み立てさせる場合は、同梱 skill の `references/api-map.md`（リポジトリ上では [docs/ai-api-map.md](./docs/ai-api-map.md)）が API 選択の地図になる。top-level API は AI が発見しやすいよう広めに残しつつ、`CORE_API` / `HARNESS_API` / `ADVANCED_API` / `OPERATIONS_API` に分類している。
 
 > Loop Engineering とは、人間がエージェントに一手ずつプロンプトを打つのをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する「システム（=ループ）そのもの」を設計する**実践。`prompt engineering → context engineering → loop engineering` という 3 層スタックの最上位（制御層）に位置する。
 
