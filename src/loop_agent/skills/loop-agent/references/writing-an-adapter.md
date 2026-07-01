@@ -297,6 +297,120 @@ act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 
 ---
 
+## 外部 CLI 互換性の監視
+
+`ClaudeCodeAct` / `CodexAct` は外部 CLI の JSON / JSONL イベントを読むため、CLI 側の
+バージョンアップで schema drift が起きえます。通常の単体テストは速く・再現可能な
+契約テストとして維持し、実 CLI 監視は opt-in の煙検査として分離します。
+
+### 1. 必須: fake-runner / fake-subprocess 契約テスト
+
+通常 CI で常に走らせるのはこの層です。
+
+```bash
+python -m pytest tests/adapters tests/test_adapters_claude_code.py tests/test_adapters_codex.py
+```
+
+この層が保証すること:
+
+- `ActResult` の 8 フィールド、`failed=True` graceful 終了、timeout / 起動失敗の扱い。
+- `TokenBudget` に積む token の意味論（部分集合や安価な cache read を二重計上しない）。
+- 代表的な既知 schema（Claude の `json` / `stream-json`、Codex の dotted / snake_case
+  JSONL イベント）を parser が読めること。
+- stdin / env / cwd / prompt separator など、loop-agent 側で固定できる subprocess 契約。
+
+この層は実 `claude` / `codex` を起動しません。外部 CLI の未導入、未ログイン、課金、
+ネットワーク不調で落ちないことが重要です。
+
+### 2. 任意: real-CLI smoke job
+
+実 CLI の schema drift を早く見つけたいメンテナは、手元または scheduled CI で
+小さな smoke job を opt-in 実行します。CLI が見つからない環境では skip し、通常 CI の
+必須条件にしません。
+
+```yaml
+name: adapter-real-cli-smoke
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[test]"
+      - name: Codex smoke
+        run: |
+          if ! command -v codex >/dev/null 2>&1; then
+            echo "codex not installed; skipping"
+            exit 0
+          fi
+          python - <<'PY'
+          from loop_agent.adapters import CodexAct
+          result = CodexAct(timeout=60)({"prompt": "Reply with exactly: LOOP_AGENT_SMOKE_OK"}).observation
+          assert not result.failed, result.error
+          assert "LOOP_AGENT_SMOKE_OK" in result.text
+          assert isinstance(result.tokens, int) and result.tokens >= 0
+          PY
+      - name: Claude Code smoke
+        run: |
+          if ! command -v claude >/dev/null 2>&1; then
+            echo "claude not installed; skipping"
+            exit 0
+          fi
+          python - <<'PY'
+          from loop_agent.adapters import ClaudeCodeAct
+          result = ClaudeCodeAct(timeout=60)({"prompt": "Reply with exactly: LOOP_AGENT_SMOKE_OK"}).observation
+          assert not result.failed, result.error
+          assert "LOOP_AGENT_SMOKE_OK" in result.text
+          assert isinstance(result.tokens, int) and result.tokens >= 0
+          PY
+```
+
+運用ルール:
+
+- `workflow_dispatch` で手動実行できるようにし、必要なら週 1 回程度の schedule にする。
+- CLI 未導入なら `exit 0` で skip する。未ログインや auth 失敗は、CLI が導入済みなら
+  smoke failure として扱う。
+- プロンプトは公開して問題ない固定文字列だけにする。リポジトリ内容、顧客データ、
+  Issue 本文、API key、ローカルパスなどを送らない。
+- smoke job は「schema がまだ読めるか」を見るだけに留める。品質評価や長い生成は
+  ここに入れない。
+
+### 3. 実出力 fixture の扱い
+
+実 CLI の stdout / stderr を fixture として残すのは、次の条件を満たすときだけです。
+
+- プロンプトが公開可能な短い固定文で、出力にも秘密・個人情報・内部パスが無い。
+- CLI の利用規約や出力の再配布条件に反しない。
+- fixture は最小化し、parser に必要な event / usage だけを残す。不要な会話本文や
+  trace ID は削る。
+- 新しい fixture には、取得した CLI 名・バージョン・取得日・どの parser 分岐を固定するかを
+  テストコメントに書く。
+
+安全に残せない出力は commit しません。その場合は、field 名と event 形だけを手書きの
+最小 JSON / JSONL サンプルにして parser test に追加します。
+
+### 4. upstream schema が変わったときの更新手順
+
+1. real-CLI smoke failure の stdout / stderr を、秘密が含まれない範囲でローカルに保存する。
+2. 失敗が adapter 契約違反なのか、parser が新しい event 形を知らないだけなのかを切り分ける。
+3. 新しい schema 形を `tests/test_adapters_claude_code.py` または
+   `tests/test_adapters_codex.py` に最小 fixture として追加し、まず failing test にする。
+4. parser を更新する。既存 schema のテストと横断契約テストは残し、古い CLI 形も読める限り
+   後方互換を保つ。
+5. token usage の意味論が変わった場合は、`tests/adapters/conftest.py` の token guard
+   サンプルも更新し、二重計上しないことを横断契約で固定する。
+6. fixture を commit する前に、秘密・個人情報・private prompt・ローカル絶対パスが無いことを
+   再確認する。
+
+---
+
 ## 新規アダプタ追加チェックリスト
 
 - [ ] `XxxResult(ActResultBase)` を定義（8 フィールド再定義しない）。`isinstance(r, ActResult)` が `True`。
@@ -311,5 +425,6 @@ act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 - [ ] `tests/adapters/conftest.py` の `AdapterSpec` に登録し、共通契約テストを通す。
 - [ ] **token 二重計上ガード**のサンプル（部分集合キーを含む usage と期待トークン）を spec に入れる。
 - [ ] 実 subprocess 経路（フェイク実行ファイル）の成功 / timeout / env 継承を 1 度ずつ通す。
+- [ ] 実 CLI schema drift 監視が必要なら、上の real-CLI smoke job に追加し、CLI 未導入時は clean skip する。
 - [ ] `loop_agent.adapters.__init__` の `__all__` に公開シンボルを追加。
 - [ ] `mypy` / `pytest` green。

@@ -2,7 +2,7 @@
 
 loop-agent は **first-class な act アダプタエコシステム**を同梱する。`ClaudeCodeAct`（headless の `claude --print`）/ `CodexAct`（headless の `codex exec`）/ `ActHook` / `ActResult` Protocol に適合する任意の**自作 adapter** の 3 系統が、いずれも `act` シームに**互換に差し込める**（callable → `ActOutcome`）。エコシステムは開かれていて、3 つ目以降のアダプタ（例 `GeminiAct`）も同じ契約に従えばそのまま `run_loop` の実行体になる。
 
-つまり `act` は特定の宿主に固定された口ではなく、`ActHook` 契約を満たす callable なら何でも受ける拡張点である。以下では同梱の 2 アダプタ（Claude Code / Codex）と、それらを混ぜて使う合成パターン（`ModelLadder`）、そして共通 API を示す。新しいアダプタの書き方は [writing-an-adapter.md](./writing-an-adapter.md) を参照。
+つまり `act` は特定の宿主に固定された口ではなく、`ActHook` 契約を満たす callable なら何でも受ける拡張点である。以下では同梱の 2 アダプタ（Claude Code / Codex）と、それらを混ぜて使う合成パターン（`ModelLadder`）、そして共通 API を示す。新しいアダプタの書き方と、外部 CLI の schema drift を監視する運用は [writing-an-adapter.md](./writing-an-adapter.md) を参照。
 
 ## ModelLadder — 異種アダプタ合成の正準例（困難タスクで強いモデルへエスカレーション）
 
@@ -139,6 +139,6 @@ act = MockCodexAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 ## 関連
 
 - [../../README.md](../../README.md) — loop-agent の入口（positioning / シーム / 動線サマリ）
-- [writing-an-adapter.md](./writing-an-adapter.md) — 3 つ目以降のアダプタ（例 `GeminiAct`）を `ActHook` / `ActResult` 契約で書く手引き
+- [writing-an-adapter.md](./writing-an-adapter.md) — 3 つ目以降のアダプタ（例 `GeminiAct`）を `ActHook` / `ActResult` 契約で書く手引きと、外部 CLI 互換性監視の運用
 - [../seams.md](../seams.md) — `act` シームを含む 5 シームの詳細仕様と型
 - [../api-reference.md](../api-reference.md) — 全 API 概要表とループコアのスコープ
