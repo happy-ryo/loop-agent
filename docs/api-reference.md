@@ -40,12 +40,12 @@ python3 -m pip install -e .[dev]   # + pytest（テスト実行用）
 
 | 要素 | 役割 |
 |---|---|
-| `run_loop(*, act, verify, conditions, gather=…, review=…, on_step=…, gate=…, time_fn=…, initial_state=…, timeout=…)` | ループドライバ。`LoopResult` を返す。`review` を渡すと `act` 後・`verify` 前に post-act artifact review を実行、`gate` を渡すと不可逆操作を interrupt、`initial_state` に復元 `LoopState` を渡すと中断地点から**再開**（resume #14）、`timeout` で `act`/`verify` の per-call timeout（#42） |
+| `run_loop(*, act, verify, conditions, gather=…, review=…, on_step=…, gate=…, time_fn=…, initial_state=…, timeout=…)` | ループドライバ。`LoopResult` を返す。`review` を渡すと `act` 後・`verify` 前に post-act artifact review を実行、`gate` を渡すと不可逆操作を interrupt、`initial_state` に復元 `LoopState` を渡すと中断地点から**再開**（resume #14）、`timeout` で `act`/`review`/`verify` の per-call timeout（#42） |
 | `ActOutcome(observation, tokens)` | `act` フックの返り値（行動結果 + 消費トークン） |
-| `ReviewOutcome(approved, feedback="", severity="info")` | `review` フックの返り値。`approved=False` かつ `severity="blocking"` の場合、その iteration は `goal_met=False` として記録され `verify` はスキップされる。`StepRecord.detail` / state.db `step.detail` に JSON feedback が残る |
+| `ReviewOutcome(approved, feedback="", severity="info")` | `review` フックの返り値。`approved=False` かつ `severity="blocking"` の場合、その iteration は `goal_met=False` として記録され `verify` はスキップされる。blocking review の feedback は `StepRecord.detail` / state.db `step.detail` に JSON として残り、通常 step の detail は `verify.detail` を維持する |
 | `VerifyOutcome(goal_met, detail)` | `verify` フックの返り値（`goal_met=True` で自然終了） |
 | `MaxIterations(n)` / `TokenBudget(b)` / `Timeout(s)` | 機械的ハード上限（合成可能 stop 条件） |
-| `TimeoutPolicy(act=…, verify=…, default=…, on_timeout=…)` | `act`/`verify` の **per-call** timeout（#42）。`run_loop`/`async_run_loop` の `timeout=` に渡す（`TimeoutPolicy` か裸の秒数）。`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復／`"kill"` は `SeamTimeout` を送出。async シームは asyncio の task cancel、sync シームは POSIX main thread の `SIGALRM` で実中断（不在環境は graceful=post-hoc、kill=`UnsupportedTimeoutKill`）。whole-run の `Timeout` stop 条件とは別物。詳細 [recipes/timeout-and-kill.md](./recipes/timeout-and-kill.md) |
+| `TimeoutPolicy(act=…, review=…, verify=…, default=…, on_timeout=…)` | `act`/`review`/`verify` の **per-call** timeout（#42）。`run_loop`/`async_run_loop` の `timeout=` に渡す（`TimeoutPolicy` か裸の秒数）。`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復／`"kill"` は `SeamTimeout` を送出。async シームは asyncio の task cancel、sync シームは POSIX main thread の `SIGALRM` で実中断（不在環境は graceful=post-hoc、kill=`UnsupportedTimeoutKill`）。whole-run の `Timeout` stop 条件とは別物。詳細 [recipes/timeout-and-kill.md](./recipes/timeout-and-kill.md) |
 | `GoalMet(verifier)` | 検証可能ゴールの達成で**成功**停止（`stop.name="goal_met"`）。`verifier(state)` は `bool` か `GoalCheck(met, detail)` を返す |
 | `NoProgress(window, repeat, key=…)` | 直近 `window` ステップで同一 `key`（既定は observation）が `repeat` 回以上 → 無進捗として**打ち切り**（`stop.name="no_progress"`） |
 | `CommandVerifier(command, cwd=…, timeout=…)` / `PytestVerifier(args=…, timeout=…)` / `RegexVerifier(pattern, …)` | よくある ground-truth verify helper。コマンド終了コード / pytest / adapter 出力の regex を `VerifyOutcome` へ変換する。LLM-as-judge ではなく、機械的 oracle を薄く包むための補助。詳細は [verifiers.md](./verifiers.md) |

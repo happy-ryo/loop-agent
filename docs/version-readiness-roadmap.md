@@ -66,7 +66,7 @@ It does not change release state; it records an audit trail in `loop-state.db`.
 
 LLM-backed `act` steps should be reviewed before merge. Issue #128 is addressed by
 the optional post-act `review` seam: pass a `ReviewHook` via `review=` and
-return `ReviewOutcome`. Blocking review feedback is stored in `StepRecord.detail`
+return `ReviewOutcome`. Blocking review feedback is stored in `StepRecord.detail`; non-blocking steps keep `verify.detail` unchanged
 and state.db `step.detail`; use `docs/recipes/review-driven-loop.md` for the
 harness shape.
 

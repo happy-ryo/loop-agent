@@ -38,7 +38,7 @@ result = run_loop(
 |---|---|
 | `approved: bool` | review が成果物を受け入れるか |
 | `feedback: str = ""` | 次 iteration に渡す簡潔な指摘 |
-| `severity: "info" | "warning" | "blocking" = "info"` | `blocking` かつ `approved=False` のときだけ verify をスキップ |
+| `severity: "info" / "warning" / "blocking" = "info"` | `blocking` かつ `approved=False` のときだけ verify をスキップ |
 
 ## 実行順序
 
@@ -52,7 +52,7 @@ gather -> gate? -> act -> review? -> verify -> repeat
 
 ## State Representation
 
-review 結果は既存の `StepRecord.detail` に JSON として保存されます。state.db を使う場合も同じ文字列が `step.detail` に永続化されるため、resume 後も feedback を読めます。
+blocking review の feedback は既存の `StepRecord.detail` に JSON として保存されます。state.db を使う場合も同じ文字列が `step.detail` に永続化されるため、resume 後も feedback を読めます。review が blocking でない場合、`StepRecord.detail` は従来どおり `verify.detail` の生文字列です。
 
 blocking review の detail 例:
 
@@ -60,10 +60,10 @@ blocking review の detail 例:
 {"review":{"approved":false,"feedback":"scope is too broad","severity":"blocking"}}
 ```
 
-review と verify の両方が走った detail 例:
+review と verify の両方が走った場合、detail は従来どおり verify detail です:
 
-```json
-{"review":{"approved":true,"feedback":"scope ok","severity":"info"},"verify":{"detail":"pytest passed"}}
+```text
+pytest passed
 ```
 
 `verify` なしで review を使う設計にはしないでください。review は設計・意図・リスクの評価であり、成功判定はできる限り ground truth `verify` に残します。
@@ -79,11 +79,11 @@ import json
 
 
 def done_when(_item, record):
-    detail = json.loads(record.detail or "{}")
-    return bool(
-        detail.get("review", {}).get("approved")
-        and detail.get("verify", {}).get("detail") == "pytest passed"
-    )
+    try:
+        detail = json.loads(record.detail or "{}")
+    except json.JSONDecodeError:
+        detail = {}
+    return bool(detail.get("review", {}).get("approved", True) and record.detail == "pytest passed")
 ```
 
 `WorkListGather(max_attempts_per_item=...)` を使うと、1 件が review feedback を繰り返しても work list 全体を独占しません。

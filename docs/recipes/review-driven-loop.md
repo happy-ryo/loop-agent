@@ -42,10 +42,7 @@ def _detail(record):
 
 def done_when(_item, record):
     detail = _detail(record)
-    return bool(
-        detail.get("review", {}).get("approved")
-        and detail.get("verify", {}).get("detail") == "pytest passed"
-    )
+    return bool(detail.get("review", {}).get("approved", True) and record.detail == "pytest passed")
 
 
 gather = WorkListGather(
@@ -93,14 +90,14 @@ result = run_loop(
 
 ## Feedback Representation
 
-`review` が返した `ReviewOutcome` は `StepRecord.detail` の JSON に入ります。blocking review の場合は `verify` が走らないため、detail は `review` だけを含みます。review と verify の両方が走った場合は、detail に `review` と `verify.detail` が入ります。
+blocking review の場合、`ReviewOutcome` は `StepRecord.detail` の JSON に入ります。review が blocking でない場合は `verify` が走り、detail は従来どおり `verify.detail` の生文字列です。
 
 ```json
 {"review":{"approved":false,"feedback":"missing target docs/api-reference.md","severity":"blocking"}}
 ```
 
-```json
-{"review":{"approved":true,"feedback":"scope and target look acceptable","severity":"info"},"verify":{"detail":"pytest passed"}}
+```text
+pytest passed
 ```
 
 大きな diff 全体を detail に入れず、finding summary、severity、file path だけを保存してください。次の `act` は repository を直接読めます。

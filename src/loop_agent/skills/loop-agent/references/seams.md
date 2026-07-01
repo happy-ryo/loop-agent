@@ -128,6 +128,5 @@ python3 examples/verify_driven_demo.py
 - [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) — 入口（positioning / シーム概要 / 動線サマリ）
 - [adapters/writing-an-adapter.md](writing-an-adapter.md) — `ActHook` Protocol で act adapter を書く
 - [review.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/review.md) — optional post-act review の API と retry/state の扱い
-- [review.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/review.md) — optional post-act review の API と retry/state の扱い
 - [recipes/](https://github.com/happy-ryo/loop-agent/tree/main/docs/recipes/) — ground truth verify の具体例集
 - [safety.md](safety.md) — `gate` シームと HumanGate の射程

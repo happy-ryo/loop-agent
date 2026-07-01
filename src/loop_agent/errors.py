@@ -25,7 +25,7 @@ The leaves carve that surface into three intents:
   synchronous :func:`loop_agent.run_loop` (Issue #40). Relocated here so it
   shares the :class:`LoopError` base; still importable from
   :mod:`loop_agent._async` for backwards compatibility.
-- :class:`SeamTimeout` -- an ``act`` / ``verify`` seam overran its per-call
+- :class:`SeamTimeout` -- an ``act`` / ``review`` / ``verify`` seam overran its per-call
   :class:`~loop_agent.loop.TimeoutPolicy` deadline under ``on_timeout="kill"``
   (Issue #42). A :class:`StateError` (a run-time invariant -- the seam did not
   finish in time). Relocated here for the unified hierarchy (Issue #71); still
@@ -123,8 +123,8 @@ class StateError(LoopError, ValueError, RuntimeError):
 class AsyncSeamInSyncLoop(LoopError, RuntimeError):
     """An async (awaitable) seam was used inside the synchronous ``run_loop``.
 
-    One of ``act`` / ``verify`` / ``gather`` / a condition's ``check`` /
-    ``review`` / ``gate.review`` / ``on_step`` / ``on_complete`` returned an awaitable while
+    One of ``act`` / ``review`` / ``verify`` / ``gather`` / a condition's ``check`` /
+    ``gate.review`` / ``on_step`` / ``on_complete`` returned an awaitable while
     the loop was driven synchronously. Use :func:`loop_agent.async_run_loop`
     for async seams (Issue #40). Inherits ``RuntimeError`` for backwards
     compatibility; canonical home is this module, re-exported from
@@ -137,11 +137,11 @@ class SeamTimeout(StateError):
 
     Raised *out of the loop* (so :func:`loop_agent.run_loop` /
     :func:`loop_agent.async_run_loop` does not return a ``LoopResult``) when
-    ``act`` or ``verify`` overruns its configured
+    ``act`` / ``review`` / ``verify`` overruns its configured
     :class:`~loop_agent.loop.TimeoutPolicy` deadline in hard-kill mode. For an
     async seam the underlying task has been cancelled (via :func:`asyncio.wait`
     + ``task.cancel()``); for a synchronous seam on a POSIX main thread it was
-    interrupted by ``SIGALRM``. ``seam`` is ``"act"`` or ``"verify"`` and
+    interrupted by ``SIGALRM``. ``seam`` is ``"act"``, ``"review"``, or ``"verify"`` and
     ``seconds`` the deadline that was exceeded.
 
     A :class:`StateError` (a run-time invariant violation -- the seam did not

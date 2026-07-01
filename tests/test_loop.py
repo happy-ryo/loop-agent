@@ -410,7 +410,7 @@ def test_resume_already_past_a_cap_stops_before_any_new_step():
 # -- optional post-act review ----------------------------------------------
 
 
-def test_review_runs_between_act_and_verify_and_records_json_detail():
+def test_review_runs_between_act_and_verify_and_preserves_verify_detail():
     order = []
 
     def act(_ctx):
@@ -436,11 +436,7 @@ def test_review_runs_between_act_and_verify_and_records_json_detail():
 
     assert order == ["act", "review", "verify"]
     assert result.status == "goal_met"
-    detail = json.loads(result.history[-1].detail)
-    assert detail == {
-        "review": {"approved": True, "feedback": "scope ok", "severity": "info"},
-        "verify": {"detail": "pytest passed"},
-    }
+    assert result.history[-1].detail == "pytest passed"
 
 
 def test_blocking_review_skips_verify_and_feedback_reaches_next_gather():

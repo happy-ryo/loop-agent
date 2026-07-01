@@ -13,7 +13,11 @@ from html import escape
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from .events import EventSink, LoopEvent, fan_out
-from .loop import ACT_TIMEOUT_OBSERVATION, VERIFY_TIMEOUT_OBSERVATION
+from .loop import (
+    ACT_TIMEOUT_OBSERVATION,
+    REVIEW_TIMEOUT_OBSERVATION,
+    VERIFY_TIMEOUT_OBSERVATION,
+)
 from .state import LoopState, StepRecord
 
 LOOP_SPIKE = "loop_spike"
@@ -144,7 +148,11 @@ def detect_spikes(
                 )
             )
         observations = [_key(r.observation) for r in tail]
-        timeout_markers = {ACT_TIMEOUT_OBSERVATION, VERIFY_TIMEOUT_OBSERVATION}
+        timeout_markers = {
+            ACT_TIMEOUT_OBSERVATION,
+            REVIEW_TIMEOUT_OBSERVATION,
+            VERIFY_TIMEOUT_OBSERVATION,
+        }
         if observations and all(o in timeout_markers for o in observations):
             spikes.append(
                 Spike(
@@ -246,7 +254,11 @@ class TimeoutMarkerBreaker:
 
     def check(self, state: LoopState) -> Optional[str]:
         tail = state.history[-self.repeat :] if self.repeat > 0 else []
-        markers = {ACT_TIMEOUT_OBSERVATION, VERIFY_TIMEOUT_OBSERVATION}
+        markers = {
+            ACT_TIMEOUT_OBSERVATION,
+            REVIEW_TIMEOUT_OBSERVATION,
+            VERIFY_TIMEOUT_OBSERVATION,
+        }
         if len(tail) == self.repeat and all(r.observation in markers for r in tail):
             return f"timeout marker repeated {self.repeat} times"
         return None

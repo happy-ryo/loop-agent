@@ -43,14 +43,14 @@ result = run_loop(
 
 ## 暴走する 1 回の呼び出しを止める（per-call timeout / kill）
 
-`act` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
+`act` / `review` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations
 
 result = run_loop(
     act=my_act, verify=my_verify, conditions=[MaxIterations(20)],
-    timeout=TimeoutPolicy(act=30.0, verify=10.0, on_timeout="graceful"),
+    timeout=TimeoutPolicy(act=30.0, review=20.0, verify=10.0, on_timeout="graceful"),
 )
 ```
 

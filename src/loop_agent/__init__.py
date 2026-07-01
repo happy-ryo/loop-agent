@@ -88,6 +88,7 @@ from .errors import (
 from .gate import Decision, HumanGate, run_gated_loop
 from .loop import (
     ACT_TIMEOUT_OBSERVATION,
+    REVIEW_TIMEOUT_OBSERVATION,
     TIMEOUT_GRACEFUL,
     TIMEOUT_KILL,
     VERIFY_TIMEOUT_OBSERVATION,
@@ -209,13 +210,14 @@ __all__ = [
     "MaxIterations",
     "TokenBudget",
     "Timeout",
-    # act/verify の per-call timeout / kill (Issue #42)
+    # act/review/verify の per-call timeout / kill (Issue #42)
     "TimeoutPolicy",
     "SeamTimeout",
     "UnsupportedTimeoutKill",
     "TIMEOUT_GRACEFUL",
     "TIMEOUT_KILL",
     "ACT_TIMEOUT_OBSERVATION",
+    "REVIEW_TIMEOUT_OBSERVATION",
     "VERIFY_TIMEOUT_OBSERVATION",
     "GoalMet",
     "GoalCheck",

@@ -22,6 +22,7 @@ import pytest
 import loop_agent.loop as loop_mod
 from loop_agent import (
     ACT_TIMEOUT_OBSERVATION,
+    REVIEW_TIMEOUT_OBSERVATION,
     TIMEOUT_GRACEFUL,
     TIMEOUT_KILL,
     VERIFY_TIMEOUT_OBSERVATION,
@@ -33,6 +34,7 @@ from loop_agent import (
     TimeoutPolicy,
     UnsupportedTimeoutKill,
     VerifyOutcome,
+    ReviewOutcome,
     async_run_loop,
     run_loop,
 )
@@ -81,6 +83,8 @@ def test_policy_rejects_non_positive(bad):
     with pytest.raises(ValueError):
         TimeoutPolicy(default=bad)
     with pytest.raises(ValueError):
+        TimeoutPolicy(review=bad)
+    with pytest.raises(ValueError):
         TimeoutPolicy(verify=bad)
 
 
@@ -96,12 +100,15 @@ def test_policy_rejects_bool():
     with pytest.raises(TypeError):
         TimeoutPolicy(default=False)
     with pytest.raises(TypeError):
+        TimeoutPolicy(review=True)
+    with pytest.raises(TypeError):
         TimeoutPolicy(verify=True)
 
 
 def test_policy_per_seam_resolution():
     p = TimeoutPolicy(default=5.0, act=2.0)
     assert p.act_seconds == 2.0
+    assert p.review_seconds == 5.0  # falls back to default
     assert p.verify_seconds == 5.0  # falls back to default
     assert TimeoutPolicy(verify=3.0).act_seconds is None
 
@@ -258,6 +265,36 @@ def test_async_verify_graceful_keeps_act_tokens():
     assert [r.observation for r in result.history] == [VERIFY_TIMEOUT_OBSERVATION] * 2
     assert [r.tokens for r in result.history] == [10, 10]
 
+
+
+def test_async_review_graceful_keeps_act_tokens_and_skips_verify():
+    verify_calls = 0
+
+    async def slow_review(_outcome):
+        await asyncio.sleep(5.0)
+        return ReviewOutcome(approved=True)
+
+    def verify(_outcome):
+        nonlocal verify_calls
+        verify_calls += 1
+        return VerifyOutcome(goal_met=True)
+
+    result = asyncio.run(
+        async_run_loop(
+            act=acting(tokens=10),
+            review=slow_review,
+            verify=verify,
+            conditions=[MaxIterations(2)],
+            timeout=TimeoutPolicy(review=0.01, on_timeout=TIMEOUT_GRACEFUL),
+        )
+    )
+
+    assert result.iterations == 2
+    assert result.tokens_used == 20
+    assert verify_calls == 0
+    assert [r.observation for r in result.history] == [REVIEW_TIMEOUT_OBSERVATION] * 2
+    assert [r.tokens for r in result.history] == [10, 10]
+    assert "review timed out after 0.01s" in result.history[0].detail
 
 def test_async_graceful_composes_with_no_progress():
     """Repeated graceful timeouts trip NoProgress on the marker observation."""

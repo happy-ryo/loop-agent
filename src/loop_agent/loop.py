@@ -66,7 +66,7 @@ GATE_PROCEED = "proceed"
 GATE_SKIP = "skip"
 GATE_PAUSE = "pause"
 
-# act/verify の per-call timeout 超過時の挙動 (Issue #42)。
+# act/review/verify の per-call timeout 超過時の挙動 (Issue #42)。
 #   graceful: 当該シームを諦め、failed=True な合成 step を記録して **次 iteration** へ。
 #             ループは返り続ける (例外を投げない)。stop 条件 (MaxIterations / Timeout /
 #             NoProgress) が次の guard で繰り返し timeout を捕捉・収束させる。
@@ -81,6 +81,7 @@ _TIMEOUT_MODES = (TIMEOUT_GRACEFUL, TIMEOUT_KILL)
 # JSON ネイティブで hashable な文字列にしてあるので、永続化 / resume を通っても安定し、
 # NoProgress の既定 key (observation そのもの) で「timeout の繰り返し」を検出できる。
 ACT_TIMEOUT_OBSERVATION = "<seam-timeout:act>"
+REVIEW_TIMEOUT_OBSERVATION = "<seam-timeout:review>"
 VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
 
 
@@ -107,10 +108,11 @@ class _AlarmInterrupt(BaseException):
 
 @dataclass(frozen=True)
 class TimeoutPolicy:
-    """Per-call timeout for the ``act`` and ``verify`` seams (Issue #42).
+    """Per-call timeout for the ``act``, ``review``, and ``verify`` seams (Issue #42).
 
-    A timeout bounds a *single* ``act`` (or ``verify``) invocation -- distinct
-    from the whole-run :class:`~loop_agent.conditions.Timeout` *stop condition*,
+    A timeout bounds a *single* ``act``, ``review``, or ``verify`` invocation --
+    distinct from the whole-run :class:`~loop_agent.conditions.Timeout` *stop
+    condition*,
     which caps cumulative wall-clock at the iteration boundary and never
     interrupts an in-progress step. Use this to stop one runaway model/tool call
     without aborting the run.
@@ -121,7 +123,8 @@ class TimeoutPolicy:
 
     - :data:`TIMEOUT_GRACEFUL` (default) -- abandon the call, record a synthetic
       ``goal_met=False`` step (observation :data:`ACT_TIMEOUT_OBSERVATION` /
-      :data:`VERIFY_TIMEOUT_OBSERVATION`), and continue to the next iteration, so
+      :data:`REVIEW_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`),
+      and continue to the next iteration, so
       the stop conditions bound a stream of timeouts (``MaxIterations`` /
       ``NoProgress`` on the marker / a ``Timeout`` stop).
     - :data:`TIMEOUT_KILL` -- cancel the call and raise :class:`SeamTimeout` out
@@ -148,8 +151,8 @@ class TimeoutPolicy:
     likewise uninterruptible until it next awaits (the deadline is enforced at
     the await boundary).
 
-    **Per-call budget.** Each ``act`` / ``verify`` invocation gets one deadline
-    that spans its whole execution. For an unusual seam that does blocking
+    **Per-call budget.** Each ``act`` / ``review`` / ``verify`` invocation gets one
+    deadline that spans its whole execution. For an unusual seam that does blocking
     synchronous work *and then* returns an awaitable, the time spent in the
     synchronous prefix is subtracted from the awaited portion's budget (a prefix
     that already exhausts the deadline trips immediately), so the total is bounded
@@ -171,11 +174,12 @@ class TimeoutPolicy:
 
     default: Optional[float] = None
     act: Optional[float] = None
+    review: Optional[float] = None
     verify: Optional[float] = None
     on_timeout: str = TIMEOUT_GRACEFUL
 
     def __post_init__(self) -> None:
-        for name in ("default", "act", "verify"):
+        for name in ("default", "act", "review", "verify"):
             value = getattr(self, name)
             if value is None:
                 continue
@@ -203,16 +207,24 @@ class TimeoutPolicy:
         return self.act if self.act is not None else self.default
 
     @property
+    def review_seconds(self) -> Optional[float]:
+        return self.review if self.review is not None else self.default
+
+    @property
     def verify_seconds(self) -> Optional[float]:
         return self.verify if self.verify is not None else self.default
 
     def _is_noop(self) -> bool:
         """True when no seam has an effective deadline (fast path)."""
-        return self.act_seconds is None and self.verify_seconds is None
+        return (
+            self.act_seconds is None
+            and self.review_seconds is None
+            and self.verify_seconds is None
+        )
 
 
-# A timeout argument accepts a TimeoutPolicy, a bare number (applied to both act
-# and verify, graceful mode), or None (no per-call timeout).
+# A timeout argument accepts a TimeoutPolicy, a bare number (applied to act,
+# review, and verify, graceful mode), or None (no per-call timeout).
 TimeoutArg = Union[TimeoutPolicy, float, int, None]
 
 
@@ -232,6 +244,9 @@ def _effective_seam_timeout(
     if seam == "act":
         seconds = policy.act_seconds
         explicit = policy.act is not None
+    elif seam == "review":
+        seconds = policy.review_seconds
+        explicit = policy.review is not None
     elif seam == "verify":
         seconds = policy.verify_seconds
         explicit = policy.verify is not None
@@ -253,7 +268,7 @@ def _resolve_timeout(timeout: TimeoutArg) -> Optional[TimeoutPolicy]:
 
     ``None`` (or a policy with no effective deadline) returns ``None`` so the
     driver keeps its exact zero-overhead path. A bare number becomes
-    ``TimeoutPolicy(default=number)`` (graceful, both seams).
+    ``TimeoutPolicy(default=number)`` (graceful, all timed seams).
     """
     if timeout is None:
         return None
@@ -484,7 +499,7 @@ async def _run_seam(
             _abandon_awaitable(result)
             raise AsyncSeamInSyncLoop(
                 "run_loop() received an async (awaitable) seam "
-                "(act/verify/gather/condition/gate/on_step/on_complete); "
+                "(act/review/verify/gather/condition/gate/on_step/on_complete); "
                 "use `await async_run_loop(...)` for async seams"
             )
         # Carry the single per-call budget into the await: subtract the real
@@ -777,16 +792,6 @@ def _review_detail(review: ReviewOutcome) -> str:
     )
 
 
-def _combine_review_and_verify_detail(
-    review: Optional[ReviewOutcome], verify_detail: str
-) -> str:
-    if review is None:
-        return verify_detail
-    detail: dict[str, Any] = {"review": _review_payload(review)}
-    if verify_detail:
-        detail["verify"] = {"detail": verify_detail}
-    return json.dumps(detail, ensure_ascii=False, sort_keys=True)
-
 async def async_run_loop(
     *,
     act: ActHook,
@@ -871,15 +876,16 @@ async def async_run_loop(
             *total* run time, not just this leg). ``None`` (the default) starts a
             fresh run; an empty :class:`LoopState` is equivalent to ``None``. The
             seed is copied, so the caller's object is not mutated.
-        timeout: Optional per-call timeout for the ``act`` and ``verify`` seams
+        timeout: Optional per-call timeout for the ``act``, ``review``, and ``verify`` seams
             (Issue #42). A :class:`TimeoutPolicy` (per-seam / ``default`` deadlines
-            and ``on_timeout`` mode), a bare number of seconds (applied to *both*
-            seams, ``graceful`` mode), or ``None`` (no per-call timeout -- the
+            and ``on_timeout`` mode), a bare number of seconds (applied to all
+            timed seams, ``graceful`` mode), or ``None`` (no per-call timeout -- the
             default, zero-overhead path). Distinct from the whole-run
             :class:`~loop_agent.conditions.Timeout` *stop condition*: this bounds
-            one ``act`` / ``verify`` call, not cumulative wall-clock. On overrun,
+            one ``act`` / ``review`` / ``verify`` call, not cumulative wall-clock. On overrun,
             ``graceful`` records a synthetic ``goal_met=False`` step (observation
-            :data:`ACT_TIMEOUT_OBSERVATION` / :data:`VERIFY_TIMEOUT_OBSERVATION`)
+            :data:`ACT_TIMEOUT_OBSERVATION` / :data:`REVIEW_TIMEOUT_OBSERVATION` /
+            :data:`VERIFY_TIMEOUT_OBSERVATION`)
             and continues so the stop conditions bound a run of timeouts;
             ``kill`` raises :class:`SeamTimeout` out of the loop. An async seam is
             cancelled via the asyncio event loop; a synchronous seam by POSIX
@@ -1106,7 +1112,39 @@ async def _drive_loop(
 
         review_outcome: Optional[ReviewOutcome] = None
         if review is not None:
-            review_outcome = await maybe_await(review(outcome))
+            review_timeout = (
+                None
+                if policy is None
+                else _effective_seam_timeout(policy, "review", review)
+            )
+            if review_timeout is None:
+                review_outcome = await maybe_await(review(outcome))
+            else:
+                try:
+                    review_outcome = await _run_seam(
+                        review,
+                        outcome,
+                        seconds=review_timeout,
+                        mode=policy.on_timeout,
+                        seam="review",
+                        time_fn=time_fn,
+                    )
+                except _GracefulTimeout:
+                    record = StepRecord(
+                        iteration=state.iteration,
+                        observation=REVIEW_TIMEOUT_OBSERVATION,
+                        tokens=outcome.tokens,
+                        goal_met=False,
+                        detail=f"review timed out after {review_timeout:g}s",
+                    )
+                    state.history.append(record)
+                    state.iteration += 1
+                    state.elapsed = time_fn() - start
+                    if on_step is not None:
+                        await maybe_await(on_step(record, state))
+                    if gate_on_complete is not None:
+                        await maybe_await(gate_on_complete())
+                    continue
             if (not review_outcome.approved) and review_outcome.severity == "blocking":
                 record = StepRecord(
                     iteration=state.iteration,
@@ -1164,7 +1202,7 @@ async def _drive_loop(
             observation=outcome.observation,
             tokens=outcome.tokens,
             goal_met=verdict.goal_met,
-            detail=_combine_review_and_verify_detail(review_outcome, verdict.detail),
+            detail=verdict.detail,
         )
         state.history.append(record)
         state.iteration += 1
