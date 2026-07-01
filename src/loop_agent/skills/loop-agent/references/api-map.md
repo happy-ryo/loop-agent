@@ -107,6 +107,50 @@ Rules:
 
 Read next: `writing-an-adapter.md` and `safety.md`.
 
+
+## If Act Needs Artifact Review Before Verify
+
+Use:
+
+```python
+from loop_agent import ReviewOutcome
+```
+
+Shape:
+
+```python
+def review(outcome):
+    if violates_required_shape(outcome.observation):
+        return ReviewOutcome(
+            approved=False,
+            severity="blocking",
+            feedback="artifact shape is invalid; fix the missing field",
+        )
+    return ReviewOutcome(approved=True)
+
+result = run_loop(
+    gather=gather,
+    act=act,
+    review=review,
+    verify=verify,
+    conditions=[MaxIterations(10), Timeout(900)],
+)
+```
+
+Use `review=` when the agent's artifact should be checked before running the
+final ground-truth verifier, especially when the feedback should guide the next
+iteration. A blocking review records a failed step and skips `verify` for that
+iteration, so the next `gather` can feed the review feedback back into `act`.
+
+Distinctions:
+
+- `HumanGate` runs before `act` and protects irreversible proposed actions.
+- `review=` runs after `act` and evaluates the produced artifact.
+- `verify` remains the ground-truth success oracle; review is a pre-verifier
+  quality or shape check, not a replacement for machine success criteria.
+
+Read next: `seams.md` and the canonical docs page `docs/review.md`.
+
 ## If There Are N Files, Bugs, Rows, Or Tasks
 
 Use:

@@ -165,3 +165,6 @@ def test_public_api_group_docs_exist_for_humans_and_coding_agents():
     assert "HARNESS_API" in first_harness
     assert "references/api-map.md" in skill
     assert "If The Loop Must Resume After Interruption" in skill_map
+    assert "If Act Needs Artifact Review Before Verify" in skill_map
+    assert "ReviewOutcome" in skill_map
+    assert "`HumanGate` runs before `act`" in skill_map
