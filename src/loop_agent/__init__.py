@@ -1,6 +1,6 @@
 """loop-agent embeddable loop runtime.
 
-Public API for a bounded ``gather -> act -> verify -> repeat`` loop engine with
+Public API for a bounded ``gather -> act -> review? -> verify -> repeat`` loop engine with
 composable stop conditions, persistence/resume, observability, human gates,
 Reflexion, transport, work discovery, and CLI/adapters.
 
@@ -94,6 +94,8 @@ from .loop import (
     ActionGate,
     ActOutcome,
     GateReview,
+    ReviewHook,
+    ReviewOutcome,
     LoopResult,
     SeamTimeout,
     TimeoutPolicy,
@@ -196,6 +198,8 @@ __all__ = [
     "AsyncSeamInSyncLoop",
     "ActOutcome",
     "VerifyOutcome",
+    "ReviewOutcome",
+    "ReviewHook",
     "LoopResult",
     "LoopState",
     "StepRecord",

@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from loop_agent import (
     ActOutcome,
+    ConfigError,
     GoalCheck,
     GoalMet,
     LoopState,
     MaxIterations,
     NoProgress,
+    ReviewOutcome,
     StepRecord,
     Timeout,
     TokenBudget,
@@ -402,6 +406,92 @@ def test_resume_already_past_a_cap_stops_before_any_new_step():
     assert result.tokens_used == 50
     assert steps == []
 
+
+# -- optional post-act review ----------------------------------------------
+
+
+def test_review_runs_between_act_and_verify_and_records_json_detail():
+    order = []
+
+    def act(_ctx):
+        order.append("act")
+        return ActOutcome(observation="artifact", tokens=3)
+
+    def review(outcome):
+        order.append("review")
+        assert outcome.observation == "artifact"
+        return ReviewOutcome(approved=True, feedback="scope ok")
+
+    def verify(outcome):
+        order.append("verify")
+        assert outcome.observation == "artifact"
+        return VerifyOutcome(goal_met=True, detail="pytest passed")
+
+    result = run_loop(
+        act=act,
+        review=review,
+        verify=verify,
+        conditions=[MaxIterations(5)],
+    )
+
+    assert order == ["act", "review", "verify"]
+    assert result.status == "goal_met"
+    detail = json.loads(result.history[-1].detail)
+    assert detail == {
+        "review": {"approved": True, "feedback": "scope ok", "severity": "info"},
+        "verify": {"detail": "pytest passed"},
+    }
+
+
+def test_blocking_review_skips_verify_and_feedback_reaches_next_gather():
+    review_calls = 0
+    verify_calls = 0
+    gather_seen = []
+
+    def gather(state):
+        gather_seen.append(state.history[-1].detail if state.history else "")
+        return {"iteration": state.iteration}
+
+    def act(ctx):
+        return ActOutcome(observation={"iteration": ctx["iteration"]}, tokens=2)
+
+    def review(_outcome):
+        nonlocal review_calls
+        review_calls += 1
+        if review_calls == 1:
+            return ReviewOutcome(False, "narrow the edit", "blocking")
+        return ReviewOutcome(True, "scope ok")
+
+    def verify(_outcome):
+        nonlocal verify_calls
+        verify_calls += 1
+        return VerifyOutcome(goal_met=True, detail="pytest passed")
+
+    result = run_loop(
+        gather=gather,
+        act=act,
+        review=review,
+        verify=verify,
+        conditions=[MaxIterations(5)],
+    )
+
+    assert result.status == "goal_met"
+    assert result.iterations == 2
+    assert verify_calls == 1
+    first_detail = json.loads(result.history[0].detail)
+    assert first_detail == {
+        "review": {
+            "approved": False,
+            "feedback": "narrow the edit",
+            "severity": "blocking",
+        }
+    }
+    assert "narrow the edit" in gather_seen[1]
+
+
+def test_review_outcome_rejects_unknown_severity():
+    with pytest.raises(ConfigError, match="ReviewOutcome severity"):
+        ReviewOutcome(True, severity="critical")
 
 # -- validation -------------------------------------------------------------
 

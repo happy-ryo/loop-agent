@@ -1,4 +1,4 @@
-"""The loop driver: gather -> act -> verify -> repeat (report.md S4.4).
+"""The loop driver: gather -> act -> review? -> verify -> repeat (report.md S4.4).
 
 A single-agent, single-process driver. ``act`` and ``verify`` are injected
 callables (hooks), so the engine carries no LLM dependency; the same seam can
@@ -15,9 +15,10 @@ never raises to signal "limit reached".
 Two entry points share one control-flow implementation (Issue #40):
 
 - :func:`async_run_loop` -- the async driver and single source of truth. Each
-  seam (``gather`` / ``act`` / ``verify`` / ``conditions`` / ``gate`` /
-  ``on_step``) may be a synchronous callable *or* an async one; the driver awaits
-  results via :func:`loop_agent._async.maybe_await`, so sync and async hooks mix.
+  seam (``gather`` / ``act`` / ``review`` / ``verify`` / ``conditions`` /
+  ``gate`` / ``on_step``) may be a synchronous callable *or* an async one; the
+  driver awaits results via :func:`loop_agent._async.maybe_await`, so sync and
+  async hooks mix.
 - :func:`run_loop` -- the original synchronous API. It drives the shared
   coroutine to completion *in the caller's own context* (no event loop is
   created), so behaviour for synchronous hooks is byte-for-byte unchanged; it
@@ -29,12 +30,22 @@ Two entry points share one control-flow implementation (Issue #40):
 from __future__ import annotations
 
 import asyncio
+import json
 import inspect
 import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
 
 from ._async import (
     AsyncSeamInSyncLoop,
@@ -574,6 +585,32 @@ class VerifyOutcome:
     detail: str = ""
 
 
+ReviewSeverity = Literal["info", "warning", "blocking"]
+_REVIEW_SEVERITIES = ("info", "warning", "blocking")
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    """Post-act artifact review, evaluated before ground-truth ``verify``.
+
+    Review is optional and distinct from :class:`ActionGate`: a gate approves a
+    proposed irreversible action before it runs, while review evaluates the
+    artifact that ``act`` already produced. A non-approved ``"blocking"`` review
+    is recorded as a failed step and skips ``verify`` for that iteration so the
+    next ``gather`` can feed the feedback back into ``act``.
+    """
+
+    approved: bool
+    feedback: str = ""
+    severity: ReviewSeverity = "info"
+
+    def __post_init__(self) -> None:
+        if self.severity not in _REVIEW_SEVERITIES:
+            raise ConfigError(
+                f"ReviewOutcome severity must be one of {_REVIEW_SEVERITIES}, "
+                f"got {self.severity!r}"
+            )
+
 @dataclass
 class GateReview:
     """A human gate's verdict on a proposed action, consumed by the driver.
@@ -716,6 +753,7 @@ class LoopResult:
 GatherHook = Callable[[LoopState], Union[Any, Awaitable[Any]]]
 ActHook = Callable[[Any], Union[ActOutcome, Awaitable[ActOutcome]]]
 VerifyHook = Callable[[ActOutcome], Union[VerifyOutcome, Awaitable[VerifyOutcome]]]
+ReviewHook = Callable[[ActOutcome], Union[ReviewOutcome, Awaitable[ReviewOutcome]]]
 StepHook = Callable[[StepRecord, LoopState], Union[None, Awaitable[None]]]
 Conditions = Union[AnyOf, list[StopCondition], tuple[StopCondition, ...]]
 
@@ -725,12 +763,37 @@ def _default_gather(state: LoopState) -> LoopState:
     return state
 
 
+def _review_payload(review: ReviewOutcome) -> dict[str, Any]:
+    return {
+        "approved": review.approved,
+        "feedback": review.feedback,
+        "severity": review.severity,
+    }
+
+
+def _review_detail(review: ReviewOutcome) -> str:
+    return json.dumps(
+        {"review": _review_payload(review)}, ensure_ascii=False, sort_keys=True
+    )
+
+
+def _combine_review_and_verify_detail(
+    review: Optional[ReviewOutcome], verify_detail: str
+) -> str:
+    if review is None:
+        return verify_detail
+    detail: dict[str, Any] = {"review": _review_payload(review)}
+    if verify_detail:
+        detail["verify"] = {"detail": verify_detail}
+    return json.dumps(detail, ensure_ascii=False, sort_keys=True)
+
 async def async_run_loop(
     *,
     act: ActHook,
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
@@ -740,15 +803,16 @@ async def async_run_loop(
     # maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
     _strict_sync: bool = False,
 ) -> LoopResult:
-    """Async driver: gather -> act -> verify -> repeat until the goal or a cap.
+    """Async driver: gather -> act -> review? -> verify -> repeat until the goal or a cap.
 
     This is the **single source of truth** for the loop's control flow; the
     synchronous :func:`run_loop` is a thin ``asyncio.run`` wrapper around it. Use
     this entry point when you are already inside an event loop (``await
     async_run_loop(...)``) or when any hook is a coroutine function.
 
-    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``, ``act``,
-    ``verify``, each ``conditions`` ``check``, ``gate.review``, ``on_step`` (and a
+    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``,
+    ``act``, ``review``, ``verify``, each ``conditions`` ``check``,
+    ``gate.review``, ``on_step`` (and a
     gate's ``on_complete``) -- may be a plain synchronous callable *or* an async
     one (returning an awaitable). The driver awaits each result via
     :func:`loop_agent._async.maybe_await`, so synchronous and asynchronous hooks
@@ -758,8 +822,9 @@ async def async_run_loop(
 
     **asyncio の使い方.** This coroutine performs no concurrency of its own: it
     ``await``\\s each seam *sequentially* to preserve the exact gather -> gate ->
-    act -> verify ordering and the stop-condition evaluation timing of the
-    synchronous loop. It runs on whatever event loop awaits it. To run several
+    act -> review? -> verify ordering and the stop-condition evaluation timing
+    of the synchronous loop. It runs on whatever event loop awaits it. To run
+    several
     independent loops concurrently, schedule them as tasks from the caller, e.g.
     ``await asyncio.gather(async_run_loop(...), async_run_loop(...))`` or
     ``asyncio.create_task(async_run_loop(...))`` -- each call owns its own
@@ -778,6 +843,11 @@ async def async_run_loop(
             sequence of stop conditions (wrapped in ``AnyOf`` automatically).
         gather: Hook building the context handed to ``act``. Defaults to passing
             the :class:`LoopState` through.
+        review: Optional post-act artifact review hook. It receives the
+            :class:`ActOutcome` before ground-truth ``verify``. A blocking
+            ``ReviewOutcome(approved=False, severity="blocking")`` records a
+            failed step, skips ``verify`` for that iteration, and leaves JSON
+            review feedback in ``StepRecord.detail`` for the next ``gather``.
         on_step: Optional observer invoked with ``(record, state)`` after each
             completed iteration (a minimal observability seam; report.md R7).
         gate: Optional limited human gate (report.md R6). When supplied, its
@@ -861,6 +931,7 @@ async def async_run_loop(
             verify=verify,
             conditions=conditions,
             gather=gather,
+            review=review,
             on_step=on_step,
             gate=gate,
             time_fn=time_fn,
@@ -877,6 +948,7 @@ async def _drive_loop(
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
@@ -948,49 +1020,49 @@ async def _drive_loop(
         # step 永続化後に呼ぶため、ここで掴んでおく (非ゲート step では None のまま)。
         gate_on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
         if gate is not None:
-            review = await maybe_await(gate.review(context, state))
-            if review.disposition == GATE_PAUSE:
+            gate_review = await maybe_await(gate.review(context, state))
+            if gate_review.disposition == GATE_PAUSE:
                 # Interrupt before the irreversible side effect. No step is
                 # recorded for the un-executed action; the decision is persisted
                 # behind the gate so a resumed run honours it (report.md R6).
                 state.elapsed = time_fn() - start
                 return LoopResult(
-                    status="paused", stop=None, state=state, pending=review.pending
+                    status="paused", stop=None, state=state, pending=gate_review.pending
                 )
-            if review.disposition == GATE_SKIP:
+            if gate_review.disposition == GATE_SKIP:
                 # The human declined to execute (reject/respond): record the
                 # decision as a zero-cost step and re-enter the guard, so caps
                 # and NoProgress still see and bound the gated cycle.
                 record = StepRecord(
                     iteration=state.iteration,
-                    observation=review.observation,
+                    observation=gate_review.observation,
                     tokens=0,
                     goal_met=False,
-                    detail=review.detail,
+                    detail=gate_review.detail,
                 )
                 state.history.append(record)
                 state.iteration += 1
                 state.elapsed = time_fn() - start
                 # replay no-op な skip (review.persist=False) は on_step を呼ばない:
                 # 前 run が永続化した本来の step 行を上書きで壊さないため。
-                if on_step is not None and review.persist:
+                if on_step is not None and gate_review.persist:
                     await maybe_await(on_step(record, state))
                 continue
-            if review.disposition != GATE_PROCEED:
+            if gate_review.disposition != GATE_PROCEED:
                 # Fail closed: an unrecognised disposition (e.g. a typo'd
                 # "paused") must NOT silently fall through to executing the
                 # action -- for a safety gate that could run an irreversible
                 # side effect instead of pausing. Reject loudly instead.
                 raise StateError(
-                    f"gate returned unknown disposition {review.disposition!r}; "
+                    f"gate returned unknown disposition {gate_review.disposition!r}; "
                     f"expected one of {GATE_PROCEED!r}/{GATE_SKIP!r}/{GATE_PAUSE!r}"
                 )
             # GATE_PROCEED: execute the (possibly edited) action. An unset
             # context keeps the gathered action; only an explicit value (an
             # edit) replaces it -- so a bare proceed never passes None to act.
-            if review.context is not KEEP_CONTEXT:
-                context = review.context
-            gate_on_complete = review.on_complete
+            if gate_review.context is not KEEP_CONTEXT:
+                context = gate_review.context
+            gate_on_complete = gate_review.on_complete
 
         # act -- per-call timeout 適用可 (Issue #42)。policy 未設定なら従来どおり
         # maybe_await 直呼びで追加コストゼロ。graceful timeout は当該 step を failed
@@ -1032,6 +1104,26 @@ async def _drive_loop(
                 continue
         state.tokens_used += outcome.tokens
 
+        review_outcome: Optional[ReviewOutcome] = None
+        if review is not None:
+            review_outcome = await maybe_await(review(outcome))
+            if (not review_outcome.approved) and review_outcome.severity == "blocking":
+                record = StepRecord(
+                    iteration=state.iteration,
+                    observation=outcome.observation,
+                    tokens=outcome.tokens,
+                    goal_met=False,
+                    detail=_review_detail(review_outcome),
+                )
+                state.history.append(record)
+                state.iteration += 1
+                state.elapsed = time_fn() - start
+                if on_step is not None:
+                    await maybe_await(on_step(record, state))
+                if gate_on_complete is not None:
+                    await maybe_await(gate_on_complete())
+                continue
+
         # verify -- 同上。act の outcome (tokens 計上済) はそのまま、verify が時間切れ
         # なら failed step を記録して次 iteration へ。
         verify_timeout = (
@@ -1072,7 +1164,7 @@ async def _drive_loop(
             observation=outcome.observation,
             tokens=outcome.tokens,
             goal_met=verdict.goal_met,
-            detail=verdict.detail,
+            detail=_combine_review_and_verify_detail(review_outcome, verdict.detail),
         )
         state.history.append(record)
         state.iteration += 1
@@ -1104,13 +1196,14 @@ def run_loop(
     verify: VerifyHook,
     conditions: Conditions,
     gather: GatherHook = _default_gather,
+    review: Optional[ReviewHook] = None,
     on_step: Optional[StepHook] = None,
     gate: Optional[ActionGate] = None,
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
     timeout: TimeoutArg = None,
 ) -> LoopResult:
-    """Drive gather -> act -> verify -> repeat until the goal or a cap (sync).
+    """Drive gather -> act -> review? -> verify -> repeat until the goal or a cap (sync).
 
     This is the **synchronous entry point** and the original public API. It shares
     one control-flow implementation with :func:`async_run_loop` (which owns the
@@ -1161,6 +1254,7 @@ def run_loop(
         verify=verify,
         conditions=conditions,
         gather=gather,
+        review=review,
         on_step=on_step,
         gate=gate,
         time_fn=time_fn,

@@ -124,7 +124,7 @@ class AsyncSeamInSyncLoop(LoopError, RuntimeError):
     """An async (awaitable) seam was used inside the synchronous ``run_loop``.
 
     One of ``act`` / ``verify`` / ``gather`` / a condition's ``check`` /
-    ``gate.review`` / ``on_step`` / ``on_complete`` returned an awaitable while
+    ``review`` / ``gate.review`` / ``on_step`` / ``on_complete`` returned an awaitable while
     the loop was driven synchronously. Use :func:`loop_agent.async_run_loop`
     for async seams (Issue #40). Inherits ``RuntimeError`` for backwards
     compatibility; canonical home is this module, re-exported from

@@ -113,6 +113,7 @@ loop-agent install-skills --target <path>                   # 任意パスに配
 | [docs/quickstart.md](./docs/quickstart.md) | 30 分で動かす動線（E primary + 監視 / resume / トラブルシュート） |
 | [docs/seams.md](./docs/seams.md) | シーム詳細（型・ground-truth の鉄則・二重終了条件・検証駆動デモ） |
 | [docs/verifiers.md](./docs/verifiers.md) | ground-truth verify helper（CommandVerifier / PytestVerifier / RegexVerifier） |
+| [docs/review.md](./docs/review.md) | optional post-act review (`review=` / `ReviewOutcome`) |
 | [docs/adapters/README.md](./docs/adapters/README.md) | act アダプタ（`ClaudeCodeAct` / `CodexAct` / ModelLadder + API 比較表） |
 | [docs/adapters/writing-an-adapter.md](./docs/adapters/writing-an-adapter.md) | 自作 adapter の書き方（`ActHook` 契約・token 二重計上の回避） |
 | [docs/recipes/](./docs/recipes/README.md) | 動線 E の prose intent → harness 具体例（flaky test / 翻訳 / リファクタ） |

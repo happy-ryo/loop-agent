@@ -14,7 +14,7 @@
 coroutine / future を返すので、その場で await される。
 
 これは :func:`loop_agent.loop.async_run_loop` が単一の制御フローで sync/async 双方を
-駆動するための土台で、``conditions`` (各 ``check``) と ``gate.review`` も同じ規約で
+駆動するための土台で、``review``、``conditions`` (各 ``check``) と ``gate.review`` も同じ規約で
 sync/async どちらでも受けられる。
 
 **strict-sync モード (run_loop 用)**: 同期 API :func:`loop_agent.run_loop` は共有

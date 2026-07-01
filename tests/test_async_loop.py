@@ -20,6 +20,7 @@ from loop_agent import (
     LoopState,
     MaxIterations,
     NoProgress,
+    ReviewOutcome,
     StepRecord,
     Timeout,
     TokenBudget,
@@ -59,6 +60,39 @@ def adone_after(n: int):
 async def anever_done(_outcome: ActOutcome) -> VerifyOutcome:
     await asyncio.sleep(0)
     return VerifyOutcome(goal_met=False)
+
+
+def test_async_review_runs_before_verify():
+    order = []
+
+    async def act(_ctx):
+        await asyncio.sleep(0)
+        order.append("act")
+        return ActOutcome(observation="artifact")
+
+    async def review(outcome):
+        await asyncio.sleep(0)
+        order.append("review")
+        assert outcome.observation == "artifact"
+        return ReviewOutcome(approved=True, feedback="scope ok")
+
+    async def verify(outcome):
+        await asyncio.sleep(0)
+        order.append("verify")
+        assert outcome.observation == "artifact"
+        return VerifyOutcome(goal_met=True)
+
+    result = asyncio.run(
+        async_run_loop(
+            act=act,
+            review=review,
+            verify=verify,
+            conditions=[MaxIterations(3)],
+        )
+    )
+
+    assert result.status == "goal_met"
+    assert order == ["act", "review", "verify"]
 
 
 # -- basic async drive ------------------------------------------------------
