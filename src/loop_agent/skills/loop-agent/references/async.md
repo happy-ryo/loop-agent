@@ -2,21 +2,21 @@
 
 # async/await support (async_run_loop)
 
-LoopAgent provides two entry points: synchronous `run_loop` and asynchronous `async_run_loop`. The control-flow implementation is unified, and the synchronous API remains fully preserved (Issue #40).
+LoopAgent provides two entry points: the synchronous `run_loop` and the asynchronous `async_run_loop`. The control-flow implementation is unified, and the synchronous API is fully preserved (Issue #40).
 
 ## Relationship between sync and async
 
 | | `run_loop` | `async_run_loop` |
 |---|---|---|
 | Invocation | `run_loop(...)` | `await async_run_loop(...)` |
-| Use case | Run directly from synchronous code | You are already inside an event loop / at least one seam is a coroutine function |
-| Arguments | `act` / `review` / `verify` / `conditions` / `gather=...` / `on_step=...` / `gate=...` / `time_fn=...` / `initial_state=...` / `timeout=...` | Same (completely identical) |
+| Use case | Run directly from synchronous code | You are already inside an event loop / any seam is a coroutine function |
+| Arguments | `act` / `review` / `verify` / `conditions` / `gather=...` / `on_step=...` / `gate=...` / `time_fn=...` / `initial_state=...` / `timeout=...` | Identical (completely identical) |
 | Return value | `LoopResult` | `LoopResult` |
-| Seams | **Synchronous callables only** (passing an async seam raises `AsyncSeamInSyncLoop`) | Accepts both synchronous callables and async callables; mixing is allowed |
+| Seams | **Synchronous callables only** (passing an async seam raises `AsyncSeamInSyncLoop`) | Accepts both synchronous callables and asynchronous callables (acallables); they may be mixed |
 
-`async_run_loop` is the **single source of truth** for the loop body (gather -> act -> review? -> verify -> repeat), and synchronous `run_loop` uses a manual synchronous driver over the shared coroutine. When the loop is composed only of synchronous hooks, the shared coroutine never actually awaits anything (`maybe_await` returns non-awaitable values as-is), and `run_loop` runs it to completion in the caller's own context. Because it does not create an event loop or wrap the execution in an `asyncio.Task`, `contextvars` propagation, hook exception types, and per-call overhead exactly match the behavior before async support was introduced. In other words, **synchronous hooks have no additional cost**.
+`async_run_loop` is the **single source of truth** for the loop body (gather -> act -> review? -> verify -> repeat), while synchronous `run_loop` shares the same implementation as a thin `asyncio.run` wrapper. When composed only of synchronous hooks, the shared coroutine never actually awaits anything (`maybe_await` returns non-awaitable values as-is), and `run_loop` runs it to completion in the caller's own context. Because it does not create an event loop or wrap execution in an `asyncio.Task`, `contextvars` propagation, hook exception types, and per-call overhead are exactly the same as before async support was introduced. In other words, **synchronous hooks have no added cost**.
 
-`run_loop` internally calls `async_run_loop` with `_strict_sync=True`. If any seam (`act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` / `on_complete`) returns an awaitable during that call, `loop_agent.errors.AsyncSeamInSyncLoop` (both a `LoopError` and a `RuntimeError`) is raised immediately and directs the caller to use `await async_run_loop(...)`. The original synchronous `run_loop` did not accept async seams either, so this is not a regression; it is a clear and consistent error.
+`run_loop` internally calls `async_run_loop` with `_strict_sync=True`. If any seam (`act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` / `on_complete`) returns an awaitable during that call, `run_loop` immediately raises `loop_agent.errors.AsyncSeamInSyncLoop` (both a `LoopError` and a `RuntimeError`) and directs the caller to use `await async_run_loop(...)`. The original synchronous `run_loop` did not accept async seams either, so this is not a regression; it is an explicit and consistent error.
 
 ## Basic example: running an async act
 
@@ -32,7 +32,7 @@ from loop_agent import (
 
 
 async def act(ctx):
-    # Example: await asynchronous I/O (HTTP / DB / LLM call) here
+    # Example: await asynchronous I/O (HTTP / DB / LLM calls) here.
     await asyncio.sleep(0)
     return ActOutcome(observation="did something", tokens=1)
 
@@ -55,11 +55,11 @@ async def main():
 asyncio.run(main())
 ```
 
-When you want to run the asynchronous loop exactly once from synchronous code, the canonical usage is to drive `async_run_loop(...)` with `asyncio.run`, as shown in `asyncio.run(main())` above. The test suite also drives coroutines this way without depending on pytest-asyncio.
+If you want to run the asynchronous loop once from synchronous code, the canonical approach is to drive `async_run_loop(...)` with `asyncio.run`, as shown by `asyncio.run(main())` above. The test suite also drives coroutines this way without depending on pytest-asyncio.
 
 ## Mixing synchronous and asynchronous seams
 
-Each of `gather` / `act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` (and the gate's `on_complete`) may be **either a plain synchronous callable or an async callable that returns an awaitable**. The driver awaits each result through `loop_agent._async.maybe_await`, so the two styles can be mixed freely (for example, async `gather` + synchronous `act` + async `verify`). Synchronous hooks return non-awaitable values, so they are used as-is without adding any await overhead.
+`gather` / `act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` (and the gate's `on_complete`) may be **plain synchronous callables or async callables that return awaitables**. The driver awaits each result through `loop_agent._async.maybe_await`, so both forms can be mixed freely (for example: async `gather` + synchronous `act` + async `verify`). Synchronous hooks do not return awaitables, so they add no await overhead and are used as-is.
 
 ```python
 def gather(state):              # synchronous
@@ -71,38 +71,38 @@ async def act(ctx):             # asynchronous
 
 result = await async_run_loop(
     act=act,
-    verify=verify,              # may be either synchronous or asynchronous
+    verify=verify,              # may be synchronous or asynchronous
     conditions=[MaxIterations(5)],
     gather=gather,
 )
 ```
 
-For details about each seam's type and contract, see [seams.md](seams.md).
+See [seams.md](seams.md) for details on each seam's types and contracts.
 
-## Concurrent execution of multiple loops (asyncio.gather)
+## Running multiple loops concurrently (asyncio.gather)
 
-`async_run_loop` itself does not perform concurrent processing internally. To keep the gather -> gate -> act -> review? -> verify order and the timing of stop-condition evaluation exactly aligned with the synchronous loop, it awaits each seam **sequentially**. If you want to run multiple independent loops concurrently, schedule them as tasks from the caller.
+`async_run_loop` itself does not perform internal concurrency. To keep the ordering of gather -> gate -> act -> review? -> verify and the timing of stop-condition evaluation exactly aligned with the synchronous loop, each seam is awaited **sequentially**. If you want to run multiple independent loops concurrently, schedule them as tasks from the caller.
 
 ```python
 results = await asyncio.gather(
     async_run_loop(act=act_a, verify=verify_a, conditions=[MaxIterations(10)]),
     async_run_loop(act=act_b, verify=verify_b, conditions=[MaxIterations(10)]),
 )
-# Or run them individually with asyncio.create_task(async_run_loop(...))
+# Or run them individually with asyncio.create_task(async_run_loop(...)).
 ```
 
-Each call owns its own `LoopState`, so concurrent runs do not interfere with each other.
+Each call owns its own `LoopState`, so concurrent runs do not interfere with one another.
 
-Note: `time_fn` remains a **synchronous** monotonic clock; it is only read and is not awaited. If a synchronous `act` blocks, it blocks the entire event loop. When sharing the loop with other tasks, wrap truly blocking work in an async hook plus `loop.run_in_executor`.
+Note: `time_fn` remains a **synchronous** monotonic clock; it is only read and is never awaited. If a synchronous `act` blocks, it blocks the entire event loop. When sharing the loop with other tasks, wrap truly blocking work in an async hook plus `loop.run_in_executor`.
 
 ## Per-call timeout and async seams
 
-The **per-call** timeout for `act` / `review` / `verify` is specified by passing a `TimeoutPolicy` (or a bare number of seconds) to `timeout=` on `run_loop` / `async_run_loop` (Issue #42). The mechanism used for actual interruption differs depending on whether the seam is synchronous or asynchronous.
+The **per-call** timeout for `act` / `review` / `verify` is configured by passing a `TimeoutPolicy` (or a bare number of seconds) to `timeout=` on `run_loop` / `async_run_loop` (Issue #42). The interruption mechanism differs depending on whether the seam is synchronous or asynchronous.
 
-- **async seams**: per-call timeout is implemented by cancelling the asyncio task (kill mode).
-- **sync seams**: actual interruption uses `SIGALRM` on the POSIX main thread (in environments without `SIGALRM`, graceful=post-hoc and kill=`UnsupportedTimeoutKill`).
+- **Async seams**: per-call timeout is implemented by asyncio task cancellation (kill mode).
+- **Sync seams**: hard interruption uses `SIGALRM` on the POSIX main thread. In environments without `SIGALRM`, graceful mode is post-hoc and kill mode raises `UnsupportedTimeoutKill`.
 
-`on_timeout="graceful"` (the default) gives up, records a synthetic step, and proceeds to the next iteration; `"kill"` raises `SeamTimeout`. This is separate from the whole-run `Timeout` stop condition. For details, see [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md).
+`on_timeout="graceful"` (the default) gives up, records a synthetic step, and proceeds to the next iteration. `"kill"` raises `SeamTimeout`. This is separate from the whole-run `Timeout` stop condition. See [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md) for details.
 
 ## Related
 
