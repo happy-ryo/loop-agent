@@ -1,20 +1,20 @@
-# Recipe: 挙動不変リファクタ（動線 E）
+# Recipe: Behavior-Preserving Refactoring (Path E)
 
-N 個のモジュールを「挙動を変えずに」整理する（重複削除・命名統一・分割等）ループです。難所は **verify を「挙動が変わっていない」で sharp に書く**こと。
+This loop organizes N modules without changing their behavior, such as removing duplication, standardizing names, or splitting modules. The hard part is to define **`verify` precisely around the invariant that behavior has not changed.**
 
-## prose intent（Claude Code にそのまま渡す）
+## Prose Intent (Pass Directly to Claude Code)
 
-> このリポジトリには loop-agent（薄いループエンジン。`act` に `ClaudeCodeAct` が使える）が入っている。
-> **`src/foo/` の各モジュールを挙動不変でリファクタするループを組んで走らせて。**
-> - gather: 対象モジュールを 1 件ずつ（試行回数最小から = 公平 scheduling）。
-> - act: `ClaudeCodeAct(model="sonnet", allowed_tools=["Read","Edit"])` で 1 モジュールを整理。
-> - verify: **既存テスト全 pass**（公開挙動の ground truth）+ public シグネチャ不変。
-> - conditions: `MaxIterations(15)` と `TokenBudget`(大きめ)。
-> - 不可逆操作: act には commit / push をさせない（編集のみ）。commit は収束後に人間が確認して行う。
+> This repository contains loop-agent, a thin loop engine whose `act` can use `ClaudeCodeAct`.
+> **Build and run a loop that refactors each module under `src/foo/` without changing behavior.**
+> - gather: Take target modules one at a time, starting with the fewest attempts for fair scheduling.
+> - act: Organize one module with `ClaudeCodeAct(model="sonnet", allowed_tools=["Read","Edit"])`.
+> - verify: **All existing tests pass** as the ground truth for public behavior, and public signatures remain unchanged.
+> - conditions: `MaxIterations(15)` and a large `TokenBudget`.
+> - Irreversible operations: Do not let `act` commit or push; it should only edit. A human reviews and commits after convergence.
 
-## verify の ground truth: 「挙動が変わっていない」をどう機械判定するか
+## Ground Truth for Verify: How to Machine-Check That "Behavior Has Not Changed"
 
-リファクタの verify は **既存テストスイートが contract**。リファクタ前に green だったテストがリファクタ後も全 green なら、テストがカバーする挙動は保存されています。カバレッジが薄いモジュールは、**リファクタ前に特性化テスト（characterization test）を足す**のが規律です（テストを先に書く → リファクタ → 全 pass）。
+For refactoring, **the existing test suite is the contract** for verify. If tests that were green before the refactor are still all green afterward, then the behavior covered by those tests has been preserved. For modules with thin coverage, the discipline is to **add characterization tests before refactoring**: write tests first, refactor, then get everything passing.
 
 ```python
 import subprocess, ast
@@ -26,22 +26,22 @@ def public_signatures(path):
 
 def verify(outcome):
     m = current["module"]
-    # 1. public シグネチャ不変（外形の contract）
+    # 1. Public signatures are unchanged (the external contract)
     if public_signatures(m) != baseline_sigs[m]:
         return VerifyOutcome(goal_met=False, detail=f"{m}: public signature changed")
-    # 2. 既存テスト全 pass（挙動の ground truth）
+    # 2. All existing tests pass (the ground truth for behavior)
     if subprocess.run(["pytest", "-q"]).returncode != 0:
         return VerifyOutcome(goal_met=False, detail=f"{m}: suite red")
     done.add(m)
     return VerifyOutcome(goal_met=len(done) == len(MODULES), detail=f"{m}: refactored")
 ```
 
-より厳密にやるなら、翻訳 recipe と同じ「文字列定数を潰した `ast.dump` 比較」で *純粋に内部構造だけ* が変わったことまで検証できますが、リファクタは構造を変えるのが目的なので、通常は **テスト contract + public シグネチャ**で十分です。
+If you want to be stricter, you can use the same approach as the translation recipe: compare `ast.dump` output after normalizing string constants to verify that *only internal structure* changed. However, refactoring is meant to change structure, so **the test contract plus public signatures** is usually enough.
 
-## 要点
+## Key Points
 
-- **テストが contract**。verify を「既存テスト全 pass」に置く以上、テストの網羅度がそのまま安全度。薄い箇所は characterization test を先に足してから回す。
-- **public シグネチャの不変チェック**を verify に足すと、「テストが見ていない外形の破壊」を安価に検出できます。
-- **スコープを 1 モジュール / 1 反復に絞る**。act に「このモジュールだけ整理して」と渡し、verify は全 suite を回す（局所変更が全体を壊していないか）。
-- **Reflexion が効く可能性が高いタスク**: リファクタの失敗は *systematic* になりがち（例: 「この import 順序を毎回壊す」「同じ抽象化ミスを繰り返す」）。同じ誤りが反復するなら lesson が次モジュールに効くので、translation/flaky より Reflexion 向き。判断は [reflexion-when-to-use.md](../reflexion-when-to-use.md)。
-- **commit / push はループ外に隔離する**。編集自体は git で戻せるので、ループは編集だけ。不可逆な commit / push は収束後に人間が行う。`HumanGate` は `gather` が返すループの離散 action を審査するもので、`act` の subprocess が内部で打つ `git commit` は見えない（commit をゲートしたいなら commit をループの離散 action にする — [docs/safety.md の限定人間ゲート節](../safety.md)）。
+- **Tests are the contract**. Once verify is defined as "all existing tests pass," test coverage directly determines safety. Add characterization tests first for thinly covered areas, then run the loop.
+- **Add a public signature invariant check** to verify. This cheaply detects breakage in the external shape that the tests do not cover.
+- **Keep the scope to one module per iteration**. Tell `act` to organize only this module, and have verify run the full suite to check whether a local change broke the whole system.
+- **A task where Reflexion is likely to help**: Refactoring failures tend to be *systematic*, for example, repeatedly breaking the same import order or making the same abstraction mistake. If the same error recurs, a lesson can help the next module, so this is a better fit for Reflexion than translation or flaky tasks. Use [reflexion-when-to-use.md](../reflexion-when-to-use.md) to decide.
+- **Keep commit / push outside the loop**. Edits can be reverted with git, so the loop should only edit. Irreversible commit / push operations should be done by a human after convergence. `HumanGate` reviews the loop's discrete actions returned by `gather`; it cannot see a `git commit` that an `act` subprocess runs internally. If you want to gate commits, make commit a discrete loop action; see the limited human gate section in [docs/safety.md](../safety.md).

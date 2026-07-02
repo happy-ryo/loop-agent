@@ -1,11 +1,12 @@
-"""OTel GenAI span 連携のテスト（report.md S4.5）。
+"""Tests for OTel GenAI span integration (report.md S4.5).
 
-2 つの面を押さえる:
-- **active path**: opentelemetry-sdk が入っていれば、run 全体が 1 本の span になり
-  gen_ai.* + 反復番号 + 終了理由が属性に載り、各反復が span event に刻まれること。
-  in-memory exporter で span を実検査する（未導入なら skip）。
-- **degrade path**: OTel 無効/未導入時に LoopSpan が no-op になり、観測の sink 側は
-  そのまま機能すること。otel=False で degrade を常に検証できる。
+Cover two aspects:
+- **active path**: when opentelemetry-sdk is installed, the whole run becomes one span;
+  gen_ai.* attributes, the iteration count, and the termination reason are recorded as
+  attributes; and each iteration is recorded as a span event. Inspect the span with an
+  in-memory exporter (skip if unavailable).
+- **degrade path**: when OTel is disabled or unavailable, LoopSpan becomes a no-op and
+  the observer sink side still works. otel=False always verifies degradation.
 """
 
 from __future__ import annotations
@@ -35,20 +36,20 @@ from loop_agent.otel import (
 from conftest import ManualClock, acting, done_after, never_done, stepping_for
 
 
-# -- degrade path（OTel 不在/無効でも壊れない）-----------------------------
+# -- degrade path (does not break when OTel is absent or disabled) ----------
 
 
 def test_loop_span_noop_when_disabled():
     span = LoopSpan(enabled=False)
     span.start()
     assert span.recording is False
-    # no-op でも全メソッドが例外なく呼べる。
+    # All methods remain callable without raising, even as no-ops.
     span.add_step(iteration=0, tokens=0, tokens_used=0, elapsed=0.0, goal_met=False)
     span.end(status="stopped", reason="x", iterations=0, tokens_used=0, elapsed=0.0)
 
 
 def test_loop_span_degrades_when_otel_unavailable(monkeypatch):
-    # OTel 未導入を擬似再現: _OTEL_AVAILABLE=False なら、tracer を渡しても no-op。
+    # Simulate OTel being unavailable: with _OTEL_AVAILABLE=False, even a tracer is a no-op.
     import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", False)
@@ -74,7 +75,7 @@ def test_observed_loop_runs_with_otel_disabled():
     assert [e.kind for e in sink.events][-1] == "loop_end"
 
 
-# -- active path（in-memory exporter で span を実検査）----------------------
+# -- active path (inspect spans with an in-memory exporter) -----------------
 
 otel_sdk = pytest.importorskip("opentelemetry.sdk.trace")
 from opentelemetry.sdk.trace import TracerProvider  # noqa: E402
@@ -170,7 +171,7 @@ def test_termination_reasons_land_on_span(otel_tracer, make_run, expected_stop, 
     attrs = dict(exporter.get_finished_spans()[0].attributes)
     assert attrs[ATTR_STATUS] == expected_status
     if expected_stop is None:
-        assert ATTR_STOP not in attrs  # goal_met では stop 属性は付かない
+        assert ATTR_STOP not in attrs  # goal_met does not set the stop attribute
     else:
         assert attrs[ATTR_STOP] == expected_stop
 
@@ -208,13 +209,14 @@ def test_exception_marks_span_error(otel_tracer):
     span = exporter.get_finished_spans()[0]
     assert span.status.status_code == StatusCode.ERROR
     assert dict(span.attributes)[ATTR_STATUS] == "error"
-    # 例外が span に記録される。
+    # The exception is recorded on the span.
     assert any(e.name == "exception" for e in span.events)
 
 
 def test_misbehaving_tracer_does_not_crash_the_loop(monkeypatch):
-    # 観測層はループを殺さない: tracer/span が例外を投げても best-effort で握り、
-    # 警告を出しつつループは完走し、event sink は正常に終了まで残る。
+    # The observation layer does not kill the loop: even if the tracer/span raises,
+    # it handles the error best-effort, emits a warning, lets the loop finish, and
+    # keeps the event sink intact through normal completion.
     import loop_agent.otel as otel_mod
     import warnings
 
@@ -255,7 +257,7 @@ def test_misbehaving_tracer_does_not_crash_the_loop(monkeypatch):
             sinks=[sink],
             tracer=FlakyTracer(),
         )
-    # ループは完走し、結果も event も無事。span は閉じられている。
+    # The loop completes, the result and events are intact, and the span is closed.
     assert result.status == "stopped"
     assert [e.kind for e in sink.events][-1] == "loop_end"
     assert span.ended is True
@@ -263,7 +265,7 @@ def test_misbehaving_tracer_does_not_crash_the_loop(monkeypatch):
 
 
 def test_start_failure_degrades_to_noop(monkeypatch):
-    # start_span 自体が落ちても以後 no-op に倒れ、ループは完走する。
+    # Even if start_span itself fails, subsequent operations degrade to no-ops and the loop completes.
     import loop_agent.otel as otel_mod
 
     monkeypatch.setattr(otel_mod, "_OTEL_AVAILABLE", True)
@@ -283,7 +285,7 @@ def test_start_failure_degrades_to_noop(monkeypatch):
 
 
 def test_default_tracer_used_when_none_supplied():
-    # tracer=None でも OTel 既定 tracer で壊れず回ること（global provider 未設定でも安全）。
+    # With tracer=None, the default OTel tracer still runs safely, even without a global provider.
     sink = ListSink()
     result = run_observed_loop(
         act=acting(tokens=0),

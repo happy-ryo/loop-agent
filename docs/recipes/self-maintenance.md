@@ -1,16 +1,16 @@
 # Self-Maintenance
 
-loop-agent 自身の小さな整合性修正を、loop-agent で検証しながら進める recipe。目的は「AI に全部任せる」ことではなく、**編集対象を絞り、verify を機械判定にし、run artifact を残す**こと。
+This recipe explains how to make small consistency fixes to loop-agent itself and then verify those fixes with loop-agent. The goal is not to "leave everything to AI"; it is to **narrow the edit target, make `verify` machine-checkable, and record a run artifact**.
 
 ## Prose Intent
 
-coding agent に渡す意図の例:
+Example instruction for a coding agent:
 
-> loop-agent を使って loop-agent 自身のドキュメント整合性を直す。対象は README / docs / module docstring のみ。古い PoC/MVP/Beta 表現を 1.0.0 Stable の実態に合わせる。コード挙動は変えない。verify は、対象ファイルの文字列スキャン、docs link の存在確認、`python -m pytest` で行う。編集は小さく、run artifact は `loop-state.db` に残す。
+> Use loop-agent to fix documentation consistency in loop-agent itself. Limit changes to the README, docs, and module docstrings. Align outdated PoC/MVP/Beta wording with the current 1.0.0 Stable state. Do not change code behavior. Verify by scanning target files for strings, checking that documentation links exist, and running `python -m pytest`. Keep edits small, and leave the run artifact in `loop-state.db`.
 
 ## Harness Shape
 
-LLM credentials が無い環境では、`act` を deterministic なローカル関数にして「検証ループ」として使う。編集は人間または coding agent が行い、loop-agent は bounded verify / audit trail を担当する。
+When LLM credentials are unavailable, define `act` as a deterministic local function and run it through the verification loop. A human or coding agent makes the edits; loop-agent provides bounded verification and an audit trail.
 
 ```python
 from pathlib import Path
@@ -35,7 +35,7 @@ def verify(outcome):
     stale = []
     for path in TARGETS:
         text = path.read_text(encoding="utf-8")
-        if "PoC loop core" in text or "ループコア（PoC）" in text:
+        if "PoC loop core" in text or "loop core (PoC)" in text:
             stale.append(str(path))
     return VerifyOutcome(goal_met=not stale, detail=f"stale={stale}")
 
@@ -65,14 +65,14 @@ db.record_result(result)
 
 ## Ground Truth
 
-Use checks that fail for the exact regression you care about:
+Use checks that fail on the exact regressions you want to prevent:
 
-- Stale wording: `rg "PoC loop core|ループコア（PoC）" README.md docs src/loop_agent`
+- Stale wording: `rg "PoC loop core|loop core \(PoC\)" README.md docs src/loop_agent`
 - Navigation: every new docs page is linked from README or a recipes index
 - Behavior preservation: `python -m pytest`
 - Packaging: `python scripts/verify_wheel_skill_bundle.py dist/*.whl` after building a wheel
 
-The key rule is that `verify` owns success. `act` can be a coding agent, a deterministic function, or a no-op audit step, but it does not get to mark the task done by assertion.
+The key rule is that `verify` determines success. `act` can be a coding agent, a deterministic function, or a no-op audit step, but it cannot declare the task complete by assertion alone.
 
 ## Audit
 

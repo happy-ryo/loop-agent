@@ -1,164 +1,187 @@
 > This file is a load-on-demand bundled copy of `docs/transport.md`. The canonical source is `docs/transport.md` in the repository.
 
-# wake 配送 transport と work-discovery
+# Wake Transport and Work Discovery
 
-ループの **完了 / 次反復 / 判断要求** の wake を別ループや窓口へ届ける配送層（transport）と、
-完了したループが「次に何を反復するか」を決める入力選定層（work-discovery）の解説。
-どちらも stdlib のみ・依存ゼロで実装されている。
+This document explains the transport layer that delivers loop **completion / next-iteration /
+decision-request** wakes to other loops or intake points, and the work-discovery layer that selects
+the input a completed loop should iterate on next. Both are implemented with the stdlib only and
+zero dependencies.
 
-## wake 配送 transport（push 一次 / pull fallback / at-most-once）
+## Wake Transport (Push-First / Pull Fallback / At-Most-Once)
 
-Phase 3（report.md §3.3 / §4.6 / §5 Phase3 / Issue #23）では、ループの **完了 / 次反復 /
-判断要求** の wake を別ループや窓口（受信側）へ届ける配送層を新設する。claude-org runtime の
-broker sidecar は runtime 所属で直接再利用できないため、**パターンだけ抽出**して loop-agent 側に
-**依存ゼロ（stdlib のみ）**で実装した。
+Phase 3 (report.md §3.3 / §4.6 / §5 Phase3 / Issue #23) adds a transport layer that delivers loop
+**completion / next-iteration / decision-request** wakes to other loops or intake points
+(recipients). Because the claude-org runtime broker sidecar belongs to the runtime and cannot be
+reused directly, loop-agent extracts only the **pattern** and implements it with **zero
+dependencies (stdlib only)**.
 
-- **push 一次 / pull fallback**: push（即応 accelerator）が通れば即配送、通らなくても wake は
-  queue に残り受信側の**能動 poll（pull）で配送が継続**する。push は accelerator、pull poll が
-  正準配送路。→ **backend 不通でも配送は途切れない**（§5 Phase3 成功条件 b）。
-- **三状態 claim-then-confirm による at-most-once**: `UNDELIVERED → CLAIMED(lease, owner)
-  → DELIVERED`。claim で lease 占有して返し、受信側が処理し切ってから confirm で確定する。
-  confirm 前に lease 失効した行は再 eligible に戻る（受信側 crash でも配送継続 = at-least-once 側に
-  倒す。idle-wake では喪失 > 重複）。owner 一致 + lease 失効チェックの fencing が「届いていないのに
-  DELIVERED」喪失窓を塞ぐ（並行 poll は worker ごとに distinct な owner を渡す前提）。確定済みは
-  二度と再配達しない。in-memory queue は RLock でスレッド安全（並行 poll の二重 claim を防ぐ）。
-- **wake id で de-dup**: wake は決定的 id（`{run_id}:{kind}:{iteration}`）を持ち、二重 enqueue は
-  no-op。resume での再配送指示や push/pull の継ぎ目の二重配送を受信側が id で de-dup できる
-  （受信側は idempotent handler 前提）。
-- **role 別 cadence**: push が失効する pull 環境では「待機」を idle 待機ではなく**能動 poll** に
-  翻訳する。受信契機を役割別に非対称設計する（dispatcher 180s / worker 60s / secretary 0 =
-  ターン冒頭で毎回 poll）。`cadence_for(role)` / `due_to_poll(role, last_poll, now)`。
+- **Push-first / pull fallback**: if push (the low-latency accelerator) succeeds, the wake is
+  delivered immediately. Even if it does not, the wake remains in the queue and delivery continues
+  through the recipient's **active polling (pull)**. Push is the accelerator; pull polling is the
+  canonical delivery path. Therefore, **delivery does not stop even when the backend is down**
+  (§5 Phase3 success condition b).
+- **At-most-once through three-state claim-then-confirm**: `UNDELIVERED → CLAIMED(lease, owner)
+  → DELIVERED`. Claim reserves the lease and returns the wake; the recipient confirms only after
+  finishing processing. Rows whose lease expires before confirm become eligible again (delivery
+  continues even if the recipient crashes = bias toward at-least-once. For idle wakes, loss is worse
+  than duplication). Fencing by owner match + lease-expiration check closes the loss window where a
+  wake could become `DELIVERED` without having been received (parallel poll assumes each worker
+  passes a distinct owner). Confirmed wakes are never redelivered. The in-memory queue is
+  thread-safe via `RLock` (preventing double claims under parallel polling).
+- **De-dup by wake id**: wakes have deterministic ids (`{run_id}:{kind}:{iteration}`), and duplicate
+  enqueue is a no-op. Recipients can de-dup by id when resume requests redelivery or when push and
+  pull meet at a delivery boundary (recipients are assumed to use idempotent handlers).
+- **Role-specific cadence**: in pull environments where push expires, "waiting" is translated into
+  **active polling** rather than idle waiting. Receive triggers are designed asymmetrically by role
+  (dispatcher 180s / worker 60s / secretary 0 = poll at the start of every turn).
+  `cadence_for(role)` / `due_to_poll(role, last_poll, now)`.
 
 ```python
 from loop_agent import (
     Transport, InMemoryWakeQueue, NullPushBackend, LoopWaker, run_loop, MaxIterations,
 )
 
-# backend 不通（push 一次なし）でも pull fallback で配送が継続する構成。
+# A configuration where delivery continues through pull fallback even when the backend is down
+# (no push-first path).
 transport = Transport(InMemoryWakeQueue(), NullPushBackend())
 waker = LoopWaker(transport, run_id="r1", recipient="coordinator", next_recipient="planner")
 
 result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)])
-waker.record_result(result)          # 完了 wake（+ 次反復 wake）を配送 → push 失敗で queue 滞留
+waker.record_result(result)          # Deliver completion wake (+ next-iteration wake) -> push failure leaves it queued
 
-# 受信側は役割 cadence で能動 poll。push が落ちていても届く。poll_and_handle は
-# handler が成功した wake だけ confirm する crash-safe な受信ループ（処理前に死んだら
-# lease 失効で再配送 = at-least-once。受信側は wake.id で de-dup する idempotent handler）。
+# The recipient actively polls according to its role cadence. Wakes still arrive even if push is down.
+# poll_and_handle is a crash-safe receive loop that confirms only wakes whose handler succeeded
+# (if it dies before processing, lease expiration causes redelivery = at-least-once. The recipient
+# de-dups by wake.id with an idempotent handler).
 transport.poll_and_handle("coordinator", lambda wake: handle(wake))
 ```
 
-`PushBackend` は `push(wake) -> bool` の best-effort 契約（確定配送のみ `True`、不通・例外は
-`False` 扱いで pull fallback に委ねる）。実 backend（renga / broker CLI 等）はこの Protocol を
-実装して注入する。`CallablePushBackend(fn)` は任意関数を、`NullPushBackend` は「常に push 失敗
-（= backend 不通）」を表す。
+`PushBackend` has a best-effort `push(wake) -> bool` contract (`True` only for confirmed delivery;
+outages and exceptions are treated as `False` and left to pull fallback). Real backends (renga /
+broker CLI, etc.) implement this Protocol and are injected. `CallablePushBackend(fn)` lifts an
+arbitrary function, and `NullPushBackend` represents "push always fails (= backend down)".
 
-受信は **claim-then-confirm** が既定: `poll(recipient)` は wake を claim するだけで確定しない
-（処理し切ってから `confirm_wakes(wakes, owner=…)`）。処理前にクラッシュした wake は lease 失効で
-再配送される（idle-wake では**喪失より重複**を選ぶ設計）。確定漏れを避けたい一般ケースは
-`poll_and_handle(recipient, handler)` が handler 成功後に wake 単位で confirm するので推奨。
-プロセス内自己完結で handler が決して失敗しない単純ケースのみ `poll(recipient, confirm=True)`
-で即確定できる（その経路は poll 後のクラッシュで喪失しうる at-most-once）。
+Receiving uses **claim-then-confirm** by default: `poll(recipient)` only claims wakes and does not
+confirm them (call `confirm_wakes(wakes, owner=...)` after processing has fully completed). Wakes
+claimed by a recipient whose process crashes after polling but before processing or confirming are
+redelivered after lease expiration (for idle wakes, the design chooses **duplication over loss**).
+For the general case where missed confirmations should be avoided, `poll_and_handle(recipient,
+handler)` is recommended because it confirms each wake after the handler succeeds. Only simple
+process-local cases where the handler never fails should use `poll(recipient, confirm=True)` for
+immediate confirmation (that path is at-most-once and can lose wakes if the process crashes after
+polling).
 
-## backend 拡張点（WakeQueue / PushBackend Protocol）
+## Backend Extension Points (WakeQueue / PushBackend Protocol)
 
-`WakeQueue`（配送の正本）は 3 種同梱しており、`open_wake_queue(backend, **opts)` で名前指定で
-生成できる（Public API を変えずに backend を選べる。in-memory が既定、明示で SQLite / Redis）:
+Three `WakeQueue` implementations (the source of truth for delivery) are included and can be
+constructed by name with `open_wake_queue(backend, **opts)` (backend selection without changing the
+Public API; in-memory is the default, SQLite / Redis are explicit):
 
-- **`InMemoryWakeQueue`**（`"memory"`・既定）— RLock でスレッド安全な in-process 実装。単一
-  プロセス内の配送に。
-- **`SqliteWakeQueue`**（`"sqlite"`・`path` / `table` 等を `opts` で）— プロセス再起動をまたいで
-  wake を残す**永続キュー**。cross-process 構成では TTL ロックに依存せず（`BEGIN IMMEDIATE` は
-  操作途中で失効しない）安全。`purge_delivered` で確定済みを掃除できる。
-- **`RedisWakeQueue`**（`"redis"`・`client` か `url` を `opts` で）— 正本を Redis に置き、別ホストの
-  プロセス間でも wake を配送する。optional な `redis` 依存が要る（未導入なら生成時に loud に弾く）。
+- **`InMemoryWakeQueue`** (`"memory"`, default) - an in-process implementation that is thread-safe
+  via `RLock`. For delivery within a single process.
+- **`SqliteWakeQueue`** (`"sqlite"`, with `path` / `table` and other values in `opts`) - a
+  **persistent queue** that keeps wakes across process restarts. In cross-process configurations it
+  is safe without relying on TTL locks (`BEGIN IMMEDIATE` does not expire in the middle of an
+  operation). Confirmed wakes can be cleaned up with `purge_delivered`.
+- **`RedisWakeQueue`** (`"redis"`, with `client` or `url` in `opts`) - stores the source of truth in
+  Redis and delivers wakes between processes on different hosts. It requires the optional `redis`
+  dependency (construction fails loudly if it is not installed).
 
-`PushBackend`（即応 accelerator）は stdlib のみの実装を同梱する:
+`PushBackend` (the low-latency accelerator) includes stdlib-only implementations:
 
-- **`NullPushBackend`** — 「常に push 失敗（= backend 不通）」を表す。pull fallback の挙動を素の
-  まま使いたいときの既定。
-- **`CallablePushBackend(fn)`** — 任意の `push(wake) -> bool` 関数を `PushBackend` に持ち上げる
-  薄いアダプタ。
+- **`NullPushBackend`** - represents "push always fails (= backend down)". This is the default when
+  you want to use the plain pull-fallback behavior.
+- **`CallablePushBackend(fn)`** - a thin adapter that lifts any `push(wake) -> bool` function into a
+  `PushBackend`.
 
 ```python
 from loop_agent import Transport, open_wake_queue, NullPushBackend
 
-queue = open_wake_queue("sqlite", path="wakes.db")   # 永続キュー（再起動をまたぐ）
-transport = Transport(queue, NullPushBackend())       # backend を変えても Public API は不変
+queue = open_wake_queue("sqlite", path="wakes.db")   # Persistent queue (survives restarts)
+transport = Transport(queue, NullPushBackend())       # Public API stays unchanged when backend changes
 ```
 
-同梱を超える backend（外部の窓口・broker / renga CLI へ wake をブリッジする `PushBackend` 等）は
-**Protocol を実装して注入する**のが拡張点である。`WakeQueue` / `PushBackend` の Protocol に適合
-すれば利用者実装を差し込める。配送のセマンティクス（at-most-once / at-least-once の倒し方、
-claim-then-confirm の fencing、wake id de-dup）は Protocol 契約として固定されているので、backend を
-差し替えても受信側の idempotent handler 前提は変わらない。
+Backends beyond the bundled ones (such as a `PushBackend` that bridges wakes to an external intake
+point, broker, or renga CLI) are extended by **implementing the Protocol and injecting it**. Any
+user implementation that conforms to the `WakeQueue` / `PushBackend` Protocol can be plugged in.
+The delivery semantics (how to bias at-most-once / at-least-once, claim-then-confirm fencing, wake
+id de-dup) are fixed as Protocol contracts, so the recipient-side assumption of idempotent handlers
+does not change when the backend is swapped.
 
-## work-discovery（次反復対象の入力選定・propose-only / 人間ゲート維持）
+## Work Discovery (Input Selection for the Next Iteration / Propose-Only / Human Gate Preserved)
 
-Phase 3（report.md §3.5 / §4.6 / §5 Phase 3 成功条件 d）では、完了したループの「次に何を
-反復するか」を決める**入力選定**を、**計算層（read-only・決定的）と配達層（人間ゲート）の
-二層**で実装する。「発見の自律性は上げるが、着手判断は人間に残す」を構造で担保する。
+Phase 3 (report.md §3.5 / §4.6 / §5 Phase 3 success condition d) implements **input selection** for
+deciding what a completed loop should iterate on next as two layers: a **computation layer
+(read-only and deterministic)** and a **delivery layer (human gate)**. The structure guarantees:
+"increase discovery autonomy, but leave the decision to start work with the human."
 
-- **計算層 `triage(candidates, *, done=())`**: 副作用ゼロ・同一入力同一出力の純関数。候補
-  （`Candidate`）を `done`（完了済み id 集合）に対して triage する — **依存解決**（`depends_on`
-  が全て `done` なら *ready*）、**優先度↓ → 工数↑ → id↑** の決定的ランキング、未充足依存の理由
-  付け（既知候補待ち / 未知 id）、**依存循環の検出**。「N 件の候補 + 推奨 1 件」を `Triage` で返す。
-- **配達層 `WorkDiscovery`**: triage 結果を**提案**として state.db の人間ゲートレジスタ
-  （MVP の `pending_decision` を reuse、gate_key は `discovery-<cycle>`）に登録する。**ここで
-  必ず止まる（propose-only）**: 完全自動では一切採択せず、人間が `resolve(...)`（= 限定人間
-  ゲートと同一経路）で採否を決めるまで pending のまま保持する。4 決定の採択写像 — `approve`→
-  推奨を採択 / `edit`→人間が指定した別の *ready* 候補を採択（ready 外は fail loud）/ `reject`→
-  採択なし / `respond`→採択なし + 応答記録。決定は pause→resume をまたいで保持される。
-- **完了→次反復の接続 `discover_next(...)`**: 直前の `LoopResult` が**完了**しているときだけ
-  提案を出す（`paused` なら `None` = まだ何も完了していないので先に人間がゲートを解決すべき）。
-  提案 (pending) を登録するだけで採択も次ループ起動もしない（**完全自動着手しない**）。
+- **Computation layer `triage(candidates, *, done=())`**: a pure function with zero side effects and
+  identical output for identical input. It triages candidates (`Candidate`) against `done` (the set
+  of completed ids): **dependency resolution** (*ready* when every `depends_on` entry is in
+  `done`), deterministic ranking by **priority descending -> effort ascending -> id ascending**,
+  reasons for unsatisfied dependencies (waiting on known candidates / unknown ids), and
+  **dependency-cycle detection**. It returns "N candidates + 1 recommendation" as `Triage`.
+- **Delivery layer `WorkDiscovery`**: registers the triage result as a **proposal** in the human-gate
+  registry in state.db (reusing the MVP `pending_decision`; `gate_key` is `discovery-<cycle>`).
+  **It always stops here (propose-only)**: it never adopts anything fully automatically, and the
+  proposal remains pending until a human decides acceptance or rejection through `resolve(...)`
+  (= the same path as the bounded human gate). The four-decision adoption mapping is:
+  `approve` -> adopt the recommendation / `edit` -> adopt a different *ready* candidate specified
+  by the human (fail loudly if it is not ready) / `reject` -> adopt nothing / `respond` -> adopt
+  nothing + record the response. Decisions are preserved across pause -> resume.
+- **Completion -> next-iteration connection `discover_next(...)`**: emits a proposal only when the
+  previous `LoopResult` is **completed** (`paused` returns `None` = nothing has completed yet, so a
+  human should resolve the gate first). It only registers the proposal (pending); it does not adopt
+  it or start the next loop (**no fully automatic work start**).
 
 ```python
 from loop_agent import discover_next, WorkDiscovery, Candidate, LoopStore, connect
 
 store = LoopStore(connect("state.db"))
 
-# 完了したループ結果 first を受けて次候補を triage → 提案（人間ゲートに pending）
+# Given the completed loop result first, triage the next candidates -> proposal (pending in the human gate)
 prop = discover_next(store=store, run_id="cycle", result=first, cycle=1,
                      candidates=[Candidate(id="t1", priority=9, payload={"goal": "X"}),
-                                 Candidate(id="t2", depends_on=("t1",))])  # t2 は t1 待ちで blocked
-# prop.triage.recommended.id == "t1" / prop.pending["status"] == "pending"（採択ゼロ）
+                                 Candidate(id="t2", depends_on=("t1",))])  # t2 is blocked waiting on t1
+# prop.triage.recommended.id == "t1" / prop.pending["status"] == "pending" (zero adoption)
 
-# 人間が採否を決めるまで次反復は起きない（propose-only）
+# The next iteration does not happen until a human decides whether to adopt it (propose-only)
 wd = WorkDiscovery(store, "cycle")
 adoption = wd.resolve(1, "approve")     # or "edit"(payload=id)/"reject"/"respond"
-# adoption.candidate.payload == {"goal": "X"} → これを次ループの gather 入力にする
+# adoption.candidate.payload == {"goal": "X"} -> use this as gather input for the next loop
 ```
 
-## multi-item を 1 本のループで公平に回す `WorkListGather`
+## `WorkListGather`: Fairly Cycling Multiple Items Through One Loop
 
-**`WorkListGather`**（`loop_agent.discovery.work_list`, Issue #56）: triage が「何を どの順で
-回すか」を決めるのに対し、`WorkListGather` は「採択済みの複数 item を **1 本のループで どう公平に
-回すか**」を担う `gather` フック。素朴な「先頭未完を返す gather」は 1 件が `MaxIterations` を独占して
-他を starve させるが、`WorkListGather` は公平 scheduling（`round_robin` / `fewest_attempts` /
-`fifo` / `priority` / custom）+ per-item 上限 + per-item の done 判定で starve を防ぐ。attempts /
-done / exhausted は毎回 `state.history` から導出する（**resume 安全** = in-process カウンタを持たない）。
+**`WorkListGather`** (`loop_agent.discovery.work_list`, Issue #56): triage decides "what to run and
+in what order"; `WorkListGather` is the `gather` hook responsible for "how to cycle multiple adopted
+items **fairly through one loop**." A naive gather that returns the first unfinished item lets one
+item monopolize `MaxIterations` and starves the rest. `WorkListGather` prevents starvation with
+fair scheduling (`round_robin` / `fewest_attempts` / `fifo` / `priority` / custom) + per-item limits
++ per-item done checks. `attempts` / `done` / `exhausted` are derived from `state.history` every
+time (**resume-safe** = no in-process counters).
 
 ```python
 from loop_agent import WorkListGather, WorkListDrained, run_loop, MaxIterations
 
 gather = WorkListGather(
     ["a.py", "b.py", "c.py"], strategy="fewest_attempts",
-    max_attempts_per_item=3,                                  # 1 件 3 回で打ち止め（exhausted）
-    done_when=lambda item, rec: rec.observation["passed"],    # この item は終わったか
+    max_attempts_per_item=3,                                  # Stop after 3 attempts for one item (exhausted)
+    done_when=lambda item, rec: rec.observation["passed"],    # Whether this item is done
 )
 result = run_loop(act=act, verify=verify, gather=gather,
-                  conditions=[WorkListDrained(gather), MaxIterations(50)])  # 全件 done/exhausted で停止
-gather.report(result.state)   # WorkListProgress(done=…, exhausted=…, remaining=…, attempts=…)
+                  conditions=[WorkListDrained(gather), MaxIterations(50)])  # Stop when all items are done/exhausted
+gather.report(result.state)   # WorkListProgress(done=..., exhausted=..., remaining=..., attempts=...)
 
-# triage に優先度・順序計算を委譲（依存が解けた ready 候補だけを取り込む）
+# Delegate priority and ordering computation to triage (take only ready candidates whose dependencies are satisfied)
 gather = WorkListGather.from_triage([Candidate(id="hi", priority=9), Candidate(id="lo")])
 ```
 
-詳細は [recipes/multi-item-work-list.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/multi-item-work-list.md)。
+Details: [recipes/multi-item-work-list.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/multi-item-work-list.md).
 
-## 関連
+## Related
 
-- [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) — プロジェクト入口と動線サマリ
-- [persistence-and-resume.md](persistence-and-resume.md) — state.db / resume の永続化層
-- [safety.md](safety.md) — 人間ゲート（HumanGate）の射程と安全テンプレ
-- [recipes/multi-item-work-list.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/multi-item-work-list.md) — multi-item ループの実践レシピ
+- [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) - project entry point and flow summary
+- [persistence-and-resume.md](persistence-and-resume.md) - persistence layer for state.db / resume
+- [safety.md](safety.md) - scope of the human gate (`HumanGate`) and safety template
+- [recipes/multi-item-work-list.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/multi-item-work-list.md) - practical recipe for multi-item loops

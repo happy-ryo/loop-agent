@@ -1,12 +1,13 @@
-"""multi-item 公平 scheduling (Issue #56) の検証.
+"""Verify fair multi-item scheduling (Issue #56).
 
-検証の柱:
+Main validation points:
 
-- 各 scheduling 戦略 (round_robin / fewest_attempts / fifo / priority / custom) の選択順。
-- per-item 上限 (exhausted) と done 判定フックの独立性。
-- attempt counter / 進捗の正規 API が state から導出され resume 安全であること。
-- 故意に失敗し続ける item が他 item を starve させないこと (統合テスト)。
-- triage との接続 (from_triage)。
+- Selection order for each scheduling strategy (round_robin / fewest_attempts / fifo /
+  priority / custom).
+- Independence of per-item caps (exhausted) and the done predicate hook.
+- The canonical attempt counter / progress APIs are derived from state and resume-safe.
+- An item that intentionally keeps failing does not starve other items (integration test).
+- Connection to triage (from_triage).
 """
 
 from __future__ import annotations
@@ -32,11 +33,11 @@ from loop_agent.state import LoopState, StepRecord
 from conftest import never_done
 
 
-# -- テスト用ハーネス ---------------------------------------------------------
+# -- Test harness ------------------------------------------------------------
 
 
 def _ctx_id(ctx) -> str:
-    """build_ctx の出力 (既定の JSON dict / WorkItem / 素の id 文字列) から item id を取る。"""
+    """Get the item id from build_ctx output (default JSON dict / WorkItem / bare id string)."""
     if isinstance(ctx, dict):
         return ctx["id"]
     if isinstance(ctx, WorkItem):
@@ -45,11 +46,12 @@ def _ctx_id(ctx) -> str:
 
 
 def scripted_act(dispatched: list[str], completes: dict[str, int]):
-    """dispatch された item id を記録し、``completes`` 回目で done フラグを立てる ``act``。
+    """Record dispatched item ids and set the done flag on the ``completes``-th call.
 
-    ``completes[id] == n`` なら id は **n 回目の dispatch** で完了する。``id`` が ``completes``
-    に無ければ永久に未完。done シグナルは ``observation["done"]`` に焼くので、リプレイ
-    (resume) でも安定 (act の内部カウンタは attribution に使わない)。
+    If ``completes[id] == n``, that id completes on the **n-th dispatch**. If ``id`` is
+    not in ``completes``, it never completes. The done signal is baked into
+    ``observation["done"]``, so replay (resume) stays stable (the internal act counter
+    is not used for attribution).
     """
     counts: dict[str, int] = {}
 
@@ -65,25 +67,25 @@ def scripted_act(dispatched: list[str], completes: dict[str, int]):
 
 
 def done_from_observation(_item: WorkItem, record: StepRecord) -> bool:
-    """``scripted_act`` が焼いた done フラグを読む done 判定フック。
+    """Done predicate hook that reads the done flag baked in by ``scripted_act``.
 
-    gate SKIP 行など ``done`` キーを持たない observation には ``False`` (未完了扱い)。
+    Observations without a ``done`` key, such as gate SKIP rows, return ``False`` (not done).
     """
     obs = record.observation
     return bool(isinstance(obs, dict) and obs.get("done"))
 
 
 def item_of_observation(record: StepRecord):
-    """``scripted_act`` が焼いた実 item id を返す item_of (gate 合成用)。
+    """Return the actual item id baked in by ``scripted_act`` for item_of (gate composition).
 
-    skip 行 (``{"skipped": True}`` で ``item`` 無し) には ``None`` (非実行) を返す。
+    Skip rows (``{"skipped": True}`` with no ``item``) return ``None`` (not executed).
     """
     obs = record.observation
     return obs.get("item") if isinstance(obs, dict) else None
 
 
 def history_of(*ids_done: tuple[str, bool]) -> LoopState:
-    """``(item_id, done)`` の並びから ``LoopState.history`` を組む (導出テスト用)。"""
+    """Build ``LoopState.history`` from a ``(item_id, done)`` sequence (for derivation tests)."""
     state = LoopState()
     for i, (item_id, done) in enumerate(ids_done):
         state.history.append(
@@ -99,7 +101,7 @@ def history_of(*ids_done: tuple[str, bool]) -> LoopState:
 
 
 def drive(gatherer: WorkListGather, completes: dict[str, int], *, max_iters: int = 100):
-    """drained または ``MaxIterations`` まで回し、(dispatch 順, LoopResult) を返す。"""
+    """Run until drained or ``MaxIterations`` and return (dispatch order, LoopResult)."""
     dispatched: list[str] = []
     result = run_loop(
         act=scripted_act(dispatched, completes),
@@ -110,7 +112,7 @@ def drive(gatherer: WorkListGather, completes: dict[str, int], *, max_iters: int
     return dispatched, result
 
 
-# -- WorkItem / 構築バリデーション -------------------------------------------
+# -- WorkItem / construction validation --------------------------------------
 
 
 def test_workitem_rejects_empty_id():
@@ -139,11 +141,11 @@ def test_bad_max_attempts_rejected():
         WorkListGather(["a"], max_attempts_per_item=0)
 
 
-# -- scheduling 戦略の選択順 -------------------------------------------------
+# -- Scheduling strategy selection order --------------------------------------
 
 
 def test_fewest_attempts_interleaves_fairly():
-    # どれも完了しない -> 試行回数最小から選ぶので厳密にラウンドロビンする。
+    # Nothing completes -> selecting the fewest attempts creates strict round-robin.
     g = WorkListGather(["a", "b", "c"], strategy="fewest_attempts")
     dispatched, _ = drive(g, completes={}, max_iters=9)
     assert dispatched == ["a", "b", "c", "a", "b", "c", "a", "b", "c"]
@@ -156,18 +158,19 @@ def test_round_robin_rotates_positionally():
 
 
 def test_round_robin_skips_completed_and_keeps_rotating():
-    # b が 1 回で完了したら、a,b,c,(b done),... 以降 b を飛ばして a<->c を巡回する。
+    # Once b completes on the first attempt, a,b,c,(b done),... skips b and cycles a<->c.
     g = WorkListGather(
         ["a", "b", "c"], strategy="round_robin", done_when=done_from_observation
     )
     dispatched, _ = drive(g, completes={"b": 1}, max_iters=7)
-    # a, b(done), c, a, c, a, c  -- b は完了後二度と出ない。
+    # a, b(done), c, a, c, a, c  -- b never appears again after completion.
     assert dispatched == ["a", "b", "c", "a", "c", "a", "c"]
     assert "b" not in dispatched[2:]
 
 
 def test_fifo_is_naive_head_selection():
-    # fifo は「先頭の未完」を返す素朴戦略。完了しなければ先頭を回し続ける。
+    # fifo is a naive strategy that returns the first unfinished item. If it never
+    # completes, the head item keeps running.
     g = WorkListGather(["a", "b", "c"], strategy="fifo")
     dispatched, _ = drive(g, completes={}, max_iters=4)
     assert dispatched == ["a", "a", "a", "a"]
@@ -176,12 +179,12 @@ def test_fifo_is_naive_head_selection():
 def test_fifo_advances_as_items_complete():
     g = WorkListGather(["a", "b", "c"], strategy="fifo", done_when=done_from_observation)
     dispatched, _ = drive(g, completes={"a": 2, "b": 1, "c": 1}, max_iters=20)
-    # a,a(done),b(done),c(done) -> drained。
+    # a,a(done),b(done),c(done) -> drained.
     assert dispatched == ["a", "a", "b", "c"]
 
 
 def test_priority_is_strict_highest_first():
-    # priority は厳密に優先度降順: 最高優先度の item が done/exhausted になるまで独占する。
+    # priority is strictly descending: the highest-priority item runs until done/exhausted.
     items = [
         WorkItem(id="lo", priority=0),
         WorkItem(id="hi", priority=10),
@@ -193,7 +196,8 @@ def test_priority_is_strict_highest_first():
 
 
 def test_priority_is_fair_within_equal_priority():
-    # 同一優先度内では試行回数で公平 (round-robin)。下位優先度は上位が片付くまで回らない。
+    # Equal priority is fair by attempt count (round-robin). Lower priority waits until
+    # higher-priority items are cleared.
     items = [
         WorkItem(id="z", priority=0),
         WorkItem(id="x", priority=5),
@@ -206,7 +210,7 @@ def test_priority_is_fair_within_equal_priority():
 
 
 def test_custom_callable_strategy():
-    # 常に最後の selectable を選ぶ custom 戦略。
+    # Custom strategy that always selects the last selectable item.
     def pick_last(ctx: ScheduleContext) -> WorkItem:
         return ctx.selectable[-1]
 
@@ -233,13 +237,13 @@ def test_custom_strategy_selecting_unselectable_fails_loud():
         g(LoopState())
 
 
-# -- per-item 上限 (exhausted) -----------------------------------------------
+# -- Per-item cap (exhausted) ------------------------------------------------
 
 
 def test_per_item_cap_exhausts_failing_item():
     g = WorkListGather(["a"], strategy="fifo", max_attempts_per_item=3)
     dispatched, result = drive(g, completes={}, max_iters=50)
-    assert dispatched == ["a", "a", "a"]  # 3 回で打ち止め
+    assert dispatched == ["a", "a", "a"]  # capped after 3 attempts
     rep = g.report(result.state)
     assert rep.exhausted == ("a",)
     assert rep.done == ()
@@ -247,7 +251,7 @@ def test_per_item_cap_exhausts_failing_item():
 
 
 def test_done_beats_cap_on_same_attempt():
-    # cap=1 で 1 回目に done になれば exhausted ではなく done に入る。
+    # With cap=1, completion on the first attempt goes to done, not exhausted.
     g = WorkListGather(["a"], max_attempts_per_item=1, done_when=done_from_observation)
     _, result = drive(g, completes={"a": 1}, max_iters=10)
     rep = g.report(result.state)
@@ -255,42 +259,43 @@ def test_done_beats_cap_on_same_attempt():
     assert rep.exhausted == ()
 
 
-# -- done 判定フック ---------------------------------------------------------
+# -- Done predicate hook -----------------------------------------------------
 
 
 def test_done_when_is_independent_of_verify():
-    # verify は常に goal 未達 (ループ全体は never_done) でも、done_when で個々の item を
-    # 完了扱いにできる。
+    # Even if verify never reaches the goal (the whole loop is never_done), done_when can
+    # mark individual items complete.
     g = WorkListGather(["a", "b"], done_when=done_from_observation)
     _, result = drive(g, completes={"a": 1, "b": 1}, max_iters=20)
-    assert result.status == "stopped"  # WorkListDrained で停止 (goal_met ではない)
+    assert result.status == "stopped"  # stopped by WorkListDrained (not goal_met)
     assert g.done_items(result.state) == {"a", "b"}
 
 
 def test_default_done_uses_goal_met():
-    # done_when を省略すると record.goal_met を done シグナルとして見る。
+    # When done_when is omitted, record.goal_met is used as the done signal.
     g = WorkListGather(["a", "b"])
     dispatched: list[str] = []
     result = run_loop(
         act=scripted_act(dispatched, {}),
-        verify=lambda _o: VerifyOutcome(goal_met=True),  # 最初の step で goal 到達
+        verify=lambda _o: VerifyOutcome(goal_met=True),  # goal reached on the first step
         gather=g,
         conditions=[WorkListDrained(g), MaxIterations(20)],
     )
-    # goal_met はループ全体も終わらせる。最初に回した a が done 扱いになる。
+    # goal_met also ends the whole loop. The first dispatched item, a, is treated as done.
     assert dispatched == ["a"]
     assert g.done_items(result.state) == {"a"}
 
 
-# -- attempt counter / 進捗 API + resume 安全 --------------------------------
+# -- Attempt counter / progress API + resume safety --------------------------
 
 
 def test_attempts_and_report_derive_from_history():
     g = WorkListGather(
         ["a", "b", "c"], strategy="fewest_attempts", done_when=done_from_observation
     )
-    # 導出は observation の item ではなく **戦略のリプレイ** で帰属する。fewest_attempts の
-    # 並びは a,b,c,a,b なので、b の 2 回目 (5 step 目) を done にする履歴を組む。
+    # Derivation attributes via **strategy replay**, not the observation item. The
+    # fewest_attempts order is a,b,c,a,b, so build history where b's second attempt
+    # (5th step) is done.
     state = history_of(
         ("a", False), ("b", False), ("c", False), ("a", False), ("b", True)
     )
@@ -303,13 +308,14 @@ def test_attempts_and_report_derive_from_history():
 
 
 def test_derivation_is_resume_safe_across_fresh_instances():
-    # 別プロセス相当: 同じ items 設定の *新しい* gatherer が同じ state で同じ導出を返す。
+    # Equivalent to another process: a *new* gatherer with the same item configuration
+    # returns the same derivation for the same state.
     state = history_of(("a", False), ("b", True), ("c", False))
     g1 = WorkListGather(["a", "b", "c"], done_when=done_from_observation)
     g2 = WorkListGather(["a", "b", "c"], done_when=done_from_observation)
     assert g1.attempts(state) == g2.attempts(state)
     assert g1.done_items(state) == g2.done_items(state) == {"b"}
-    # 次に dispatch する item も一致 (in-process カウンタに依存しない)。
+    # The next item to dispatch also matches (does not depend on an in-process counter).
     assert g1(state)["id"] == g2(state)["id"]
 
 
@@ -337,29 +343,29 @@ def test_build_ctx_receives_attempt_count():
 
     g = WorkListGather(["a"], max_attempts_per_item=3, build_ctx=build_ctx)
     drive(g, completes={}, max_iters=10)
-    # attempt は dispatch 前の既試行回数 (0,1,2)。
+    # attempt is the existing attempt count before dispatch (0,1,2).
     assert seen == [("a", 0), ("a", 1), ("a", 2)]
 
 
-# -- WorkListDrained 停止条件 ------------------------------------------------
+# -- WorkListDrained stop condition ------------------------------------------
 
 
 def test_work_list_drained_stops_before_gather_runs():
-    # drained 後に gather が呼ばれて DRAINED が act に渡る、ということが起きない。
+    # After drained, gather is not called and DRAINED is not passed to act.
     g = WorkListGather(["a", "b"], done_when=done_from_observation)
     dispatched, result = drive(g, completes={"a": 1, "b": 1}, max_iters=50)
     assert result.stop is not None
     assert result.stop.name == "work_list_drained"
-    # act は実在 item にだけ呼ばれた (DRAINED が混じらない)。
+    # act was only called with real items (DRAINED is not mixed in).
     assert set(dispatched) <= {"a", "b"}
 
 
-# -- 統合: starve しないこと -------------------------------------------------
+# -- Integration: no starvation ----------------------------------------------
 
 
 def test_failing_item_does_not_starve_others_integration():
-    # "a" は永久に失敗、"b"/"c" は 1 回で完了。公平戦略 + per-item 上限なら b/c は
-    # ちゃんと順番が回ってきて完了し、a だけが cap で打ち止めになる。
+    # "a" fails forever; "b"/"c" complete in one attempt. With a fair strategy plus
+    # per-item cap, b/c get their turns and complete, while only a is capped.
     g = WorkListGather(
         ["a", "b", "c"],
         strategy="fewest_attempts",
@@ -368,48 +374,50 @@ def test_failing_item_does_not_starve_others_integration():
     )
     dispatched, result = drive(g, completes={"b": 1, "c": 1}, max_iters=100)
     rep = g.report(result.state)
-    assert rep.done == ("b", "c")  # starve されず完了
+    assert rep.done == ("b", "c")  # completed without starvation
     assert rep.exhausted == ("a",)
     assert rep.attempts == {"a": 3, "b": 1, "c": 1}
     assert result.stop.name == "work_list_drained"
 
 
 def test_naive_fifo_without_cap_starves_others():
-    # 対照: 素朴 fifo + 上限なしだと失敗し続ける先頭が全反復を独占し、他は一度も回らない。
-    g = WorkListGather(["a", "b", "c"], strategy="fifo")  # cap なし、drained 条件なし
+    # Contrast: naive fifo with no cap lets the failing head item monopolize all
+    # iterations, so the other items never run.
+    g = WorkListGather(["a", "b", "c"], strategy="fifo")  # no cap, no drained condition
     dispatched: list[str] = []
     run_loop(
-        act=scripted_act(dispatched, {"b": 1, "c": 1}),  # b,c は本来すぐ終わるはず
+        act=scripted_act(dispatched, {"b": 1, "c": 1}),  # b,c should normally finish quickly
         verify=never_done,
         gather=g,
         conditions=[MaxIterations(10)],
     )
-    # a が永久に未完なので fifo は a を 10 回独占。b/c は starve。
+    # Since a never completes, fifo lets a monopolize 10 attempts. b/c starve.
     assert dispatched == ["a"] * 10
     assert "b" not in dispatched and "c" not in dispatched
 
 
-# -- triage との接続 ---------------------------------------------------------
+# -- Triage connection --------------------------------------------------------
 
 
 def test_from_triage_orders_by_ranking_and_excludes_blocked():
     candidates = [
         Candidate(id="low", priority=1),
         Candidate(id="high", priority=9, payload={"seed": 1}),
-        Candidate(id="blocked", depends_on=("missing",)),  # 依存未充足 -> 除外
+        Candidate(id="blocked", depends_on=("missing",)),  # unmet dependency -> excluded
     ]
     g = WorkListGather.from_triage(candidates)
     ids = [it.id for it in g.items]
-    assert ids == ["high", "low"]  # triage ランキング順 (優先度降順)、blocked は除外
-    # priority / payload を引き継ぐ。
+    assert ids == ["high", "low"]  # triage ranking order (descending priority), blocked excluded
+    # priority / payload are inherited.
     assert g.items[0].priority == 9
     assert g.items[0].payload == {"seed": 1}
 
 
 def test_default_ctx_is_json_native_for_persistent_gate():
-    # 既定 build_ctx は永続人間ゲート (run_gated_loop) と合成しても state.db に保存できる
-    # JSON ネイティブ dict を返す。WorkItem を返していた頃は request_decision の
-    # JSON-native 検査で ValueError になっていた (#56 codex review 3)。
+    # The default build_ctx returns a JSON-native dict that can be stored in state.db
+    # even when composed with the persistent human gate (run_gated_loop). When it
+    # returned WorkItem, request_decision's JSON-native check raised ValueError
+    # (#56 codex review 3).
     from loop_agent import LoopStore, connect, run_gated_loop
 
     store = LoopStore(connect(":memory:"))
@@ -418,24 +426,25 @@ def test_default_ctx_is_json_native_for_persistent_gate():
         act=scripted_act([], {}),
         verify=never_done,
         gather=g,
-        on=lambda _ctx: True,  # 全 action を不可逆扱い -> 最初の dispatch で pause
+        on=lambda _ctx: True,  # treat every action as irreversible -> pause on first dispatch
         store=store,
         run_id="r1",
         conditions=[WorkListDrained(g), MaxIterations(5)],
     )
-    # JSON-native なので ValueError にならず pause し、保存された context が読める。
+    # Because it is JSON-native, this pauses without ValueError and the stored context is readable.
     assert result.status == "paused"
     assert result.pending is not None
-    assert result.pending["action"]["id"] == "a"  # 既定 ctx dict が round-trip した
+    assert result.pending["action"]["id"] == "a"  # default ctx dict round-tripped
 
 
 def test_item_of_excludes_gate_skips_from_exhaustion():
-    # gate が item の action を SKIP すると run_loop は act せず StepRecord を積む。既定では
-    # それも 1 試行として数え、走ってもいない item が per-item 上限で exhausted になりうる
-    # (#56 codex review)。item_of が skip 行に None を返せば非実行として外せる。
+    # When gate SKIPs an item's action, run_loop appends a StepRecord without calling act.
+    # By default this still counts as one attempt, so an item that never ran can become
+    # exhausted by the per-item cap (#56 codex review). If item_of returns None for skip
+    # rows, they can be excluded as not executed.
 
     class SkipFirstTwo:
-        """最初の 2 回は SKIP、以降は PROCEED する gate (skip 行に印を付ける)。"""
+        """Gate that SKIPs the first 2 times, then PROCEEDs (marking skip rows)."""
 
         def __init__(self) -> None:
             self.n = 0
@@ -448,7 +457,8 @@ def test_item_of_excludes_gate_skips_from_exhaustion():
                 )
             return GateReview(disposition=GATE_PROCEED)
 
-    # 単一 item, cap=2。skip を試行に数えると 2 回の skip で即 exhausted (act 0 回) になる。
+    # Single item, cap=2. If skips count as attempts, two skips immediately exhaust it
+    # (0 act calls).
     g = WorkListGather(
         ["a"],
         max_attempts_per_item=2,
@@ -457,27 +467,29 @@ def test_item_of_excludes_gate_skips_from_exhaustion():
     )
     dispatched: list[str] = []
     result = run_loop(
-        act=scripted_act(dispatched, {"a": 1}),  # 実際に act すれば 1 回で done
+        act=scripted_act(dispatched, {"a": 1}),  # if act actually runs, it completes once
         verify=never_done,
         gather=g,
         gate=SkipFirstTwo(),
         conditions=[WorkListDrained(g), MaxIterations(20)],
     )
-    # skip は試行に数えないので a は exhausted されず、PROCEED 後に実 act して done になる。
+    # Skips do not count as attempts, so a is not exhausted and becomes done after the
+    # real act following PROCEED.
     rep = g.report(result.state)
     assert rep.done == ("a",)
     assert rep.exhausted == ()
-    assert dispatched == ["a"]  # 実 act は 1 回だけ (skip 2 回は act を呼ばない)
+    assert dispatched == ["a"]  # only one real act (the two skips do not call act)
 
 
 def test_excluded_skips_still_rotate_fairly_no_starvation():
-    # item_of で skip を非実行にしても、公平性は selections (offer 回数) で測るので先頭 item を
-    # skip し続けても他 item が offer される (#56 codex review 2: starve 防止)。
+    # Even when item_of treats skips as not executed, fairness is measured by selections
+    # (offer count), so other items are still offered when the head item is repeatedly
+    # skipped (#56 codex review 2: starvation prevention).
     offered: list[str] = []
 
     class SkipEverything:
         def review(self, context, state):
-            offered.append(_ctx_id(context))  # gate に提示された item
+            offered.append(_ctx_id(context))  # item presented to gate
             return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
 
     g = WorkListGather(
@@ -488,16 +500,17 @@ def test_excluded_skips_still_rotate_fairly_no_starvation():
         verify=never_done,
         gather=g,
         gate=SkipEverything(),
-        conditions=[MaxIterations(6)],  # drained にはならない (skip は exhaust しない)
+        conditions=[MaxIterations(6)],  # does not drain (skips do not exhaust)
     )
-    # 先頭 a に張り付かず a,b,c,a,b,c と巡回して全 item が human に提示される。
+    # It does not stick to head item a; it cycles a,b,c,a,b,c and presents every item to human.
     assert offered == ["a", "b", "c", "a", "b", "c"]
 
 
 def test_item_of_attributes_gate_edits_to_actual_item():
-    # scheduler は a を offer するが、gate が最初の a を b の action に edit して PROCEED する。
-    # record は b のものなので item_of で b に帰属する (#56 codex review 4: edit 取り違え防止)。
-    # item_of を渡さないと b の record が offer 元 a に誤帰属する。
+    # The scheduler offers a, but gate edits the first a into b's action and PROCEEDs.
+    # The record belongs to b, so item_of attributes it to b (#56 codex review 4:
+    # preventing edit misattribution). Without item_of, b's record is incorrectly
+    # attributed to the offered source a.
     class EditFirstAToB:
         def __init__(self) -> None:
             self.edited = False
@@ -520,16 +533,18 @@ def test_item_of_attributes_gate_edits_to_actual_item():
         conditions=[WorkListDrained(g), MaxIterations(20)],
     )
     rep = g.report(result.state)
-    # 各 item は実 act 1 回ずつ正しい item に帰属して done (a は edit step では実行されず、
-    # 後の素通り step で実行された)。誤帰属なら a が 2 回・b が 0 回等になる。
+    # Each item gets one real act correctly attributed and becomes done (a does not run
+    # on the edited step; it runs later on a pass-through step). With misattribution,
+    # this would look like a=2 and b=0, etc.
     assert set(rep.done) == {"a", "b", "c"}
     assert rep.attempts == {"a": 1, "b": 1, "c": 1}
-    assert dispatched == ["b", "c", "a"]  # offer a->edit b, 次 c, 最後 a
+    assert dispatched == ["b", "c", "a"]  # offer a->edit b, then c, finally a
     assert result.stop.name == "work_list_drained"
 
 
 def test_skips_counted_as_attempts_by_default():
-    # 対照: item_of を渡さなければ skip 行も 1 試行として offer 元 item に数える (既定挙動)。
+    # Contrast: without item_of, skip rows count as one attempt on the offered source item
+    # (default behavior).
     class AlwaysSkip:
         def review(self, context, state):
             return GateReview(disposition=GATE_SKIP, observation={"skipped": True})
@@ -542,13 +557,13 @@ def test_skips_counted_as_attempts_by_default():
         gate=AlwaysSkip(),
         conditions=[WorkListDrained(g), MaxIterations(20)],
     )
-    # skip 2 回で a が exhausted (act は 0 回)。既定の数え方を明示。
+    # Two skips exhaust a (0 act calls). This documents the default counting behavior.
     assert g.exhausted_items(result.state) == {"a"}
     assert g.attempts(result.state) == {"a": 2}
 
 
 def test_schedule_context_is_exported_from_facades():
-    # custom strategy を型付けするのに必要なので facade から import できること。
+    # It must be importable from facades because custom strategies need it for typing.
     import loop_agent
     import loop_agent.discovery as discovery_pkg
 
@@ -557,24 +572,26 @@ def test_schedule_context_is_exported_from_facades():
 
 
 def test_triage_function_does_not_shadow_a_submodule():
-    # 入力選定の実装は _triage (private) に置く。triage を同名 submodule に置くと、facade の
-    # `from ._triage import triage` (関数) が package 属性 triage を上書きし、
-    # `import loop_agent.discovery.triage` が *関数* に bind される事故が起きる (#56 review)。
+    # Input selection implementation lives in _triage (private). If triage is placed in
+    # a submodule with the same name, facade's `from ._triage import triage` (function)
+    # overwrites the package attribute triage, causing `import loop_agent.discovery.triage`
+    # to bind to the *function* by mistake (#56 review).
     import loop_agent
     import loop_agent.discovery as discovery_pkg
 
-    # facade の triage は関数 (Triage を返す) で、Candidate も facade から引ける。
+    # The facade triage is a function (returning Triage), and Candidate is also available
+    # from the facade.
     assert callable(discovery_pkg.triage)
     assert loop_agent.triage is discovery_pkg.triage
     rec = discovery_pkg.triage([discovery_pkg.Candidate(id="x")])
     assert rec.recommended.id == "x"
-    # 公開 submodule 名 triage は存在しない (shadow なし)。
+    # There is no public submodule named triage (no shadowing).
     with pytest.raises(ModuleNotFoundError):
         import loop_agent.discovery.triage  # noqa: F401
 
 
 def test_resume_with_same_gatherer_continues_consistently():
-    # 同一 gatherer を initial_state で再開すると、attempts が引き継がれて最後まで drained する。
+    # Resuming the same gatherer with initial_state carries attempts forward and drains.
     g = WorkListGather(
         ["a", "b", "c"],
         strategy="fewest_attempts",
@@ -583,7 +600,7 @@ def test_resume_with_same_gatherer_continues_consistently():
     )
     completes = {"b": 1, "c": 1}
 
-    # leg 1: 早めに打ち切る。
+    # leg 1: stop early.
     disp1: list[str] = []
     leg1 = run_loop(
         act=scripted_act(disp1, completes),
@@ -593,7 +610,7 @@ def test_resume_with_same_gatherer_continues_consistently():
     )
     assert leg1.status == "stopped" and leg1.stop.name == "max_iterations"
 
-    # leg 2: 中断地点 (同じ state) から同一 gatherer で再開。
+    # leg 2: resume the same gatherer from the interruption point (same state).
     disp2: list[str] = []
     leg2 = run_loop(
         act=scripted_act(disp2, completes),
@@ -603,7 +620,7 @@ def test_resume_with_same_gatherer_continues_consistently():
         initial_state=leg1.state,
     )
     rep = g.report(leg2.state)
-    # 2 leg 通算で b/c は完了、a は cap2 で exhausted。starve していない。
+    # Across both legs, b/c complete and a is exhausted by cap2. No starvation.
     assert rep.done == ("b", "c")
     assert rep.exhausted == ("a",)
     assert rep.attempts == {"a": 2, "b": 1, "c": 1}
@@ -615,9 +632,9 @@ def test_from_triage_respects_done_dependencies():
         Candidate(id="dep"),
         Candidate(id="needs_dep", depends_on=("dep",)),
     ]
-    # dep 未完了なら needs_dep は blocked で除外。
+    # If dep is unfinished, needs_dep is blocked and excluded.
     g0 = WorkListGather.from_triage(candidates)
     assert [it.id for it in g0.items] == ["dep"]
-    # dep 完了後に呼び直すと needs_dep が ready になり取り込まれる。
+    # Calling again after dep is done makes needs_dep ready and includes it.
     g1 = WorkListGather.from_triage(candidates, done=["dep"])
     assert [it.id for it in g1.items] == ["needs_dep"]

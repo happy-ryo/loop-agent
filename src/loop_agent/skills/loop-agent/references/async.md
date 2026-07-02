@@ -1,24 +1,24 @@
 > This file is a load-on-demand bundled copy of `docs/async.md`. The canonical source is `docs/async.md` in the repository.
 
-# async/await 対応 (async_run_loop)
+# async/await support (async_run_loop)
 
-LoopAgent は同期 `run_loop` と非同期 `async_run_loop` の 2 つのエントリポイントを提供する。control flow の実装は一本化されており、同期 API は完全維持されている（Issue #40）。
+LoopAgent provides two entry points: synchronous `run_loop` and asynchronous `async_run_loop`. The control-flow implementation is unified, and the synchronous API remains fully preserved (Issue #40).
 
-## sync と async の対応関係
+## Relationship between sync and async
 
 | | `run_loop` | `async_run_loop` |
 |---|---|---|
-| 呼び出し | `run_loop(...)` | `await async_run_loop(...)` |
-| 用途 | 同期コードからそのまま回す | すでにイベントループ内にいる / いずれかのシームが coroutine function |
-| 引数 | `act` / `review` / `verify` / `conditions` / `gather=…` / `on_step=…` / `gate=…` / `time_fn=…` / `initial_state=…` / `timeout=…` | 同一（completely identical） |
-| 返り値 | `LoopResult` | `LoopResult` |
-| シーム | **同期 callable のみ**（async シームを渡すと `AsyncSeamInSyncLoop` を送出） | 同期 callable も非同期（acallable）も受ける（混在可） |
+| Invocation | `run_loop(...)` | `await async_run_loop(...)` |
+| Use case | Run directly from synchronous code | You are already inside an event loop / at least one seam is a coroutine function |
+| Arguments | `act` / `review` / `verify` / `conditions` / `gather=...` / `on_step=...` / `gate=...` / `time_fn=...` / `initial_state=...` / `timeout=...` | Same (completely identical) |
+| Return value | `LoopResult` | `LoopResult` |
+| Seams | **Synchronous callables only** (passing an async seam raises `AsyncSeamInSyncLoop`) | Accepts both synchronous callables and async callables; mixing is allowed |
 
-`async_run_loop` がループ本体（gather -> act -> review? -> verify -> repeat）の **single source of truth** であり、同期 `run_loop` はその薄い `asyncio.run` ラッパとして同じ実装を共有する。同期フックだけで構成した場合、共有 coroutine は実際には一度も await せず（`maybe_await` は awaitable でない値をそのまま返す）、`run_loop` は呼び出し元自身の context でこれを走らせ切る。イベントループを作らず `asyncio.Task` でも包まないため、`contextvars` の伝播・フック例外の型・per-call オーバーヘッドは async 対応導入前と完全に一致する。つまり**同期フックに追加コストはない**。
+`async_run_loop` is the **single source of truth** for the loop body (gather -> act -> review? -> verify -> repeat), and synchronous `run_loop` uses a manual synchronous driver over the shared coroutine. When the loop is composed only of synchronous hooks, the shared coroutine never actually awaits anything (`maybe_await` returns non-awaitable values as-is), and `run_loop` runs it to completion in the caller's own context. Because it does not create an event loop or wrap the execution in an `asyncio.Task`, `contextvars` propagation, hook exception types, and per-call overhead exactly match the behavior before async support was introduced. In other words, **synchronous hooks have no additional cost**.
 
-`run_loop` は内部で `async_run_loop` を `_strict_sync=True` で呼ぶ。この間にいずれかのシーム（`act` / `review` / `verify` / `conditions` の各 `check` / `gate.review` / `on_step` / `on_complete`）が awaitable を返すと、その時点で `loop_agent.errors.AsyncSeamInSyncLoop`（`LoopError` かつ `RuntimeError`）を送出して `await async_run_loop(...)` へ誘導する。元々の同期 `run_loop` も async シームを受けつけなかったため、これは regression ではなく明確で一貫したエラーである。
+`run_loop` internally calls `async_run_loop` with `_strict_sync=True`. If any seam (`act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` / `on_complete`) returns an awaitable during that call, `loop_agent.errors.AsyncSeamInSyncLoop` (both a `LoopError` and a `RuntimeError`) is raised immediately and directs the caller to use `await async_run_loop(...)`. The original synchronous `run_loop` did not accept async seams either, so this is not a regression; it is a clear and consistent error.
 
-## 基本例: async な act を回す
+## Basic example: running an async act
 
 ```python
 import asyncio
@@ -32,7 +32,7 @@ from loop_agent import (
 
 
 async def act(ctx):
-    # 例: 非同期 I/O (HTTP / DB / LLM 呼び出し) をここで await する
+    # Example: await asynchronous I/O (HTTP / DB / LLM call) here
     await asyncio.sleep(0)
     return ActOutcome(observation="did something", tokens=1)
 
@@ -55,60 +55,60 @@ async def main():
 asyncio.run(main())
 ```
 
-同期コードから 1 回だけ非同期ループを回したい場合は、上記の `asyncio.run(main())` のように `async_run_loop(...)` を `asyncio.run` で駆動するのが正規の使い方である（テストスイートも pytest-asyncio に依存せずこの形で coroutine を駆動している）。
+When you want to run the asynchronous loop exactly once from synchronous code, the canonical usage is to drive `async_run_loop(...)` with `asyncio.run`, as shown in `asyncio.run(main())` above. The test suite also drives coroutines this way without depending on pytest-asyncio.
 
-## 同期シームと非同期シームの混在
+## Mixing synchronous and asynchronous seams
 
-`gather` / `act` / `review` / `verify` / `conditions` の各 `check` / `gate.review` / `on_step`（および gate の `on_complete`）は、**プレーンな同期 callable でも async なもの（awaitable を返す）でもよい**。ドライバは各結果を `loop_agent._async.maybe_await` 経由で await するため、両者は自由に混在できる（例: async な `gather` + 同期 `act` + async な `verify`）。同期フックは返り値が awaitable でないため await のオーバーヘッドを一切足さず、そのまま使われる。
+Each of `gather` / `act` / `review` / `verify` / each `conditions` `check` / `gate.review` / `on_step` (and the gate's `on_complete`) may be **either a plain synchronous callable or an async callable that returns an awaitable**. The driver awaits each result through `loop_agent._async.maybe_await`, so the two styles can be mixed freely (for example, async `gather` + synchronous `act` + async `verify`). Synchronous hooks return non-awaitable values, so they are used as-is without adding any await overhead.
 
 ```python
-def gather(state):              # 同期
+def gather(state):              # synchronous
     return state
 
-async def act(ctx):             # 非同期
+async def act(ctx):             # asynchronous
     await asyncio.sleep(0)
     return ActOutcome(observation=None, tokens=1)
 
 result = await async_run_loop(
     act=act,
-    verify=verify,              # 同期 / 非同期どちらでもよい
+    verify=verify,              # may be either synchronous or asynchronous
     conditions=[MaxIterations(5)],
     gather=gather,
 )
 ```
 
-各シームの型と契約の詳細は [seams.md](seams.md) を参照。
+For details about each seam's type and contract, see [seams.md](seams.md).
 
-## 複数ループの並行実行 (asyncio.gather)
+## Concurrent execution of multiple loops (asyncio.gather)
 
-`async_run_loop` 自身は内部で並行処理を行わない。gather -> gate -> act -> review? -> verify の順序と stop 条件の評価タイミングを同期ループと完全一致させるため、各シームを**逐次** await する。複数の独立ループを並行に回したい場合は、呼び出し側でタスクとしてスケジュールする。
+`async_run_loop` itself does not perform concurrent processing internally. To keep the gather -> gate -> act -> review? -> verify order and the timing of stop-condition evaluation exactly aligned with the synchronous loop, it awaits each seam **sequentially**. If you want to run multiple independent loops concurrently, schedule them as tasks from the caller.
 
 ```python
 results = await asyncio.gather(
     async_run_loop(act=act_a, verify=verify_a, conditions=[MaxIterations(10)]),
     async_run_loop(act=act_b, verify=verify_b, conditions=[MaxIterations(10)]),
 )
-# あるいは asyncio.create_task(async_run_loop(...)) で個別に走らせる
+# Or run them individually with asyncio.create_task(async_run_loop(...))
 ```
 
-各呼び出しは自分専用の `LoopState` を持つため、並行 run どうしは干渉しない。
+Each call owns its own `LoopState`, so concurrent runs do not interfere with each other.
 
-注意: `time_fn` は**同期**の monotonic クロックのまま（読まれるだけで await されない）。同期 `act` がブロックするとイベントループ全体をブロックするため、他タスクとループを共有する場合は本当にブロックする処理を async フック + `loop.run_in_executor` でラップすること。
+Note: `time_fn` remains a **synchronous** monotonic clock; it is only read and is not awaited. If a synchronous `act` blocks, it blocks the entire event loop. When sharing the loop with other tasks, wrap truly blocking work in an async hook plus `loop.run_in_executor`.
 
-## per-call timeout と async シーム
+## Per-call timeout and async seams
 
-`act` / `review` / `verify` の **per-call** timeout は `TimeoutPolicy`（または裸の秒数）を `run_loop` / `async_run_loop` の `timeout=` に渡して指定する（Issue #42）。実中断の手段はシームが同期か非同期かで異なる。
+The **per-call** timeout for `act` / `review` / `verify` is specified by passing a `TimeoutPolicy` (or a bare number of seconds) to `timeout=` on `run_loop` / `async_run_loop` (Issue #42). The mechanism used for actual interruption differs depending on whether the seam is synchronous or asynchronous.
 
-- **async シーム**: asyncio の task cancel で per-call timeout を実現する（kill mode）。
-- **sync シーム**: POSIX main thread の `SIGALRM` で実中断する（SIGALRM 不在環境では graceful=post-hoc、kill=`UnsupportedTimeoutKill`）。
+- **async seams**: per-call timeout is implemented by cancelling the asyncio task (kill mode).
+- **sync seams**: actual interruption uses `SIGALRM` on the POSIX main thread (in environments without `SIGALRM`, graceful=post-hoc and kill=`UnsupportedTimeoutKill`).
 
-`on_timeout="graceful"`（既定）は諦めて合成 step を記録し次反復へ進み、`"kill"` は `SeamTimeout` を送出する。これは whole-run の `Timeout` stop 条件とは別物である。詳細は [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md)。
+`on_timeout="graceful"` (the default) gives up, records a synthetic step, and proceeds to the next iteration; `"kill"` raises `SeamTimeout`. This is separate from the whole-run `Timeout` stop condition. For details, see [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md).
 
-## 関連
+## Related
 
-- [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) — LoopAgent 全体像と動線
-- [seams.md](seams.md) — gather / act / review / verify / conditions / gate / on_step シームの型と契約
-- [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md) — per-call timeout（graceful / kill）の使い方
+- [../README.md](https://github.com/happy-ryo/loop-agent/blob/main/README.md) - LoopAgent overview and navigation
+- [seams.md](seams.md) - Types and contracts for gather / act / review / verify / conditions / gate / on_step seams
+- [recipes/timeout-and-kill.md](https://github.com/happy-ryo/loop-agent/blob/main/docs/recipes/timeout-and-kill.md) - How to use per-call timeout (graceful / kill)
 
 ## Timeout portability note
 

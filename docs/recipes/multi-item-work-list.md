@@ -1,33 +1,33 @@
-# Recipe: N 件を 1 本のループで公平に回す（WorkListGather）
+# Recipe: Rotate N Items Fairly in One Loop (WorkListGather)
 
-flaky test 安定化・一括翻訳・横断リファクタ — どれも「**N 件の独立した item** を 1 本のループで順に片付ける」形です。`WorkListGather`（`loop_agent.discovery.work_list`, Issue #56）は、その `gather` を正規化した再利用部品です。
+Flaky test stabilization, bulk translation, and cross-cutting refactors all have the same shape: **process N independent items** one after another in a single loop. `WorkListGather` (`loop_agent.discovery.work_list`, Issue #56) is the reusable component that normalizes that kind of `gather`.
 
-## なぜ素朴な gather だと壊れるか
+## Why a Naive gather Breaks Down
 
-`gather` は「次に何をやるか」を返すだけのフック（`Callable[[state], ctx]`）。N 件を回すとき、いちばん素直な実装はこうなります:
+`gather` is only a hook that returns "what to do next" (`Callable[[state], ctx]`). When cycling through N items, the most straightforward implementation looks like this:
 
 ```python
 def gather(state):
-    return next(f for f in files if f not in done)   # 先頭の未完を返す
+    return next(f for f in files if f not in done)   # Return the first unfinished item.
 ```
 
-これは **1 件が verify を連続失敗すると詰みます**。先頭の `a.py` がどうしても直らないと、`gather` は毎反復 `a.py` を返し続け、`MaxIterations` を `a.py` だけで食い潰す。`b.py` / `c.py` は一度も触られずに（= starve して）ループが終わります。Self-translation PoC（#37）で実際に踏んだ罠です。
+This **gets stuck when one item fails verification repeatedly**. If the first file, `a.py`, cannot be fixed, `gather` keeps returning `a.py` on every iteration and burns the entire `MaxIterations` budget on that file alone. `b.py` and `c.py` are never touched, so they starve and the loop ends. This is the trap we hit in the self-translation PoC (#37).
 
-## WorkListGather が提供するもの
+## What WorkListGather Provides
 
-| 機能 | 何を解決するか |
+| Feature | What it solves |
 |---|---|
-| **公平 scheduling**（`round_robin` / `fewest_attempts` / `fifo` / `priority` / custom） | 1 件が独占しないよう順番を回す |
-| **per-item 上限**（`max_attempts_per_item`） | 直らない item を規定回数で打ち止め（*exhausted*）し、残りの予算を他へ |
-| **done 判定フック**（`done_when`） | ループ全体の `verify` とは独立に「*この item* は終わったか」を判定 |
-| **attempt counter / 進捗 API**（`attempts` / `report` / `remaining`） | 試行回数・完了・残りを `state` から読む |
-| **triage 接続**（`from_triage`） | 何を どの順で回すかの優先度計算を既存の `triage` に委譲 |
+| **Fair scheduling** (`round_robin` / `fewest_attempts` / `fifo` / `priority` / custom) | Rotates the order so one item cannot monopolize the loop |
+| **Per-item limit** (`max_attempts_per_item`) | Stops retrying an unfixable item after a defined number of attempts (*exhausted*) and leaves the remaining budget for other items |
+| **Done predicate hook** (`done_when`) | Determines whether *this item* is complete independently from the loop-wide `verify` |
+| **Attempt counter / progress API** (`attempts` / `report` / `remaining`) | Reads attempts, completed items, and remaining items from `state` |
+| **Triage integration** (`from_triage`) | Delegates priority calculation for which items to process and in what order to the existing `triage` machinery |
 
-## prose intent（coding agent にそのまま渡す）
+## Prose Intent (Pass Directly to a Coding Agent)
 
-> `src/` 配下の指定 3 ファイルの docstring を英訳して。1 ファイルでも翻訳に詰まったら、そのファイルは 3 回試して諦め、残りのファイルは必ず触ること（1 ファイルの失敗で他を巻き込まない）。各ファイルは「対象言語が 0 になり、当該テストが pass」を完了条件にして。
+> Translate the docstrings in the three specified files under `src/` into English. If translation gets stuck on any one file, try that file three times and then give up on it, but make sure the remaining files are still handled; one file's failure must not block the others. Treat a file as complete when the remaining source-language count reaches zero and that file's relevant tests pass.
 
-## 組み上がる harness
+## Assembled Harness
 
 ```python
 from loop_agent import (
@@ -36,18 +36,18 @@ from loop_agent import (
 
 FILES = ["src/a.py", "src/b.py", "src/c.py"]
 
-def act(ctx):                          # 既定 build_ctx は dict {"id","attempt","priority","payload"}
-    obs = translate_and_test(ctx["id"])  # 1 ファイル翻訳 -> テスト実行
+def act(ctx):                          # Default build_ctx is dict {"id","attempt","priority","payload"}.
+    obs = translate_and_test(ctx["id"])  # Translate one file -> run tests.
     return ActOutcome(observation={"file": ctx["id"], "passed": obs.passed}, tokens=obs.tokens)
 
-def verify(outcome):                   # ループ全体のゴール（任意。drained で止めるなら未達固定でよい）
+def verify(outcome):                   # Loop-wide goal. Optional; if stopping on drained, it can stay unmet.
     return VerifyOutcome(goal_met=False)
 
 gather = WorkListGather(
     FILES,
-    strategy="fewest_attempts",        # 試行回数最小から（= 公平な round-robin）
-    max_attempts_per_item=3,           # 1 ファイル 3 回で打ち止め
-    done_when=lambda item, rec: rec.observation["passed"],   # この item は終わったか
+    strategy="fewest_attempts",        # Start with the fewest attempts (= fair round-robin).
+    max_attempts_per_item=3,           # Stop after three attempts for a file.
+    done_when=lambda item, rec: rec.observation["passed"],   # Is this item complete?
 )
 
 result = run_loop(
@@ -56,21 +56,21 @@ result = run_loop(
 )
 
 report = gather.report(result.state)
-print("done:", report.done, "exhausted:", report.exhausted)   # exhausted = 諦めた件
+print("done:", report.done, "exhausted:", report.exhausted)   # exhausted = items given up on
 ```
 
-## 要点
+## Key Points
 
-- **停止は必ず `WorkListDrained` で。** 全 item が done か exhausted になると `gather` は返す item が無く `DRAINED` を返します。ループを止めるのは `gather` ではなく停止条件 — 停止条件は各反復の *先頭*（`gather` の前）で評価されるので、`WorkListDrained` を `conditions` に入れておけば drained になった瞬間に `gather` が呼ばれる前に止まり、`DRAINED` が `act` に渡ることはありません。`MaxIterations` は保険として併記します。
-- **`done_when` は `verify` と別物。** `verify` は *ループ全体*のゴール、`done_when` は *item ごと*の完了。multi-item では「この 1 ファイルが終わったか」を `done_when(item, record)` で判定し、`verify` は未達固定（`goal_met=False`）にして停止を `WorkListDrained` に委ねるのが素直です。
-- **done シグナルは `observation` に焼く。** `done_when` が受け取るのは `StepRecord` だけ。`act` の `observation` に `{"passed": bool}` のような **JSON ネイティブな完了フラグ**を載せ、`done_when` はそれを読みます。resume（別プロセス再開）では `observation` が JSON 往復するので、`tuple`/`set` 等のドリフトしうる型でなく素の bool / str を使うこと（loop core の resume 注記と同じ約束）。
-- **戦略の選び方:**
-  - `fewest_attempts`（既定）— 試行回数が最も少ない item から。失敗が多い item に引きずられず、全体を均す。迷ったらこれ。
-  - `round_robin` — 並び順で厳密に巡回。各 item に等しく順番を与えたいとき。
-  - `priority` — `WorkItem(priority=...)` 降順で **厳密に** 高優先度を先に片付ける（同優先度内のみ公平）。重要な item を先に終わらせたいとき。
-  - `fifo` — 先頭の未完を返す素朴版。`max_attempts_per_item` と併用すれば starve は緩和されるが、公平性は他に劣る。
-  - custom callable — `ScheduleContext`（`selectable` / `attempts` / `last_selected` …）を受け取り 1 件返す。独自の優先ロジック用。
-- **ModelLadder と合成。** 既定 ctx は `attempt`（この item の既試行回数）を含むので、`act` 側で `ctx["attempt"]` を見て haiku → sonnet → opus と昇格できます（`build_ctx` を省略してもよい）。独自形にしたいなら `build_ctx=lambda item, attempt, st: {"id": item.id, "attempt": attempt}` のように JSON ネイティブで返します。
-- **resume 安全（ただし同一 gatherer に限る）。** `WorkListGather` は in-process カウンタを持たず、毎回 `state.history` をリプレイして attempts / done / exhausted を導出します。中断した run を `initial_state` で再開しても、同じ `state` から同じスケジュールを再現します。**前提**: 帰属は現在の `items` / `strategy` / `max_attempts_per_item` を使ったリプレイで決まり、`StepRecord` は dispatch した item を構造的に持ちません。よって resume は「中断した *同一* gatherer を同じ `state` で再開」に限ります。設定の違う gatherer に過去の history を食わせると、step を別 item に黙って誤帰属します（crash しません）。
-- **人間ゲートと合成するなら `item_of`。** `WorkListGather` は「どの record がどの item の act 結果か」を schedule のリプレイで導出します（既定は「offer した item ＝ act した item」）。`run_loop(gate=...)` を挟むと両者がずれます: gate が `GATE_SKIP`（reject/respond）を返すと `act` せず record だけ積まれ、`edit` で別 item の action に差し替えると record はその item のものになります。これらを正しく扱うには `item_of=lambda rec: ...`（record から実 item id を返す。非実行なら `None`）を渡します。すると attempts / done / `max_attempts_per_item` は実 item に付き、走っていない item を誤って *exhausted* にしたり、edit 先の record を offer 元に取り違えたりしません。公平性は「offer 回数」で測るので、skip し続けた item も後ろへ回り `fewest_attempts` / `round_robin` / `priority` は他 item へ rotate します（`fifo` のみ素朴ゆえ非 rotate）。gate を挟まない標準ループでは offer と record が 1:1 なので `item_of` は不要です。
-- **依存があるなら `from_triage`。** item 間に依存（「`b` は `a` の後」）があるなら、`Candidate` で依存を書いて `WorkListGather.from_triage(candidates, done=...)` を使うと、**ready（依存充足）な候補だけ**を triage のランキング順で取り込みます。依存が解けたら、その時点の `done` で呼び直して新しい gatherer を作ります — このとき items の構成が変わるので、**過去の history は引き継がず新しい `LoopState` で開始**してください（triage が done 済みを除外し、新規 ready は試行 0 から始まるのが正しい挙動）。
+- **Always stop with `WorkListDrained`.** Once every item is either done or exhausted, `gather` has no item to return and yields `DRAINED`. The stopping condition, not `gather`, stops the loop. Stopping conditions are evaluated at the *start* of each iteration, before `gather`, so if `WorkListDrained` is included in `conditions`, the loop stops as soon as the work list is drained, before `gather` is called and before `DRAINED` can be passed to `act`. Include `MaxIterations` as a safety limit.
+- **`done_when` is separate from `verify`.** `verify` represents the *loop-wide* goal, while `done_when` represents completion for *each item*. In a multi-item loop, the natural pattern is to decide whether a single file is complete with `done_when(item, record)`, keep `verify` fixed as unmet (`goal_met=False`), and delegate termination to `WorkListDrained`.
+- **Bake the done signal into `observation`.** `done_when` receives only the `StepRecord`. Put a **JSON-native completion flag** such as `{"passed": bool}` in the `act` observation, then have `done_when` read it. During resume in another process, `observation` round-trips through JSON, so use plain bools and strings rather than drift-prone types such as `tuple` or `set`; this is the same contract noted by the loop core resume behavior.
+- **How to choose a strategy:**
+  - `fewest_attempts` (default) - Selects the item with the fewest attempts. It smooths work across the list without letting repeatedly failing items drag the whole loop along. Use this when unsure.
+  - `round_robin` - Cycles strictly in list order. Use this when every item should receive an equal turn.
+  - `priority` - Handles higher-priority items first in strict descending `WorkItem(priority=...)` order, with fairness only among items at the same priority. Use this when important items should finish first.
+  - `fifo` - The naive version that returns the first unfinished item. Pairing it with `max_attempts_per_item` reduces starvation, but it is less fair than the other strategies.
+  - custom callable - Accepts `ScheduleContext` (`selectable` / `attempts` / `last_selected` ...) and returns one item. Use this for custom priority logic.
+- **Compose with ModelLadder.** The default ctx includes `attempt` (the number of previous attempts for this item), so `act` can inspect `ctx["attempt"]` and escalate from haiku to sonnet to opus. You can omit `build_ctx` for that case. If you need a custom shape, return JSON-native data, for example `build_ctx=lambda item, attempt, st: {"id": item.id, "attempt": attempt}`.
+- **Resume-safe, but only with the same gatherer.** `WorkListGather` does not keep in-process counters. On every call, it replays `state.history` to derive attempts, done items, and exhausted items. If an interrupted run resumes from `initial_state`, it reproduces the same schedule from the same `state`. **Assumption**: attribution is determined by replaying with the current `items`, `strategy`, and `max_attempts_per_item`; `StepRecord` does not structurally store the dispatched item. Therefore, resume is limited to restarting the *same* gatherer with the same `state`. Feeding old history to a differently configured gatherer silently misattributes steps to different items; it does not crash.
+- **Use `item_of` when composing with a human gate.** `WorkListGather` derives "which record belongs to which item" by replaying the schedule; by default, the offered item is treated as the acted item. If you insert `run_loop(gate=...)`, those can diverge: when the gate returns `GATE_SKIP` (reject/respond), no `act` runs but a record is still appended, and when an edit swaps in an action for another item, the record belongs to that other item. To handle this correctly, pass `item_of=lambda rec: ...`, returning the actual item id from the record or `None` when nothing executed. Then attempts, done status, and `max_attempts_per_item` attach to the actual item, so an item that did not run is not incorrectly marked *exhausted*, and an edited record is not attributed to the offered item. Fairness is measured by offer count, so an item that keeps being skipped moves back in the rotation and `fewest_attempts`, `round_robin`, and `priority` rotate to other items (`fifo` remains naive and does not rotate). In a standard loop without a gate, the offer and record are 1:1, so `item_of` is unnecessary.
+- **Use `from_triage` when there are dependencies.** If items depend on each other, such as "`b` must run after `a`", declare those dependencies with `Candidate` and use `WorkListGather.from_triage(candidates, done=...)`. It imports only candidates that are **ready**, meaning their dependencies are satisfied, in triage ranking order. When a dependency is resolved, call it again with the current `done` set to create a new gatherer. Because the item set changes at that point, **start from a new `LoopState` without carrying over old history**. The correct behavior is for triage to exclude completed items and for newly ready items to start at attempt 0.

@@ -5,37 +5,37 @@
 [![CI](https://github.com/happy-ryo/loop-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/happy-ryo/loop-agent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-loop-agent は、Loop Engineering を実践するための小さな Python ランタイムです。エージェントや既存アプリの中で、次の処理を実行します。
+loop-agent is a small Python runtime for practicing Loop Engineering. Inside an agent or an existing application, it runs the following process:
 
-1. `gather` で次にやる作業を取り出す
-2. `act` でその作業を実行する
-3. `verify` で結果を検証する
-4. 成功ならループ終了、未達なら次のイテレーションへ進む
-5. イテレーションの最大回数、時間、予算、停滞などの上限に達したら止まる
+1. Use `gather` to retrieve the next task to work on
+2. Use `act` to execute that task
+3. Use `verify` to validate the result
+4. If successful, end the loop; if not yet complete, continue to the next iteration
+5. Stop when a limit is reached, such as the maximum number of iterations, time, budget, or stagnation
 
-Loop Engineering で重要なのは、人がエージェントに一手ずつ指示するのではなく、何を集め、どう実行し、何で検証し、いつ止めるかというループを設計することです。
-loop-agent は、ループを回すためのエンジンで、利用する人を「何に取り組むのか」「どのように取り組むのか」「どのように検証して完了するのか」「うまくいかないとき、どういう条件で止めるのか」というループの中のできごとに集中できるようにします。
+What matters in Loop Engineering is not having a person instruct an agent one step at a time, but designing the loop: what to gather, how to execute it, how to verify it, and when to stop.
+loop-agent is the engine for running that loop. It lets users focus on the events inside the loop: what to work on, how to work on it, how to verify that it is complete, and under what conditions to stop when things are not going well.
 
-特徴的なのは、ループを Python の関数や CLI で表現できることです。Claude Code や Codex などのコーディングエージェントにループを実装してもらい、実行できます。書いてもらったループは Python のコードとして残るので、コードを見て理解を深めることもできます。
+A defining feature is that loops can be expressed as Python functions or through the CLI. You can have coding agents such as Claude Code or Codex implement and run loops for you. The loops they write remain as Python code, so you can inspect the code and deepen your understanding.
 
-## 何に使うものか
+## What It Is For
 
-たとえば、次のような処理を安全に繰り返したいときに使います。各反復の結果は履歴に残り、最後は「成功した」「上限で止まった」「承認待ちで止まった」といった結果として返ります。
+Use loop-agent when you want to safely repeat processes like the following. The result of each iteration is kept in history, and the final result is returned as something like "succeeded", "stopped at a limit", or "stopped pending approval".
 
-- たまった GitHub Issue を処理させたい
-- テストが通るまでコーディングエージェントに修正させる
-- 複数ファイルを 1 件ずつ処理し、終わったものから記録する
-- 外部 CLI やモデル呼び出しを実行し、失敗したら次の試行へ進む
-- 長い作業を state.db に残し、中断後に再開する
-- commit / push などの不可逆操作だけ手動承認を挟む
+- Process accumulated GitHub issues
+- Have a coding agent keep fixing code until tests pass
+- Process multiple files one by one, recording each completed item
+- Run an external CLI or model call, then move to the next attempt if it fails
+- Persist long-running work in state.db and resume it after interruption
+- Require manual approval only for irreversible operations such as commit / push
 
-## インストール
+## Installation
 
 ```bash
 pip install loop-agent
 ```
 
-Claude Code / Codex / Cursor などのコーディングエージェントにループを書かせる場合は、loop-agent 用の skill もインストールします。
+If you want coding agents such as Claude Code / Codex / Cursor to write loops for you, also install the skill for loop-agent.
 
 ```bash
 loop-agent install-skills
@@ -43,7 +43,7 @@ loop-agent install-skills --target-agent codex
 loop-agent install-skills --target-agent cursor
 ```
 
-## 最小例
+## Minimal Example
 
 ```python
 from loop_agent import ActOutcome, MaxIterations, VerifyOutcome, run_loop
@@ -66,25 +66,25 @@ result = run_loop(
 print(result.status, result.reason)
 ```
 
-`verify` が `goal_met=True` を返すと成功として止まります。成功しなくても、`MaxIterations` などの停止条件で必ず止められます。
+When `verify` returns `goal_met=True`, the loop stops as a success. Even if it does not succeed, stop conditions such as `MaxIterations` ensure that the loop will stop.
 
-## ループを構成する要素
+## Loop Components
 
-loop-agent のループは、主に 5 つの要素で構成します。
+A loop-agent loop is mainly composed of five elements.
 
-| 名前 | 役割 |
+| Name | Role |
 |---|---|
-| `gather` | 次に実行する対象を選ぶ |
-| `act` | 実際に処理する |
-| `verify` | 成功したか検証する |
-| `conditions` | 回数、時間、予算、停滞などで止める |
-| `gate` | 必要な操作だけ手動承認を挟む |
+| `gather` | Selects the next target to execute |
+| `act` | Performs the actual work |
+| `verify` | Checks whether the work succeeded |
+| `conditions` | Stops based on count, time, budget, stagnation, and similar limits |
+| `gate` | Inserts manual approval only for operations that need it |
 
-`gather` を省略すると、現在の状態がそのまま `act` に渡ります。小さなループなら `act`、`verify`、`conditions` だけで始められます。
+If you omit `gather`, the current state is passed directly to `act`. For a small loop, you can start with only `act`, `verify`, and `conditions`.
 
-## ループのひな形を作る
+## Create a Loop Template
 
-CLI で、ループのひな形を生成できます。
+You can generate a loop template from the CLI.
 
 ```bash
 loop-agent init-harness --template light  --output ./harness-light
@@ -92,76 +92,81 @@ loop-agent init-harness --template claude --output ./harness-claude
 loop-agent init-harness --template codex  --output ./harness-codex
 ```
 
-生成されるのは短い `harness.py` と README です。プロンプト、検証コマンド、停止条件、手動承認の対象は、生成後に自分の用途へ合わせて編集します。
+This generates a short `harness.py` and README. After generation, edit the prompt, verification command, stop conditions, and targets for manual approval to fit your use case. The Claude and Codex templates include resumable state, JSONL progress events, a review stub, and a repeated-failure cutoff so long runs can be observed and resumed.
 
-## コーディングエージェントと使う
+Reflexion is intentionally not in the starter harness. Start by making the inner
+loop observable and verifiable. Add Reflexion after the run shows a repeated,
+lesson-shaped failure; adding it before the prompt, verifier, and review are clear
+can turn noisy first attempts into bad stored lessons.
 
-Claude Code、Codex、Cursor などのコーディングエージェントに以下のようなプロンプトでループを書かせる使い方も想定しています。
+## Using It with Coding Agents
+
+loop-agent is also designed for workflows where coding agents such as Claude Code, Codex, or Cursor write loops from prompts like this:
 
 ```text
-loop-agent を使って、失敗している pytest を直すループを書いてください。
-act はコーディングエージェントに修正を任せ、verify は pytest の終了コードで判定してください。
-最大 5 回で止め、commit と push はループ外に置いてください。
+Using loop-agent, write a loop that fixes failing pytest tests.
+For act, delegate the fixes to a coding agent, and for verify, judge success by the pytest exit code.
+Stop after at most 5 attempts, and keep commit and push outside the loop.
 ```
 
-skill を入れておくと、コーディングエージェントが loop-agent の API や設計パターンを見つけやすくなります。
+Installing the skill makes it easier for coding agents to find loop-agent APIs and design patterns.
 
-## 主な機能
+## Main Features
 
-- 同期 / 非同期のループ実行: `run_loop`、`async_run_loop`
-- 停止条件: 最大反復数、時間、トークン、停滞検出など
-- 検証ヘルパー: `CommandVerifier`、`PytestVerifier`、`RegexVerifier`
-- 状態記録と再開: progress file / state.db
-- 手動承認: 不可逆操作だけを一時停止 / 再開
-- アダプタ: `ClaudeCodeAct`、`CodexAct`
-- 複数対象の処理: `WorkListGather`
-- 観測と運用: summary、dashboard、spike scan
-- 外側の改善ループ: Reflexion
+- Synchronous / asynchronous loop execution: `run_loop`, `async_run_loop`
+- Stop conditions: maximum iterations, time, tokens, stagnation detection, and more
+- Verification helpers: `CommandVerifier`, `PytestVerifier`, `RegexVerifier`
+- State recording and resume: progress file / state.db
+- Manual approval: pause / resume only for irreversible operations
+- Adapters: `ClaudeCodeAct`, `CodexAct`
+- Processing multiple targets: `WorkListGather`
+- Observation and operations: summary, dashboard, spike scan
+- Outer improvement loop: Reflexion for repeated, lesson-shaped failures
 
-## 判断基準
+## Fit Criteria
 
-loop-agent に向いているのは、完了条件をテストやコマンド結果などで機械的に判定できる作業です。
+loop-agent is well suited to work whose completion can be judged mechanically, such as by tests or command results.
 
-良い例:
+Good examples:
 
-- `pytest` が通る
-- 特定のファイルだけが変更されている
-- コマンドの終了コードが 0
-- 文字列や AST の条件を満たす
-- N 件の作業がすべて done になる
+- `pytest` passes
+- Only specific files have changed
+- A command exits with code 0
+- String or AST conditions are satisfied
+- All N tasks become done
 
-向いていない例:
+Poor fits:
 
-- 「もっと良い文章にする」
-- 「なんとなく品質を上げる」
-- 成功判定を毎回人間の感覚に頼る作業
+- "Make the writing better"
+- "Generally improve the quality"
+- Work where success judgment depends on human intuition every time
 
-曖昧な目標でも使えますが、その場合は `verify` をどう書くかが設計の中心になります。
+You can still use loop-agent for ambiguous goals, but in that case, designing `verify` becomes the central concern.
 
-## ドキュメント
+## Documentation
 
-| ドキュメント | 内容 |
+| Document | Contents |
 |---|---|
-| [docs/quickstart.md](./docs/quickstart.md) | 最初のループを動かす |
-| [docs/first-harness-api.md](./docs/first-harness-api.md) | 初回に使う API |
-| [docs/seams.md](./docs/seams.md) | `gather` / `act` / `verify` などの詳細 |
-| [docs/verifiers.md](./docs/verifiers.md) | 検証ヘルパー |
-| [docs/recipes/](./docs/recipes/README.md) | 具体的なループ例 |
-| [docs/adapters/README.md](./docs/adapters/README.md) | Claude Code / Codex アダプタ |
-| [docs/persistence-and-resume.md](./docs/persistence-and-resume.md) | 状態保存と再開 |
-| [docs/safety.md](./docs/safety.md) | 停止条件と手動承認 |
+| [docs/quickstart.md](./docs/quickstart.md) | Run your first loop |
+| [docs/first-harness-api.md](./docs/first-harness-api.md) | APIs to use first |
+| [docs/seams.md](./docs/seams.md) | Details of `gather` / `act` / `verify` and related components |
+| [docs/verifiers.md](./docs/verifiers.md) | Verification helpers |
+| [docs/recipes/](./docs/recipes/README.md) | Concrete loop examples |
+| [docs/adapters/README.md](./docs/adapters/README.md) | Claude Code / Codex adapters |
+| [docs/persistence-and-resume.md](./docs/persistence-and-resume.md) | State persistence and resume |
+| [docs/safety.md](./docs/safety.md) | Stop conditions and manual approval |
 | [docs/cli.md](./docs/cli.md) | CLI |
-| [docs/stability.md](./docs/stability.md) | 互換性契約 |
-| [docs/api-reference.md](./docs/api-reference.md) | API 一覧 |
+| [docs/stability.md](./docs/stability.md) | Compatibility contract |
+| [docs/api-reference.md](./docs/api-reference.md) | API reference |
 
-## ステータス
+## Status
 
-**1.0.0 安定版**。互換性の正本は [docs/stability.md](./docs/stability.md) です。
+**1.0.0 Stable**. The canonical compatibility contract is [docs/stability.md](./docs/stability.md).
 
-README は入口として短く保ち、細かい仕様は docs に分けています。
+This README is kept short as an entry point, with detailed specifications split into docs.
 
-## ライセンス / 開発
+## License / Development
 
-ライセンスは [MIT](./LICENSE) です。
+The license is [MIT](./LICENSE).
 
-Issue / PR は英語で扱います。既定ブランチは `main` です。
+Issues / PRs are handled in English. The default branch is `main`.

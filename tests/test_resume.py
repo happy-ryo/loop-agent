@@ -1,15 +1,18 @@
-"""resume の検証: 中断 -> 再開が通し実行と状態欠落なく一致すること (Issue #14).
+"""Resume verification: interrupt -> resume matches a straight-through run without state loss (Issue #14).
 
-report.md S5 Phase 2 成功条件 a の回帰テスト。state.db SoT に永続化済みの step から
-:meth:`LoopStore.load_or_init` で :class:`LoopState` を復元し、
-``run_loop(initial_state=...)`` で中断地点からループを継続できることを実証する。中核の
-主張は「途中で落として再開した結果が、一度も中断しなかった通し実行と一致する」こと
-(永続化 SoT が step-for-step で一致し、最終集計 / stop_reason も一致する)。
+Regression test for report.md S5 Phase 2 success criterion a. It restores
+:class:`LoopState` with :meth:`LoopStore.load_or_init` from steps already
+persisted in the state.db SoT, and demonstrates that
+``run_loop(initial_state=...)`` can continue the loop from the interruption
+point. The core claim is that "the result after crashing midway and resuming
+matches a straight-through run that was never interrupted" (the persisted SoT
+matches step-for-step, and the final aggregates / stop_reason also match).
 
-resume は **状態ベースの停止条件** (GoalMet) と組み合わせて意味を持つ: プロセスを
-またぐと act/verify フックは作り直されるが、その内部のコール回数カウンタは復元され
-ない。判定を (gather された) state から導くフックなら、新プロセスでも同じ判断を再現
-できる -- ここではトークンコスト固定の act と GoalMet(state.iteration>=N) を使う。
+Resume is meaningful when combined with a **state-based stop condition**
+(GoalMet): across processes the act/verify hooks are recreated, but their
+internal call counters are not restored. Hooks that derive their decision from
+the (gathered) state can reproduce the same judgment in a new process -- this
+test uses an act with a fixed token cost and GoalMet(state.iteration>=N).
 """
 
 from __future__ import annotations
@@ -33,8 +36,9 @@ from loop_agent import (
 )
 from conftest import ManualClock, acting, never_done, stepping_for
 
-# resume が一致を再現できる、状態ベースで決定的なループ構成。act はトークン固定、
-# 終了は GoalMet(state ベース) なので、フックを作り直す resume でも判定が変わらない。
+# A state-based deterministic loop setup where resume can reproduce a match.
+# The act token cost is fixed, and termination is GoalMet (state-based), so
+# recreating hooks during resume does not change the decision.
 GOAL_AT = 6
 
 
@@ -47,7 +51,7 @@ def _fresh_run_args() -> dict:
 
 
 def _step_projection(store: LoopStore, run_id: str) -> list[tuple]:
-    """timestamp / elapsed を除いた、決定的に比較できる step 射影を返す。"""
+    """Return a deterministic step projection excluding timestamp / elapsed."""
     return [
         (
             s["iteration"],
@@ -62,12 +66,13 @@ def _step_projection(store: LoopStore, run_id: str) -> list[tuple]:
 
 
 def test_resume_after_crash_matches_straight_through(tmp_path):
-    # (1) 通し実行 (中断なし) を基準にする。
+    # (1) Use a straight-through run (no interruption) as the baseline.
     full_path = tmp_path / "full.db"
     full_result, _ = _run_with_db_resumable(full_path, "full")
 
-    # (2) 中断: 3 step を永続化した直後に run_loop の外へ例外を投げて「クラッシュ」
-    #     させる (record_result には到達しないので run は running のまま残る)。
+    # (2) Interrupt: immediately after persisting 3 steps, raise an exception
+    #     out of run_loop to "crash" it (record_result is not reached, so the
+    #     run remains running).
     part_path = tmp_path / "part.db"
 
     class _Crash(RuntimeError):
@@ -76,28 +81,30 @@ def test_resume_after_crash_matches_straight_through(tmp_path):
     crash_db = DBProgressLog(part_path, "run")
 
     def crashing_observer(record, state):
-        crash_db.on_step(record, state)  # ここで commit 済みになる
-        if state.iteration == 3:  # 3 step 永続化後、4 step 目に入る前に落とす
+        crash_db.on_step(record, state)  # This commits the step.
+        if state.iteration == 3:  # Crash after persisting 3 steps, before step 4.
             raise _Crash()
 
     with pytest.raises(_Crash):
         run_loop(
             on_step=crashing_observer,
-            initial_state=crash_db.state,  # 新規 run なので空 = fresh start
+            initial_state=crash_db.state,  # New run, so empty = fresh start.
             **_fresh_run_args(),
         )
     crash_db.close()
 
-    # 中断時点では 3 step だけが SoT に残り、run は未終了 (running)。
+    # At the interruption point, only 3 steps remain in the SoT and the run is
+    # unfinished (running).
     probe = LoopStore(connect(part_path))
     assert len(probe.read_steps("run")) == 3
     assert probe.get_run("run")["status"] == "running"
     assert probe.get_stop_reason("run") is None
     probe.conn.close()
 
-    # (3) 再開: 別接続 (= 別プロセス相当) で開き直し、復元 state から継続する。
+    # (3) Resume: reopen with another connection (= equivalent to another
+    # process) and continue from the restored state.
     resume_db = DBProgressLog(part_path, "run")
-    assert resume_db.state.iteration == 3  # 永続化済み step から途中状態を復元
+    assert resume_db.state.iteration == 3  # Restore midpoint state from persisted steps.
     assert resume_db.state.tokens_used == 30
     assert [r.iteration for r in resume_db.state.history] == [0, 1, 2]
 
@@ -109,13 +116,13 @@ def test_resume_after_crash_matches_straight_through(tmp_path):
     resume_db.record_result(resumed_result)
     resume_db.close()
 
-    # --- 再開結果が通し実行と一致する ---
+    # --- Resumed result matches the straight-through run ---
     assert resumed_result.iterations == full_result.iterations == GOAL_AT
     assert resumed_result.tokens_used == full_result.tokens_used == GOAL_AT * 10
     assert resumed_result.succeeded is full_result.succeeded is True
     assert resumed_result.stop.name == full_result.stop.name == "goal_met"
 
-    # --- 永続化 SoT も step-for-step / 集計 / stop_reason まで一致する ---
+    # --- Persisted SoT also matches step-for-step, aggregates, and stop_reason ---
     full_store = LoopStore(connect(full_path))
     resume_store = LoopStore(connect(part_path))
     assert _step_projection(resume_store, "run") == _step_projection(full_store, "full")
@@ -135,8 +142,9 @@ def test_resume_after_crash_matches_straight_through(tmp_path):
 
 
 def test_resume_does_not_replay_already_persisted_steps(tmp_path):
-    # 再開は復元 state から *続き* を回すだけで、既永続化 step を再実行しない。
-    # よって step event は通し実行と同じ本数になる (replay でノイズが増えない)。
+    # Resume only runs the *continuation* from the restored state; it does not
+    # re-execute already persisted steps. Therefore the number of step events
+    # matches the straight-through run (no replay noise is added).
     full_path = tmp_path / "full.db"
     _run_with_db_resumable(full_path, "full")
     full_store = LoopStore(connect(full_path))
@@ -177,15 +185,18 @@ def test_resume_does_not_replay_already_persisted_steps(tmp_path):
     resumed_step_events = [
         e for e in resume_store.read_events("run") if e["kind"] == "loop_step"
     ]
-    # loop_begin は中断前の 1 件のみ (再開で再記録しない)、step event は通しと同数。
+    # loop_begin has only the one event from before interruption (resume does
+    # not record it again), and step events match the straight-through count.
     begins = [e for e in resume_store.read_events("run") if e["kind"] == "loop_begin"]
     assert len(begins) == 1
     assert len(resumed_step_events) == len(full_step_events) == GOAL_AT
 
 
 def test_resume_from_a_capped_then_extended_run(tmp_path):
-    # GoalMet を使わない素の cap 構成でも、復元 state から継続して通しと一致する。
-    # 1 回目は MaxIterations(2) で 2 step 永続化、再開時に cap を 5 へ広げて継続。
+    # Even a plain cap setup without GoalMet continues from the restored state
+    # and matches a straight-through run. The first run persists 2 steps with
+    # MaxIterations(2); on resume the cap is widened to 5 and execution
+    # continues.
     path = tmp_path / "state.db"
 
     db1 = DBProgressLog(path, "run")
@@ -221,10 +232,12 @@ def test_resume_from_a_capped_then_extended_run(tmp_path):
 
 
 def test_resumed_elapsed_through_db_drives_timeout_like_straight_through(tmp_path):
-    # elapsed が DB へ persist -> reconstruct -> clock 復帰 を経ても Timeout を正しく
-    # 駆動することを決定的に検証する (success 条件の「終了条件状態」のうち、DB 経由の
-    # elapsed 復元パスを明示的に押さえる)。再開 leg は新プロセス相当に fresh ManualClock
-    # (monotonic は再起動で 0 に戻る) を渡し、back-dating で総経過が継続することを確認。
+    # Deterministically verify that elapsed still drives Timeout correctly after
+    # persist -> reconstruct -> restore clock through the DB (explicitly
+    # covering the DB-backed elapsed restoration path for the success condition's
+    # "stop condition state"). The resume leg receives a fresh ManualClock,
+    # equivalent to a new process (monotonic resets to 0 on restart), confirming
+    # that back-dating preserves total elapsed time.
     def args(clock):
         return dict(
             act=stepping_for(clock, seconds=2.0),
@@ -233,13 +246,15 @@ def test_resumed_elapsed_through_db_drives_timeout_like_straight_through(tmp_pat
             time_fn=clock,
         )
 
-    # 通し実行: step=2.0s, Timeout=7.0 -> guard が 0,2,4,6,8 を見て 8 で発火 (4 step)。
+    # Straight-through run: step=2.0s, Timeout=7.0 -> the guard sees
+    # 0,2,4,6,8 and fires at 8 (4 steps).
     full = DBProgressLog(tmp_path / "full.db", "full")
     full_result = run_loop(initial_state=full.state, on_step=full.on_step, **args(ManualClock()))
     full.record_result(full_result)
     full.close()
 
-    # leg1: 1 step 永続化後にクラッシュ (elapsed=2.0 が run 集計へ確定)。
+    # leg1: crash after persisting 1 step (elapsed=2.0 is committed into the
+    # run aggregate).
     class _Crash(RuntimeError):
         pass
 
@@ -254,9 +269,10 @@ def test_resumed_elapsed_through_db_drives_timeout_like_straight_through(tmp_pat
         run_loop(on_step=crashing_observer, initial_state=db1.state, **args(ManualClock()))
     db1.close()
 
-    # leg2: 別プロセス相当 = fresh ManualClock(0)。復元 elapsed から継続する。
+    # leg2: equivalent to another process = fresh ManualClock(0). Continue from
+    # the restored elapsed value.
     db2 = DBProgressLog(tmp_path / "part.db", "run")
-    assert db2.state.elapsed == 2.0  # 1 step * 2.0s が DB から復元される
+    assert db2.state.elapsed == 2.0  # 1 step * 2.0s is restored from the DB.
     resumed = run_loop(on_step=db2.on_step, initial_state=db2.state, **args(ManualClock()))
     db2.record_result(resumed)
     db2.close()
@@ -267,9 +283,10 @@ def test_resumed_elapsed_through_db_drives_timeout_like_straight_through(tmp_pat
 
 
 def test_resume_at_cap_runs_zero_new_steps_via_db(tmp_path):
-    # 最終 step を永続化した直後 (record_result 前) にクラッシュした run を再開すると、
-    # 復元 seed が既に cap 到達済みなので新規 step を 1 つも回さず即終了する
-    # (guard-before-step 契約が DB 復元 seed でも成り立つ)。
+    # When resuming a run that crashed immediately after persisting the final
+    # step (before record_result), the restored seed has already reached the cap,
+    # so it exits immediately without running any new steps (the
+    # guard-before-step contract also holds for a DB-restored seed).
     path = tmp_path / "state.db"
 
     class _Crash(RuntimeError):
@@ -279,7 +296,7 @@ def test_resume_at_cap_runs_zero_new_steps_via_db(tmp_path):
 
     def crashing_observer(record, state):
         db1.on_step(record, state)
-        if state.iteration == 3:  # cap=3 に到達した直後に落とす
+        if state.iteration == 3:  # Crash immediately after reaching cap=3.
             raise _Crash()
 
     with pytest.raises(_Crash):
@@ -305,18 +322,19 @@ def test_resume_at_cap_runs_zero_new_steps_via_db(tmp_path):
     db2.record_result(result)
     db2.close()
 
-    assert new_steps == []  # 既に cap 到達 -> 新規 step なし
+    assert new_steps == []  # Already reached the cap -> no new steps.
     assert result.iterations == 3
     assert result.tokens_used == 30
     assert result.stop.name == "max_iterations"
     store = LoopStore(connect(path))
-    assert len(store.read_steps("run")) == 3  # 永続化も 3 step のまま
+    assert len(store.read_steps("run")) == 3  # Persistence also remains at 3 steps.
 
 
 def test_resume_roundtrips_history_observations_through_json(tmp_path):
-    # 既知の限界を pin する: state.db から復元した history の observation は保存時の JSON を
-    # round-trip した値になる (tuple -> list)。raw observation を直接キーにする条件は
-    # この型ドリフトに注意が必要 (run_loop の initial_state docstring / README 参照)。
+    # Pin a known limitation: history observations restored from state.db become
+    # the JSON round-tripped value from storage (tuple -> list). Conditions that
+    # use raw observations directly as keys need to account for this type drift
+    # (see run_loop's initial_state docstring / README).
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("run")
     store.record_step("run", StepRecord(0, ("a", "b"), 0, False), LoopState(iteration=1))
@@ -327,11 +345,14 @@ def test_resume_roundtrips_history_observations_through_json(tmp_path):
 
 
 def test_resume_noprogress_with_json_stable_key_matches_straight_through(tmp_path):
-    # 限界の緩和策を実証: observation を直接キーにすると tuple->list ドリフトで再開が
-    # 壊れる (list は unhashable) が、JSON 安定な signature へ射影する key を NoProgress に
-    # 渡せば、tuple observation でも再開が通し実行 (no_progress) と一致する。
+    # Demonstrate a mitigation for the limitation: if observations are used
+    # directly as keys, tuple->list drift breaks resume (lists are unhashable).
+    # But if NoProgress receives a key that projects to a JSON-stable signature,
+    # resume matches the straight-through run (no_progress) even with tuple
+    # observations.
     def _key(record):
-        # tuple も list も同じ JSON 配列になるので、再開境界の型ドリフトを吸収する。
+        # Both tuple and list become the same JSON array, absorbing type drift
+        # across the resume boundary.
         return json.dumps(record.observation, sort_keys=True, default=repr)
 
     def args():
@@ -341,7 +362,8 @@ def test_resume_noprogress_with_json_stable_key_matches_straight_through(tmp_pat
             conditions=[NoProgress(window=3, repeat=3, key=_key), MaxIterations(100)],
         )
 
-    # 通し実行: 同一 observation の反復 -> iteration 3 で no_progress 発火。
+    # Straight-through run: repeated identical observations -> no_progress fires
+    # at iteration 3.
     full = DBProgressLog(tmp_path / "full.db", "full")
     full_result = run_loop(initial_state=full.state, on_step=full.on_step, **args())
     full.record_result(full_result)
@@ -349,7 +371,8 @@ def test_resume_noprogress_with_json_stable_key_matches_straight_through(tmp_pat
     assert full_result.stop.name == "no_progress"
     assert full_result.iterations == 3
 
-    # 2 step 永続化後にクラッシュ -> 復元して継続。key が型ドリフトを吸収し一致する。
+    # Crash after persisting 2 steps -> restore and continue. The key absorbs
+    # type drift, so the result matches.
     class _Crash(RuntimeError):
         pass
 
@@ -374,16 +397,19 @@ def test_resume_noprogress_with_json_stable_key_matches_straight_through(tmp_pat
 
 
 def test_resume_of_verify_hook_completed_run_returns_goal_met_without_new_steps(tmp_path):
-    # verify フックで goal 達成した最終 step が永続化された直後 (record_result 前) に
-    # クラッシュした run を再開すると、復元 state.goal_met=True を尊重し、新規 step を
-    # 1 つも回さず自然終了 (status=goal_met) を再現する。これがないと完了済み run の
-    # 再開が余計な act を回し、通し実行と結果が乖離する (Codex review P2)。
+    # When resuming a run that crashed immediately after the final step that
+    # reached the goal via the verify hook was persisted (before record_result),
+    # the restored state.goal_met=True is respected and natural completion
+    # (status=goal_met) is reproduced without running any new steps. Without
+    # this, resuming an already completed run would run an extra act and diverge
+    # from the straight-through result (Codex review P2).
     path = tmp_path / "state.db"
 
     class _Crash(RuntimeError):
         pass
 
-    # leg1 の verify: 3 回目で goal 達成 (resume では再評価されない)。
+    # leg1 verify: the goal is reached on the 3rd call (not re-evaluated on
+    # resume).
     calls = {"n": 0}
 
     def verify_done_at_3(_outcome):
@@ -395,7 +421,7 @@ def test_resume_of_verify_hook_completed_run_returns_goal_met_without_new_steps(
 
     def crashing_observer(record, state):
         db1.on_step(record, state)
-        if state.goal_met:  # goal 達成 step を永続化した直後に落とす
+        if state.goal_met:  # Crash immediately after persisting the goal-met step.
             raise _Crash()
 
     with pytest.raises(_Crash):
@@ -430,7 +456,7 @@ def test_resume_of_verify_hook_completed_run_returns_goal_met_without_new_steps(
     db2.record_result(result)
     db2.close()
 
-    assert new_steps == []  # 完了済み -> 新規 step なし
+    assert new_steps == []  # Already complete -> no new steps.
     assert result.status == "goal_met"
     assert result.goal_met is True
     assert result.stop is None
@@ -439,7 +465,7 @@ def test_resume_of_verify_hook_completed_run_returns_goal_met_without_new_steps(
 
 
 def _run_with_db_resumable(path, run_id):
-    """通し実行 (中断なし) を resume と同じ配線 (initial_state=db.state) で回す。"""
+    """Run straight through (no interruption) with resume-style wiring."""
     db = DBProgressLog(path, run_id)
     result = run_loop(
         initial_state=db.state, on_step=db.on_step, **_fresh_run_args()

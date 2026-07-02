@@ -1,4 +1,4 @@
-"""episodic memory + 取込前検証の単体テスト (Issue #22 安全不変条件: 肥大化抑止 / 注入拒否)。"""
+"""Unit tests for episodic memory and pre-admission validation (Issue #22 safety invariants: growth bounds / injection rejection)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from loop_agent.state import StepRecord
 
 @dataclass
 class _Outcome:
-    """``.history`` だけ持つ最小の outcome スタンド (default_admit の duck typing 用)。"""
+    """Minimal outcome stand-in with only ``.history`` for default_admit duck typing."""
 
     history: tuple[StepRecord, ...]
 
@@ -31,7 +31,7 @@ def _admit_ok(text: str = "x", episode: int = 0, support: float = 1.0) -> Lesson
     return LessonVerdict(admit=True)
 
 
-# -- default_admit: 構造的取込前検証 (LLM 非依存) ---------------------------------
+# -- default_admit: structural pre-admission validation (LLM-independent) ---------
 
 
 def test_default_admit_accepts_grounded_lesson():
@@ -43,7 +43,7 @@ def test_default_admit_accepts_grounded_lesson():
 
 
 def test_default_admit_rejects_ungrounded_provenance():
-    """注入 lesson: 実 step に紐づかない provenance は弾く (false lesson 注入防止)。"""
+    """Injection lesson: reject provenance not tied to a real step to prevent false lesson injection."""
     outcome = _Outcome(history=(_step(0),))
     lesson = Lesson(text="evil", episode=0, provenance="step-99-deadbeef", support=1.0)
     verdict = default_admit(lesson, outcome)
@@ -59,7 +59,7 @@ def test_default_admit_rejects_empty_text():
 
 
 def test_default_admit_rejects_insufficient_support():
-    """support が再計算で 0 (ungrounded 相当) の lesson は弾く。"""
+    """Reject lessons whose recomputed support is 0, equivalent to ungrounded lessons."""
     step = _step(0)
     outcome = _Outcome(history=(step,))
     lesson = Lesson(text="ok", episode=0, provenance=step_signature(step), support=0.0)
@@ -67,14 +67,14 @@ def test_default_admit_rejects_insufficient_support():
 
 
 def test_step_signature_is_content_sensitive():
-    """署名は内容ベース: iteration が同じでも内容が違えば別署名 (詐称耐性)。"""
+    """Signatures are content-based: the same iteration with different content gets a different signature for spoofing resistance."""
     a = step_signature(_step(0, obs="a", detail="x"))
     b = step_signature(_step(0, obs="b", detail="y"))
     assert a != b
 
 
 def test_default_admit_is_structural_and_deterministic():
-    """default_admit は純構造判定: 同入力で同結果、外部 model に依存しない。"""
+    """default_admit is purely structural: identical input yields identical output and does not depend on an external model."""
     step = _step(0)
     outcome = _Outcome(history=(step,))
     lesson = Lesson(text="t", episode=0, provenance=step_signature(step), support=1.0)
@@ -83,7 +83,7 @@ def test_default_admit_is_structural_and_deterministic():
     assert first == second
 
 
-# -- EpisodicMemory: 肥大化抑止 (反復上限) --------------------------------------
+# -- EpisodicMemory: growth bounds (iteration cap) -------------------------------
 
 
 def test_memory_cap_keeps_at_most_cap_lessons():
@@ -120,17 +120,17 @@ def test_render_is_bounded_by_byte_cap():
 
 
 def test_render_byte_cap_bounds_utf8_bytes_for_non_ascii():
-    """非 ASCII (日本語) でも文字数でなく実 UTF-8 バイト数で有界 (P3 fix)。"""
+    """Even non-ASCII text is bounded by actual UTF-8 bytes, not character count (P3 fix)."""
     mem = EpisodicMemory(cap=50, per_lesson_chars=200, render_byte_cap=120)
     for i in range(50):
         mem.admit(
-            Lesson(text=f"日本語の教訓 {i} " + "あ" * 80, episode=i,
+            Lesson(text=f"cafe lesson {i} " + "é" * 80, episode=i,
                    provenance=f"p{i}", support=1.0),
             LessonVerdict(admit=True),
         )
     rendered = mem.render()
     assert len(rendered.encode("utf-8")) <= 120
-    # 丸めた結果も妥当な UTF-8 (壊れた multibyte が残らない)。
+    # The truncated result is still valid UTF-8 with no broken multibyte characters.
     rendered.encode("utf-8").decode("utf-8")
 
 
@@ -141,15 +141,15 @@ def test_render_empty_when_no_lessons():
 def test_duplicate_lesson_text_not_stored_twice():
     mem = EpisodicMemory(cap=5)
     assert mem.admit(Lesson("same lesson", 0, "p0", 1.0), LessonVerdict(admit=True)) is True
-    # 正規化テキストが一致する重複は弾く (whitespace / case 無視)。
+    # Reject duplicates whose normalized text matches, ignoring whitespace and case.
     assert mem.admit(Lesson("Same   Lesson", 1, "p1", 1.0), LessonVerdict(admit=True)) is False
     assert len(mem) == 1
 
 
 def test_dedup_applies_after_truncation():
-    """切り詰め後に同一になる lesson は二重保存しない (dedup は格納テキストで判定)。"""
+    """Lessons that become identical after truncation are not stored twice; dedup uses stored text."""
     mem = EpisodicMemory(cap=5, per_lesson_chars=8)
-    # 先頭 8 文字 "COMMON: " が同一、以降だけ違う 2 つ。
+    # The first 8 characters, "COMMON: ", are identical; only the suffixes differ.
     assert mem.admit(Lesson("COMMON: alpha", 0, "p0", 1.0), LessonVerdict(admit=True)) is True
     assert mem.admit(Lesson("COMMON: beta", 1, "p1", 1.0), LessonVerdict(admit=True)) is False
     assert len(mem) == 1
@@ -163,11 +163,11 @@ def test_rejected_verdict_not_stored():
     assert len(mem) == 0
 
 
-# -- 決定的・価値考慮の eviction ------------------------------------------------
+# -- Deterministic, value-aware eviction -----------------------------------------
 
 
 def test_high_support_lesson_survives_marginal_flood():
-    """高 support の load-bearing lesson を、低 support の周辺 lesson で押し出さない。"""
+    """Do not evict a high-support load-bearing lesson with low-support marginal lessons."""
     mem = EpisodicMemory(cap=2)
     mem.admit(Lesson("load bearing fix", 0, "p0", support=1.0), LessonVerdict(admit=True))
     for i in range(1, 6):
@@ -181,7 +181,7 @@ def test_high_support_lesson_survives_marginal_flood():
 
 
 def test_eviction_is_deterministic():
-    """同じ admit 列なら eviction 結果は決定的 (support, episode, 挿入順)。"""
+    """Given the same admit sequence, eviction is deterministic by support, episode, and insertion order."""
     def build():
         m = EpisodicMemory(cap=2)
         m.admit(Lesson("a", 0, "pa", support=0.5), LessonVerdict(admit=True))
@@ -190,8 +190,8 @@ def test_eviction_is_deterministic():
         return [l.text for l in m.lessons()]
 
     assert build() == build()
-    # support 最小 (c=0.1) と... a=0.5 が残り b=0.9。c は最小なので即 evict されない:
-    # 3 件目 admit 後 cap=2 超過 -> support 最小 (c=0.1) を捨てる。
+    # Lowest support is c=0.1; a=0.5 and b=0.9 remain.
+    # After the third admit, cap=2 is exceeded, so the lowest-support lesson c=0.1 is evicted.
     assert set(build()) == {"a", "b"}
 
 

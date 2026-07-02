@@ -1,43 +1,27 @@
-# 外側 Reflexion ループ + RQGM epoch 安全核
+# Outer Reflexion Loop + RQGM Epoch Safety Core
 
-内側 ReAct ループ (`run_loop`) の **外** に Reflexion 型の試行間ループを重ね、失敗からの言語的指針を episodic memory に取り込んで次 episode の context へ配線する self-improving の仕組み。安全核は「二信号モデル」と「epoch 昇格ゲート」。
+A self-improving mechanism that layers a Reflexion-style inter-attempt loop **outside** the inner ReAct loop (`run_loop`), incorporates linguistic guidance from failures into episodic memory, and wires that memory into the next episode's context. The safety core is the "two-signal model" and the "epoch promotion gate."
 
-本格（report.md §4.4 / §5 Phase 3 / §6 / Issue #22・#4 の RQGM コメント）では、内側 ReAct
-ループの**外**に Reflexion 型の試行間ループを重ねる。`run_reflexion(...)` は内側 `run_loop`
-を **1 episode** として呼び（driver は内側に手を入れない）、episode 境界で
-`reflect(trajectory, signal, reward)` を回して**言語的指針（lesson）**を episodic memory に
-取り込み、次 episode の context へ配線する。失敗トラジェクトリからの学びが次ループで eval
-改善につながることを実証する（成功条件 a）。
+In the full design (report.md §4.4 / §5 Phase 3 / §6 / RQGM comments in Issues #22 and #4), a Reflexion-style inter-attempt loop is layered **outside** the inner ReAct loop. `run_reflexion(...)` calls the inner `run_loop` as **one episode** (the driver does not modify the inner loop), runs `reflect(trajectory, signal, reward)` at episode boundaries, incorporates the resulting **linguistic guidance (lesson)** into episodic memory, and wires it into the next episode's context. This demonstrates that learning from failed trajectories improves evaluation in the next loop (success condition a).
 
-## 二信号モデル（signal vs reward・設計の肝・安全核）
+## Two-Signal Model (signal vs reward, Key Design Point, Safety Core)
 
-各 episode は 2 つの異なる信号を生む。
+Each episode produces two distinct signals.
 
-- `signal`（**ground-truth 一次**）: 内側 verify（test/lint/exit-code）と `LoopResult.succeeded`
-  に由来し driver が計算する。収束/頭打ち/best/評価器昇格/lesson 採用 ― **帰結ある制御は
-  すべてこれが駆動**する（評価器の入れ替えに依存しないスケール）。
-- `reward`（**epoch 内で固定**した rubric 評価器の出力）: Reflexion の verbal reinforcement
-  として **`reflect` だけが消費**する。収束/採用判定には一切載らない。
+- `signal` (**ground-truth first**): computed by the driver from inner verification (test/lint/exit-code) and `LoopResult.succeeded`.
+  Every consequential control decision is driven by this signal: convergence, plateau detection, best selection, evaluator promotion, and lesson admission. This gives the control path a scale that does not depend on swapping evaluators.
+- `reward` (the output of the rubric evaluator, **fixed within an epoch**): consumed **only by `reflect`** as verbal reinforcement for Reflexion. It is never used for convergence or admission decisions.
 
-これにより「gameable な評価器スカラを押し上げて収束を宣言する」抜け道が**構造的に**塞がれる。
+This structurally closes the escape hatch of "raising a gameable evaluator scalar and declaring convergence."
 
-## 安全不変条件
+## Safety Invariants
 
-安全不変条件（report.md §6 + RQGM。コメントでなく `tests/test_reflexion.py` 等で実証）:
+Safety invariants (report.md §6 + RQGM; demonstrated in tests such as `tests/test_reflexion.py`, not just comments):
 
-- **評価器を固定して self-optimize させない**: epoch 構造で epoch 内は評価基準を凍結し、
-  評価器の更新は **epoch 境界でのみ**。更新は held-out の**固定 gold ラベル**に対する一致度で
-  incumbent を ε 超で上回り、かつどの fold/critical probe でも後退しないときに限る
-  （ε-best-belief + dominance。`admit_evaluator`）。`epoch_len>=2` / `epsilon>0` を構成時に強制。
-- **ground-truth 一次**（test/lint/exit-code）、judge は rubric + 限定（`Score` は多様軸の
-  最小値で集約し、欠落軸は 0.0・judge は集約から除外）。
-- **早期停止**（`ScorePlateau` の best-so-far トレンドで頭打ちを打ち切り）/ **多様評価** /
-  **dual-component 分離**（測定経路は事前収録 probe を採点するだけで production の act/gate に
-  触れない。task 名前空間の素性を構成時に検証）/ **memory 取込前検証**（`default_admit` の
-  構造的ゲートで grounding を要求し、support は driver が再計算して上書き ＝ 自己申告を信用
-  しない。false lesson 注入を弾く）。
-- **反省の肥大化・劣化を反復上限で防ぐ**（`EpisodicMemory` の件数/文字/描画バイト上限 +
-  `ReflectionBudget` / `MaxEpisodes`）。
+- **Do not let the system self-optimize against a fixed evaluator**: the epoch structure freezes the evaluation criteria within an epoch, and evaluator updates happen **only at epoch boundaries**. An update is allowed only when it beats the incumbent by more than ε on agreement with **fixed held-out gold labels** and does not regress on any fold or critical probe (ε-best-belief + dominance; `admit_evaluator`). `epoch_len>=2` and `epsilon>0` are enforced at construction time.
+- **Ground truth comes first** (test/lint/exit-code); the judge is rubric-based and limited (`Score` aggregates with the minimum over diverse axes, missing axes are 0.0, and the judge is excluded from aggregation).
+- **Early stopping** (stop on plateau via the best-so-far trend in `ScorePlateau`) / **diverse evaluation** / **dual-component separation** (the measurement path only scores pre-recorded probes and does not touch production act/gate paths; task-namespace features are validated at construction time) / **pre-admission memory validation** (`default_admit` requires grounding through a structural gate, and support is recomputed and overwritten by the driver, so self-reported support is not trusted; false lesson injection is rejected).
+- **Prevent reflection bloat and degradation with iteration limits** (item/character/rendered-byte caps in `EpisodicMemory` + `ReflectionBudget` / `MaxEpisodes`).
 
 ```python
 from loop_agent import (
@@ -47,18 +31,18 @@ from loop_agent import (
 )
 from loop_agent.memory import step_signature
 
-def episode(ctx):                                    # 1 episode = 内側 run_loop を 1 回
+def episode(ctx):                                    # 1 episode = one inner run_loop call
     has_lesson = "increment by 1" in ctx.memory_block
     act = lambda _c: ActOutcome(observation="fixed" if has_lesson else "bug", tokens=5)
     verify = lambda o: VerifyOutcome(goal_met="fixed" in o.observation)
     return run_loop(act=act, verify=verify, conditions=[MaxIterations(2)])
 
-def ground_truth(o):                                 # 一次信号は内側 verify 由来（評価器ではない）
+def ground_truth(o):                                 # Primary signal comes from inner verify, not the evaluator
     v = 0.95 if o.succeeded else 0.2
     return GroundTruthSignal(succeeded=o.succeeded,
                              score=Score(ground_truth=v, components={"correctness": v}))
 
-def reflect(history, signal, reward):                # 失敗から grounded な lesson を抽出
+def reflect(history, signal, reward):                # Extract a grounded lesson from failure
     if signal.succeeded: return None
     return Lesson(text="increment by 1", episode=0,
                   provenance=step_signature(history[-1]), support=1.0)
@@ -73,66 +57,47 @@ result = run_reflexion(
     held_out=HeldOut((Probe("h0", {"truth": 0.0}, 0.0), Probe("h1", {"truth": 1.0}, 1.0))),
     epoch_len=2,
 )
-# ep0 は memory 空で fail(0.20) → 学びを取込 → ep1 は配線された指針で pass(0.95)
+# ep0 fails with empty memory (0.20) -> learns a lesson -> ep1 passes with wired-in guidance (0.95)
 # result.succeeded is True / result.best_score == 0.95
 ```
 
-## 外側 Reflexion の永続化/resume（epoch・lesson テーブル + 評価器 version registry）
+## Outer Reflexion Persistence/Resume (epoch and lesson tables + evaluator version registry)
 
-外側ループの**学習状態**（epoch 進行・episodic memory の lesson・各 epoch で固定された評価器の
-version）を state.db に永続化し、**再起動後も学習の続きから resume** する（Issue #29）。内側
-resume（`LoopStore.load_or_init` / #14）と store lease（#21）を土台に、外側専用の 4 表
-（`reflexion_run` / `reflexion_episode` / `reflexion_lesson` / `reflexion_evaluator`）を**内側
-スキーマと独立・additive**（`IF NOT EXISTS`）に追加する。
+The outer loop's **learning state** (epoch progress, episodic-memory lessons, and the evaluator version fixed for each epoch) is persisted to state.db, allowing learning to **resume from where it left off after a restart** (Issue #29). Building on inner resume (`LoopStore.load_or_init` / #14) and store leases (#21), four outer-loop-specific tables (`reflexion_run` / `reflexion_episode` / `reflexion_lesson` / `reflexion_evaluator`) are added **independently from and additively to** the inner schema (`IF NOT EXISTS`).
 
-- **settled state を SoT に**: `run_reflexion(..., persist=log.on_episode)` の `persist` フックは
-  各 episode が**完全に確定した後**（epoch 昇格・評価器入れ替えを含む境界処理の*後*）に発火する。
-  `DBReflexionLog` がそれを受けて「episode 行 + memory の全 lesson + reflexion_run スカラ + 評価器
-  version 登録」を**1 トランザクション**に束ねて書く。中断地点から resume すると **通し実行と一致**
-  する（episode 数 / epoch / 採用 lesson / 評価器 version / best ground-truth）。
-- **評価器 version registry + fail-loud**: 各 epoch で固定された評価器の version を
-  `reflexion_evaluator` に追記（audit）、現行 version を `reflexion_run` が持つ。resume 時に復元
-  `evaluator_version` と渡された `evaluator.version` が食い違えば `run_reflexion` が**loud に弾く**
-  （callable は直列化できないので別評価器に silently 差し替えない。PR #28 の安全核を継ぐ）。
-  `declared_keys` も同様に整合を要求する（stale な集約での誤収束を防ぐ）。
-- **memory 容量ポリシーも往復**: `cap` / `per_lesson_chars` / `render_byte_cap` を保存し、復元時に
-  同じ上限の `EpisodicMemory` を組み直すので eviction 挙動が resume をまたいで一致する。`paused`
-  episode は未確定なので persist しない（resume で同じ episode を再実行できる）。
+- **Use settled state as the SoT**: the `persist` hook in `run_reflexion(..., persist=log.on_episode)` fires **only after each episode is fully settled** (after boundary processing, including epoch promotion and evaluator replacement). `DBReflexionLog` receives that state and writes the episode row, all lessons in memory, `reflexion_run` scalars, and evaluator version registration in **one transaction**. Resuming from an interruption matches an uninterrupted run (episode count / epoch / admitted lessons / evaluator version / best ground truth).
+- **Evaluator version registry + fail-loud behavior**: the evaluator version fixed for each epoch is appended to `reflexion_evaluator` (audit), and `reflexion_run` stores the current version. On resume, if the restored `evaluator_version` differs from the supplied `evaluator.version`, `run_reflexion` **fails loudly** (callables cannot be serialized, so it does not silently swap in a different evaluator; this carries forward the safety core from PR #28). `declared_keys` must also match, preventing false convergence under stale aggregation.
+- **Memory capacity policy round-trips too**: `cap` / `per_lesson_chars` / `render_byte_cap` are saved, and resume reconstructs an `EpisodicMemory` with the same limits, so eviction behavior is consistent across resume. A `paused` episode is not settled, so it is not persisted (resume can rerun the same episode).
 
 ```python
 from loop_agent import DBReflexionLog, run_reflexion, MaxEpisodes
 
-# 第 1 プロセス: 3 episode 走って中断（接続を閉じる = プロセス終了相当）
-log = DBReflexionLog("outer.db", "run-1")          # 新規なら空・既存なら復元した途中状態
+# First process: run 3 episodes, then interrupt (closing the connection is equivalent to process exit)
+log = DBReflexionLog("outer.db", "run-1")          # Empty if new; restored partial state if existing
 result = run_reflexion(
     episode=episode, ground_truth=ground_truth, reflect=reflect, evaluator=evaluator,
     convergence=[MaxEpisodes(3)], declared_keys=("correctness",),
     production_tasks=["fix"], held_out=held_out,
-    initial_state=log.state, memory=log.memory, persist=log.on_episode,   # ← 永続化配線
+    initial_state=log.state, memory=log.memory, persist=log.on_episode,   # Persistence wiring
 )
 log.record_result(result); log.close()
 
-# 第 2 プロセス: 同じ DB を開き直して resume（epoch・採用 lesson・評価器 version ごと継続）
-log2 = DBReflexionLog("outer.db", "run-1")          # state.db から学習状態を復元
+# Second process: reopen the same DB and resume, preserving epoch, admitted lessons, and evaluator version
+log2 = DBReflexionLog("outer.db", "run-1")          # Restore learning state from state.db
 result2 = run_reflexion(
     episode=episode, ground_truth=ground_truth, reflect=reflect, evaluator=evaluator,
     convergence=[MaxEpisodes(6)], declared_keys=("correctness",),
     production_tasks=["fix"], held_out=held_out,
     initial_state=log2.state, memory=log2.memory, persist=log2.on_episode,
 )
-# result2 は通し MaxEpisodes(6) と episode 数/epoch/採用 lesson/評価器 version/best が一致する
+# result2 matches an uninterrupted MaxEpisodes(6) run in episode count, epoch, admitted lessons, evaluator version, and best
 ```
 
-**スコープ境界**: 単一プロセスの self-improving に集中する（分散協調は Issue #21）。外側
-ループの**永続化/resume**（epoch・lesson テーブル + 評価器 version registry）は **state.db へ
-実装済み（Issue #29。`ReflexionStore` / `DBReflexionLog`）**。外側ループの **OTel 観測** も
-[observability.md](./observability.md)（Issue #30。`run_observed_reflexion`）で接続済み。残る追跡
-follow-up は観測の dashboard 化（安全核 = 二信号モデル / epoch 昇格ゲート / 取込前検証には
-踏み込まない）。
+**Scope boundary**: focus on single-process self-improvement (distributed coordination is Issue #21). Outer-loop **persistence/resume** (epoch and lesson tables + evaluator version registry) has been **implemented in state.db (Issue #29; `ReflexionStore` / `DBReflexionLog`)**. Outer-loop **OTel observation** is also connected in [observability.md](./observability.md) (Issue #30; `run_observed_reflexion`). The remaining follow-up is dashboarding for observation (without touching the safety core: the two-signal model / epoch promotion gate / pre-admission validation).
 
-## 関連
+## Related
 
-- [README](../README.md) — 全体の入口と動線サマリ
-- [reflexion-when-to-use.md](./reflexion-when-to-use.md) — Reflexion を使うべきか・blind retry で足りるかの判断
-- [observability.md](./observability.md) — 外側 Reflexion 観測（`run_observed_reflexion`）
-- [seams.md](./seams.md) — act / verify などのシーム詳細
+- [README](../README.md) — Overall entry point and navigation summary
+- [reflexion-when-to-use.md](./reflexion-when-to-use.md) — How to decide whether to use Reflexion or whether blind retry is sufficient
+- [observability.md](./observability.md) — Outer Reflexion observation (`run_observed_reflexion`)
+- [seams.md](./seams.md) — Details of seams such as act / verify

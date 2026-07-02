@@ -94,10 +94,12 @@ MAX_OBSERVATION_CHARS = 2000
 FOLLOW_POLL_SECONDS = 0.5
 
 
-# ``ConfigError`` の正準定義は loop_agent.errors にある (Issue #43)。CLI の TOML /
-# 引数パースの設定エラーもこれを使い、:func:`main` が捕捉して stderr に出力し非ゼロ
-# 終了する (想定外の内部エラーは traceback ごと伝播させる)。後方互換のため
-# ``from loop_agent.cli import ConfigError`` は引き続き有効 (上の import で再公開)。
+# The canonical ``ConfigError`` definition lives in loop_agent.errors (Issue #43).
+# CLI TOML / argument-parsing configuration errors use it too, so :func:`main`
+# catches them, prints to stderr, and exits non-zero (unexpected internal errors
+# still propagate with their tracebacks). For backward compatibility,
+# ``from loop_agent.cli import ConfigError`` remains valid (re-exported by the
+# import above).
 
 # -- TOML config -------------------------------------------------------------
 
@@ -1009,7 +1011,19 @@ The agent is limited to reversible file editing. Commit, push, and deploy stay
 outside the loop unless you model them as gated discrete actions.
 """
 
-from loop_agent import MaxIterations, PytestVerifier, Timeout, TokenBudget, run_loop
+import json
+import time
+
+from loop_agent import (
+    DBProgressLog,
+    MaxIterations,
+    NoProgress,
+    PytestVerifier,
+    ReviewOutcome,
+    Timeout,
+    TokenBudget,
+    run_loop,
+)
 from loop_agent.adapters import ClaudeCodeAct
 
 
@@ -1022,6 +1036,10 @@ Rules:
 - Stop after one coherent attempt; verify will run separately.
 """
 
+RUN_ID = "claude-harness"
+DB_PATH = "loop-state.db"
+EVENTS_PATH = "loop-events.jsonl"
+
 act = ClaudeCodeAct(
     allowed_tools=["Read", "Edit"],
     model="sonnet",
@@ -1030,13 +1048,56 @@ act = ClaudeCodeAct(
 verify = PytestVerifier(["tests", "-q"], timeout=120)
 
 
+def gather(state):
+    feedback = state.history[-1].detail if state.history else ""
+    return {
+        "prompt": (
+            f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}\\n"
+            f"Prior review/verify feedback:\\n{feedback}\\n"
+        )
+    }
+
+
+def review(outcome):
+    if getattr(outcome.observation, "failed", False):
+        return ReviewOutcome(
+            approved=False,
+            feedback=f"act failed: {getattr(outcome.observation, 'error', '')}",
+            severity="blocking",
+        )
+    # Replace this with a real artifact review for long-running LLM tasks.
+    return ReviewOutcome(approved=True, feedback="review not configured")
+
+
 if __name__ == "__main__":
-    result = run_loop(
-        gather=lambda state: {"prompt": f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}"},
-        act=act,
-        verify=verify,
-        conditions=[MaxIterations(10), Timeout(1800), TokenBudget(500_000)],
-    )
+    with DBProgressLog(DB_PATH, RUN_ID) as progress:
+        def on_step(record, state):
+            progress.on_step(record, state)
+            with open(EVENTS_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "kind": "loop_step",
+                    "run_id": RUN_ID,
+                    "iteration": record.iteration,
+                    "detail": record.detail,
+                    "tokens_used": state.tokens_used,
+                    "time": time.time(),
+                }) + "\\n")
+
+        result = run_loop(
+            gather=gather,
+            act=act,
+            review=review,
+            verify=verify,
+            on_step=on_step,
+            initial_state=progress.state,
+            conditions=[
+                MaxIterations(10),
+                Timeout(1800),
+                TokenBudget(500_000),
+                NoProgress(window=3, repeat=3, key=lambda record: record.detail),
+            ],
+        )
+        progress.record_result(result)
     print(result.status, result.reason)
 '''
 
@@ -1048,7 +1109,19 @@ closed by the adapter. Keep irreversible operations outside the loop unless you
 model them as gated discrete actions.
 """
 
-from loop_agent import MaxIterations, PytestVerifier, Timeout, TokenBudget, run_loop
+import json
+import time
+
+from loop_agent import (
+    DBProgressLog,
+    MaxIterations,
+    NoProgress,
+    PytestVerifier,
+    ReviewOutcome,
+    Timeout,
+    TokenBudget,
+    run_loop,
+)
 from loop_agent.adapters import CodexAct
 
 
@@ -1061,6 +1134,10 @@ Rules:
 - Stop after one coherent attempt; verify will run separately.
 """
 
+RUN_ID = "codex-harness"
+DB_PATH = "loop-state.db"
+EVENTS_PATH = "loop-events.jsonl"
+
 act = CodexAct(
     model="gpt-5.5",
     effort="medium",
@@ -1070,13 +1147,56 @@ act = CodexAct(
 verify = PytestVerifier(["tests", "-q"], timeout=120)
 
 
+def gather(state):
+    feedback = state.history[-1].detail if state.history else ""
+    return {
+        "prompt": (
+            f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}\\n"
+            f"Prior review/verify feedback:\\n{feedback}\\n"
+        )
+    }
+
+
+def review(outcome):
+    if getattr(outcome.observation, "failed", False):
+        return ReviewOutcome(
+            approved=False,
+            feedback=f"act failed: {getattr(outcome.observation, 'error', '')}",
+            severity="blocking",
+        )
+    # Replace this with a real artifact review for long-running LLM tasks.
+    return ReviewOutcome(approved=True, feedback="review not configured")
+
+
 if __name__ == "__main__":
-    result = run_loop(
-        gather=lambda state: {"prompt": f"{TASK_PROMPT}\\n\\nIteration: {state.iteration}"},
-        act=act,
-        verify=verify,
-        conditions=[MaxIterations(10), Timeout(1800), TokenBudget(500_000)],
-    )
+    with DBProgressLog(DB_PATH, RUN_ID) as progress:
+        def on_step(record, state):
+            progress.on_step(record, state)
+            with open(EVENTS_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "kind": "loop_step",
+                    "run_id": RUN_ID,
+                    "iteration": record.iteration,
+                    "detail": record.detail,
+                    "tokens_used": state.tokens_used,
+                    "time": time.time(),
+                }) + "\\n")
+
+        result = run_loop(
+            gather=gather,
+            act=act,
+            review=review,
+            verify=verify,
+            on_step=on_step,
+            initial_state=progress.state,
+            conditions=[
+                MaxIterations(10),
+                Timeout(1800),
+                TokenBudget(500_000),
+                NoProgress(window=3, repeat=3, key=lambda record: record.detail),
+            ],
+        )
+        progress.record_result(result)
     print(result.status, result.reason)
 '''
 
@@ -1109,6 +1229,18 @@ Before running:
 2. Narrow `verify = PytestVerifier([...])` to the real oracle for the task.
 3. Keep `allowed_tools=["Read", "Edit"]` unless you intentionally model an
    irreversible action as a gated loop action.
+4. Replace the `review` stub for unattended or broad edits. Blocking review
+   feedback is persisted and fed into the next iteration.
+
+The generated harness writes resumable state to `loop-state.db` and line-delimited
+progress events to `loop-events.jsonl`. If the same review or verifier failure
+repeats, `NoProgress` stops the inner loop; wrap the harness in Reflexion only
+when a reusable lesson can improve the next run.
+
+Reflexion is intentionally left out of this starter file. First make the inner
+loop observable and verifiable; then add Reflexion when repeated failures show
+that a stored lesson would help. Starting with Reflexion too early can preserve
+noise from an unfinished prompt, verifier, or review policy.
 
 Run:
 
@@ -1129,6 +1261,18 @@ Before running:
 2. Narrow `verify = PytestVerifier([...])` to the real oracle for the task.
 3. Keep irreversible actions outside the loop unless they are explicit gated
    actions.
+4. Replace the `review` stub for unattended or broad edits. Blocking review
+   feedback is persisted and fed into the next iteration.
+
+The generated harness writes resumable state to `loop-state.db` and line-delimited
+progress events to `loop-events.jsonl`. If the same review or verifier failure
+repeats, `NoProgress` stops the inner loop; wrap the harness in Reflexion only
+when a reusable lesson can improve the next run.
+
+Reflexion is intentionally left out of this starter file. First make the inner
+loop observable and verifiable; then add Reflexion when repeated failures show
+that a stored lesson would help. Starting with Reflexion too early can preserve
+noise from an unfinished prompt, verifier, or review policy.
 
 Run:
 

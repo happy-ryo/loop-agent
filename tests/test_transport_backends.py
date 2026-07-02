@@ -1,9 +1,11 @@
-"""クロスプロセス WakeQueue backend の検証 (Issue #41)。
+"""Verify cross-process WakeQueue backends (Issue #41).
 
-:class:`SqliteWakeQueue` (stdlib) / :class:`RedisWakeQueue` (optional dep) が
-:class:`InMemoryWakeQueue` と **同一の三状態 claim-then-confirm セマンティクス** を持つことを、
-共通の契約テストを 3 backend へ parametrize して実証する。Redis は実接続が CI で不可なため、
-本モジュール内の最小 :class:`FakeRedis` (redis-py 互換のサブセット) を注入して検証する。
+:class:`SqliteWakeQueue` (stdlib) / :class:`RedisWakeQueue` (optional dep)
+are proven to have the **same three-state claim-then-confirm semantics** as
+:class:`InMemoryWakeQueue` by parametrizing shared contract tests across the
+three backends. Because a real Redis connection is unavailable in CI, the tests
+inject the minimal :class:`FakeRedis` in this module (a redis-py-compatible
+subset).
 """
 
 from __future__ import annotations
@@ -29,10 +31,11 @@ from loop_agent.transport import (
 
 
 # ---------------------------------------------------------------------------
-# 最小 FakeRedis (redis-py 互換のサブセット; RedisWakeQueue が使うコマンドのみ)
+# Minimal FakeRedis (a redis-py-compatible subset; only commands RedisWakeQueue uses)
 #
-# 実 Redis は CI で不可。RedisWakeQueue が使う命令だけを in-process で実装し、redis-py の
-# **bytes 返却** セマンティクスまで模す (= RedisWakeQueue の bytes デコード経路まで実走させる)。
+# A real Redis is unavailable in CI. Implement only the commands RedisWakeQueue uses
+# in-process, including redis-py's **bytes return** semantics (= exercises
+# RedisWakeQueue's bytes decoding path).
 # ---------------------------------------------------------------------------
 
 
@@ -45,10 +48,11 @@ def _b(v: object) -> bytes:
 
 
 class FakeRedis:
-    """RedisWakeQueue が使うコマンドのサブセットを実装した in-process な偽 Redis。
+    """In-process fake Redis implementing the command subset RedisWakeQueue uses.
 
-    redis-py 既定 (``decode_responses=False``) と同じく文字列値は ``bytes`` で返す。単一
-    プロセス内テスト用で、TTL は記録するが自動失効はしない (テストが明示的に検査する)。
+    Like redis-py's default (``decode_responses=False``), string values are
+    returned as ``bytes``. Intended for single-process tests; TTLs are recorded
+    but do not expire automatically (tests inspect them explicitly).
     """
 
     def __init__(self) -> None:
@@ -58,7 +62,7 @@ class FakeRedis:
         self.sets: dict[bytes, set[bytes]] = {}
         self.expires: dict[bytes, int] = {}
 
-    # -- strings (分散ロック用) ------------------------------------------------
+    # -- strings (for distributed locks) --------------------------------------
     def set(self, name, value, nx=False, px=None):
         key = _b(name)
         if nx and key in self.strings:
@@ -164,11 +168,11 @@ class FakeRedis:
         self.expires[_b(name)] = int(seconds)
         return True
 
-    # -- scripting (compare-and-delete ロック解放だけを忠実に実装) -------------
+    # -- scripting (faithfully implement only compare-and-delete lock release) -
     def eval(self, script, numkeys, *keys_and_args):
         keys = keys_and_args[:numkeys]
         args = keys_and_args[numkeys:]
-        # RedisWakeQueue が使う唯一のスクリプト = lock の compare-and-delete。
+        # The only script RedisWakeQueue uses = lock compare-and-delete.
         key = _b(keys[0])
         token = _b(args[0])
         if self.strings.get(key) == token:
@@ -177,7 +181,7 @@ class FakeRedis:
 
 
 # ---------------------------------------------------------------------------
-# backend parametrize: 各 backend の fresh な queue を生む factory
+# backend parametrization: factories that create a fresh queue for each backend
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +215,7 @@ def _wake(i: int, recipient: str = "coord") -> Wake:
 
 
 # ---------------------------------------------------------------------------
-# 共通契約テスト (全 backend で同一セマンティクス)
+# Shared contract tests (same semantics across all backends)
 # ---------------------------------------------------------------------------
 
 
@@ -221,7 +225,7 @@ def test_enqueue_then_claim_then_confirm(queue):
 
     claimed = queue.claim("coord", now=0.0, lease=30.0, owner="o")
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
-    assert claimed[0].payload == {"n": 0}  # payload は JSON round-trip で保たれる。
+    assert claimed[0].payload == {"n": 0}  # Payload is preserved by the JSON round-trip.
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
     assert queue.confirm("r1:loop_done:0", owner="o", now=1.0) is True
@@ -230,7 +234,7 @@ def test_enqueue_then_claim_then_confirm(queue):
 
 def test_enqueue_is_idempotent_by_id(queue):
     assert queue.enqueue(_wake(0)) is True
-    assert queue.enqueue(_wake(0)) is False  # 同一 id は no-op。
+    assert queue.enqueue(_wake(0)) is False  # The same id is a no-op.
     assert len(queue.claim("coord", now=0.0, lease=30.0, owner="o")) == 1
 
 
@@ -251,7 +255,7 @@ def test_claim_limit_bounds_batch(queue):
         queue.enqueue(_wake(i))
     first = queue.claim("coord", now=0.0, lease=30.0, owner="o", limit=2)
     assert len(first) == 2
-    # 残りは limit 後の seq 順。
+    # Remaining wakes are in seq order after the limit.
     rest = queue.claim("coord", now=0.0, lease=30.0, owner="o")
     assert [w.id for w in rest] == ["r1:loop_done:2", "r1:loop_done:3", "r1:loop_done:4"]
 
@@ -270,14 +274,14 @@ def test_claim_only_returns_matching_recipient(queue):
 def test_claimed_wake_not_reclaimed_while_lease_held(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="o")
-    # lease 保持中は再 claim できない。
+    # Cannot reclaim while the lease is held.
     assert queue.claim("coord", now=10.0, lease=30.0, owner="o2") == []
 
 
 def test_lease_expiry_releases_for_reclaim(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="o")
-    # lease 失効後は再 eligible になり再 claim できる (crash recovery)。
+    # After lease expiry, it becomes eligible again and can be reclaimed (crash recovery).
     reclaimed = queue.claim("coord", now=31.0, lease=30.0, owner="o2")
     assert [w.id for w in reclaimed] == ["r1:loop_done:0"]
 
@@ -285,16 +289,16 @@ def test_lease_expiry_releases_for_reclaim(queue):
 def test_release_expired_counts_and_resets(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="o")
-    assert queue.release_expired(now=10.0) == 0  # まだ失効していない。
+    assert queue.release_expired(now=10.0) == 0  # Not expired yet.
     assert queue.state_of("r1:loop_done:0") == CLAIMED
-    assert queue.release_expired(now=31.0) == 1  # 失効 -> UNDELIVERED へ。
+    assert queue.release_expired(now=31.0) == 1  # Expired -> UNDELIVERED.
     assert queue.state_of("r1:loop_done:0") == UNDELIVERED
 
 
 def test_confirm_requires_owner_match(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="owner-A")
-    # owner 不一致の confirm は弾かれる。
+    # Confirm with a mismatched owner is rejected.
     assert queue.confirm("r1:loop_done:0", owner="owner-B", now=1.0) is False
     assert queue.state_of("r1:loop_done:0") == CLAIMED
     assert queue.confirm("r1:loop_done:0", owner="owner-A", now=1.0) is True
@@ -304,17 +308,17 @@ def test_confirm_requires_owner_match(queue):
 def test_confirm_after_lease_expiry_is_fenced(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="o")
-    # lease 失効後の遅延 confirm は弾かれる (届いていないので DELIVERED 化しない)。
+    # A delayed confirm after lease expiry is rejected (not delivered, so not marked DELIVERED).
     assert queue.confirm("r1:loop_done:0", owner="o", now=31.0) is False
 
 
 def test_owner_fencing_blocks_stale_confirm(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="worker-A")
-    # A の lease 失効後に B が再 claim。
+    # B reclaims after A's lease expires.
     second = queue.claim("coord", now=31.0, lease=30.0, owner="worker-B")
     assert [w.id for w in second] == ["r1:loop_done:0"]
-    # 遅れて来た A の confirm は弾かれ、B の confirm だけが通る。
+    # A's late confirm is rejected; only B's confirm succeeds.
     assert queue.confirm("r1:loop_done:0", owner="worker-A", now=32.0) is False
     assert queue.confirm("r1:loop_done:0", owner="worker-B", now=32.0) is True
 
@@ -323,14 +327,14 @@ def test_mark_delivered_only_from_undelivered(queue):
     queue.enqueue(_wake(0))
     assert queue.mark_delivered("r1:loop_done:0") is True
     assert queue.state_of("r1:loop_done:0") == DELIVERED
-    # 既に DELIVERED なら no-op。
+    # Already DELIVERED is a no-op.
     assert queue.mark_delivered("r1:loop_done:0") is False
 
 
 def test_mark_delivered_does_not_steal_active_claim(queue):
     queue.enqueue(_wake(0))
     queue.claim("coord", now=0.0, lease=30.0, owner="o")  # CLAIMED
-    # CLAIMED を奪わない (claim-then-confirm の crash recovery を壊さない)。
+    # Do not steal CLAIMED (preserves claim-then-confirm crash recovery).
     assert queue.mark_delivered("r1:loop_done:0") is False
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
@@ -344,7 +348,7 @@ def test_mark_delivered_excludes_from_claim(queue):
 def test_pending_excludes_delivered_and_orders_by_seq(queue):
     for i in (0, 1, 2):
         queue.enqueue(_wake(i))
-    queue.mark_delivered("r1:loop_done:1")  # 確定済みは pending から除かれる。
+    queue.mark_delivered("r1:loop_done:1")  # Confirmed wakes are excluded from pending.
     pend = queue.pending("coord")
     assert [w.id for w in pend] == ["r1:loop_done:0", "r1:loop_done:2"]
 
@@ -353,7 +357,7 @@ def test_pending_all_recipients_ordered_by_global_seq(queue):
     queue.enqueue(_wake(0, recipient="alice"))
     queue.enqueue(_wake(1, recipient="bob"))
     queue.enqueue(_wake(2, recipient="alice"))
-    pend = queue.pending()  # 宛先指定なし = 全 recipient を global seq 順。
+    pend = queue.pending()  # No recipient specified = all recipients in global seq order.
     assert [w.id for w in pend] == ["r1:loop_done:0", "r1:loop_done:1", "r1:loop_done:2"]
 
 
@@ -374,7 +378,7 @@ def test_claim_rejects_nonpositive_lease(queue):
 
 
 def test_payload_must_be_json_serializable(queue):
-    # JSON 直列化は永続 backend の性質。in-memory は直列化しないので対象外。
+    # JSON serialization is a property of persistent backends. In-memory does not serialize.
     if isinstance(queue, InMemoryWakeQueue):
         pytest.skip("InMemoryWakeQueue does not serialize payloads")
     bad = Wake(id="x", kind=WAKE_LOOP_DONE, recipient="coord", payload={"obj": object()})
@@ -383,7 +387,7 @@ def test_payload_must_be_json_serializable(queue):
 
 
 # ---------------------------------------------------------------------------
-# Transport 統合 (SQLite を正本に据えても push一次/pull fallback が成立する)
+# Transport integration (push-first/pull fallback still works with SQLite as source of truth)
 # ---------------------------------------------------------------------------
 
 
@@ -415,7 +419,7 @@ def test_transport_pull_fallback_over_sqlite(tmp_path):
 
 
 def test_transport_redelivers_respects_inflight_claim_over_sqlite(tmp_path):
-    """SQLite backend でも CLAIMED 中の再 deliver が active claim を横取りしない (codex P2 等価)。"""
+    """With SQLite, redelivery while CLAIMED does not steal the active claim (codex P2 equivalent)."""
     clock = ManualClock()
     q = SqliteWakeQueue(str(tmp_path / "t.db"))
     from loop_agent.transport import CallablePushBackend
@@ -426,7 +430,7 @@ def test_transport_redelivers_respects_inflight_claim_over_sqlite(tmp_path):
     claimed = t.poll("coord", confirm=False)
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
     up["ok"] = True
-    assert t.deliver(_wake(0)) == "queued"  # 横取りしない。
+    assert t.deliver(_wake(0)) == "queued"  # Does not steal the claim.
     assert q.state_of("r1:loop_done:0") == CLAIMED
     clock.advance(31.0)
     assert [w.id for w in t.poll("coord")] == ["r1:loop_done:0"]
@@ -434,18 +438,18 @@ def test_transport_redelivers_respects_inflight_claim_over_sqlite(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# SQLite 固有 (クロスプロセス共有 / 永続 / cleanup)
+# SQLite-specific (cross-process sharing / persistence / cleanup)
 # ---------------------------------------------------------------------------
 
 
 def test_sqlite_file_shared_across_connections(tmp_path):
-    """別 connection (= 別プロセス相当) が同じファイル正本を共有して配送を継続できる。"""
+    """A separate connection (= separate process equivalent) can share the same file source of truth and continue delivery."""
     path = str(tmp_path / "shared.db")
     producer = SqliteWakeQueue(path)
     producer.enqueue(_wake(0))
     producer.close()
 
-    consumer = SqliteWakeQueue(path)  # 別インスタンス = 別 connection。
+    consumer = SqliteWakeQueue(path)  # Separate instance = separate connection.
     claimed = consumer.claim("coord", now=0.0, lease=30.0, owner="o")
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
     assert consumer.confirm("r1:loop_done:0", owner="o", now=1.0) is True
@@ -460,9 +464,9 @@ def test_sqlite_purge_delivered_reclaims_rows(tmp_path):
         queue_ids.append(f"r1:loop_done:{i}")
     q.mark_delivered("r1:loop_done:0")
     q.mark_delivered("r1:loop_done:1")
-    assert q.purge_delivered() == 2  # DELIVERED 2 件だけ物理削除。
+    assert q.purge_delivered() == 2  # Physically deletes only the 2 DELIVERED rows.
     assert q.state_of("r1:loop_done:0") is None
-    assert q.state_of("r1:loop_done:2") == UNDELIVERED  # 非確定は残る。
+    assert q.state_of("r1:loop_done:2") == UNDELIVERED  # Unconfirmed rows remain.
     q.close()
 
 
@@ -477,13 +481,13 @@ def test_sqlite_custom_table_isolates_namespace(tmp_path):
     b = SqliteWakeQueue(path, table="wakes_b")
     a.enqueue(_wake(0))
     assert a.pending() != []
-    assert b.pending() == []  # 別 table は分離されている。
+    assert b.pending() == []  # Separate tables are isolated.
     a.close()
     b.close()
 
 
 def test_sqlite_concurrent_pollers_never_double_claim(tmp_path):
-    """SQLite backend を複数スレッドで並行 poll しても二重 claim しない (BEGIN IMMEDIATE 直列化)。"""
+    """Concurrent polling with multiple threads on SQLite does not double-claim (BEGIN IMMEDIATE serialization)."""
     q = SqliteWakeQueue(str(tmp_path / "c.db"))
     t = Transport(q, NullPushBackend(), lease=3600.0, time_fn=time.monotonic)
     n_wakes = 100
@@ -519,12 +523,12 @@ def test_sqlite_concurrent_pollers_never_double_claim(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Redis 固有 (namespace / TTL / import gate / 分散ロック)
+# Redis-specific (namespace / TTL / import gate / distributed lock)
 # ---------------------------------------------------------------------------
 
 
 def test_redis_import_gate_without_client_or_url_raises():
-    # client も url も無いと ValueError (redis 未導入環境でも import gate より前で弾く)。
+    # Without client or url, ValueError is raised before the import gate even without redis installed.
     with pytest.raises((ValueError, ImportError)):
         RedisWakeQueue()
 
@@ -535,7 +539,7 @@ def test_redis_namespace_isolates_keys():
     b = RedisWakeQueue(client=client, namespace="ns_b")
     a.enqueue(_wake(0))
     assert a.pending() != []
-    assert b.pending() == []  # 別 namespace は同一 client 上でも衝突しない。
+    assert b.pending() == []  # Separate namespaces do not collide on the same client.
 
 
 def test_redis_sets_ttl_on_delivered():
@@ -543,7 +547,7 @@ def test_redis_sets_ttl_on_delivered():
     q = RedisWakeQueue(client=client, namespace="ns", delivered_ttl=123.0)
     q.enqueue(_wake(0))
     q.mark_delivered("r1:loop_done:0")
-    # 確定時に wake hash へ EXPIRE が張られる (long-running の残留を自動回収)。
+    # Confirmation sets EXPIRE on the wake hash (auto-cleans long-running residue).
     assert client.expires.get(b"ns:wake:r1:loop_done:0") == 123
 
 
@@ -559,33 +563,33 @@ def test_redis_distributed_lock_released_after_op():
     client = FakeRedis()
     q = RedisWakeQueue(client=client, namespace="ns")
     q.enqueue(_wake(0))
-    # 操作後はロックが解放されている (次の操作が deadlock しない)。
+    # The lock is released after each operation (the next operation does not deadlock).
     assert client.get("ns:lock") is None
     q.claim("coord", now=0.0, lease=30.0, owner="o")
     assert client.get("ns:lock") is None
 
 
 def test_redis_lock_release_only_deletes_own_token():
-    """compare-and-delete: 別 token のロックは消さない (失効後に他者が握ったロックを守る)。"""
+    """compare-and-delete: do not delete a lock with another token (protects a lock another owner acquired after expiry)."""
     client = FakeRedis()
     q = RedisWakeQueue(client=client, namespace="ns")
     client.set("ns:lock", "held-by-other")
-    q._release_lock("my-stale-token")  # token 不一致 -> 消さない。
+    q._release_lock("my-stale-token")  # Token mismatch -> do not delete.
     assert client.get("ns:lock") == b"held-by-other"
-    q._release_lock("held-by-other")  # token 一致 -> 消す。
+    q._release_lock("held-by-other")  # Token match -> delete.
     assert client.get("ns:lock") is None
 
 
 def test_redis_recipients_registry_pruned_when_drained():
-    """recipient の pending が尽きると {ns}:recipients から外れる (registry の無制限増殖防止)。"""
+    """When a recipient has no pending wakes, remove it from {ns}:recipients (prevents unbounded registry growth)."""
     client = FakeRedis()
     q = RedisWakeQueue(client=client, namespace="ns")
     q.enqueue(_wake(0, recipient="ephemeral"))
     assert client.smembers("ns:recipients") == {b"ephemeral"}
-    q.mark_delivered("r1:loop_done:0")  # 確定 -> recipient drained。
+    q.mark_delivered("r1:loop_done:0")  # Confirmed -> recipient drained.
     assert client.smembers("ns:recipients") == set()
     assert q.pending() == []
-    # 再 enqueue で registry が復活し pending(None) の全走査が壊れない。
+    # Re-enqueue restores the registry so pending(None)'s full scan still works.
     q.enqueue(_wake(1, recipient="ephemeral"))
     assert client.smembers("ns:recipients") == {b"ephemeral"}
     assert [w.id for w in q.pending()] == ["r1:loop_done:1"]

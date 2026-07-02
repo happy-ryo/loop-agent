@@ -1,10 +1,11 @@
-"""ループ状態 SoT (state.db) の検証: transaction / クラッシュ耐性 / スキーマ独立性.
+"""Loop state SoT (state.db) validation: transaction / crash safety / schema independence.
 
-report.md S3.4 / S4.6 / S5 Phase 2 の「state.db SoT」の最小実装 (Issue #11) を対象に、
-(a) 各反復が atomic に永続化され、(b) トランザクションがクラッシュ耐性を持ち
-(commit 前のプロセス終了で半端な行が残らない)、(c) スキーマが org 本体から独立した
-最小スキーマである、ことを実証する。DBProgressLog が JSONL の ProgressLog と同じ
-観測フックの drop-in であることも併せて確認する。
+Targets the minimal "state.db SoT" implementation (Issue #11) from report.md
+S3.4 / S4.6 / S5 Phase 2, proving that (a) each iteration is persisted
+atomically, (b) transactions are crash-safe (no partial rows remain when the
+process exits before commit), and (c) the schema is a minimal schema independent
+from the org core. It also verifies that DBProgressLog is a drop-in replacement
+for the same observation hook as the JSONL ProgressLog.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from conftest import acting, done_after, never_done
 
 
 def _run_with_db(conn, run_id, *, act, verify, conditions, on_step=None):
-    """run_loop を DBProgressLog に配線し、終了状態まで記録して結果を返す。"""
+    """Wire run_loop to DBProgressLog, record through final state, and return the result."""
     db = DBProgressLog(conn, run_id)
 
     if on_step is None:
@@ -52,7 +53,7 @@ def _run_with_db(conn, run_id, *, act, verify, conditions, on_step=None):
     return result, db
 
 
-# -- スキーマ独立性 (org 本体非依存の最小スキーマ) ----------------------------
+# -- Schema independence (minimal schema independent of org core) -------------
 
 
 def test_schema_has_only_the_minimal_loop_tables(tmp_path):
@@ -63,16 +64,18 @@ def test_schema_has_only_the_minimal_loop_tables(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
     }
-    # sqlite_sequence は AUTOINCREMENT の副産物なので除外して比較する。
+    # Exclude sqlite_sequence because it is an AUTOINCREMENT side effect.
     names.discard("sqlite_sequence")
-    # run / step / event / stop_reason の 4 表 + 限定人間ゲート (Issue #15) の
-    # pending_decision。いずれも org 本体非依存の自己完結スキーマ。
+    # Four tables for run / step / event / stop_reason, plus pending_decision
+    # for the limited human gate (Issue #15). All are self-contained schemas
+    # independent of the org core.
     assert names == {"run", "step", "event", "stop_reason", "pending_decision"}
 
 
 def test_schema_carries_no_claude_org_tables(tmp_path):
-    # org 本体のスキーマ (projects / workstreams / worker_dirs / runs(複数形) /
-    # org_sessions 等) が紛れ込んでいないこと = 疎結合の担保。
+    # Ensure org core schema tables (projects / workstreams / worker_dirs /
+    # plural runs / org_sessions, etc.) have not slipped in, preserving loose
+    # coupling.
     conn = connect(tmp_path / "state.db")
     names = {
         r["name"]
@@ -86,8 +89,8 @@ def test_schema_carries_no_claude_org_tables(tmp_path):
 
 
 def test_store_module_does_not_import_org_state_db(tmp_path):
-    # loop_agent.store / connect が claude-org の tools.state_db を一切 import
-    # しないこと (import するとパッケージとして org に密結合する)。
+    # loop_agent.store / connect must not import claude-org's tools.state_db at
+    # all; importing it would tightly couple the package to org.
     connect(tmp_path / "state.db")
     assert not any("tools.state_db" in m for m in sys.modules)
 
@@ -98,7 +101,8 @@ def test_connect_sets_schema_version(tmp_path):
 
 
 def test_connect_is_idempotent_on_existing_db(tmp_path):
-    # 2 回開いても IF NOT EXISTS でスキーマ再適用がエラーにならず、既存データを保つ。
+    # Opening twice should reapply the schema through IF NOT EXISTS without
+    # errors and preserve existing data.
     path = tmp_path / "state.db"
     store = LoopStore(connect(path))
     store.load_or_init("r1")
@@ -110,7 +114,7 @@ def test_connect_is_idempotent_on_existing_db(tmp_path):
     ).fetchone() is not None
 
 
-# -- load_or_init (run ライフサイクル / resume 土台) --------------------------
+# -- load_or_init (run lifecycle / resume foundation) -------------------------
 
 
 def test_load_or_init_new_run_returns_empty_state_and_logs_begin(tmp_path):
@@ -129,14 +133,14 @@ def test_load_or_init_new_run_returns_empty_state_and_logs_begin(tmp_path):
 def test_load_or_init_is_idempotent_and_does_not_relog_begin(tmp_path):
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
-    store.load_or_init("r1")  # 2 回目は既存 run を返すだけ
+    store.load_or_init("r1")  # The second call only returns the existing run.
     begins = [e for e in store.read_events("r1") if e["kind"] == EVENT_BEGIN]
     assert len(begins) == 1
 
 
 def test_load_or_init_reconstructs_state_from_persisted_steps(tmp_path):
-    # resume (#14) の土台: 既存 run を load すると、永続化済み step から LoopState が
-    # 復元される (history / iteration / tokens_used / goal_met)。
+    # Resume foundation (#14): loading an existing run reconstructs LoopState
+    # from persisted steps (history / iteration / tokens_used / goal_met).
     path = tmp_path / "state.db"
     _run_with_db(
         connect(path),
@@ -146,7 +150,8 @@ def test_load_or_init_reconstructs_state_from_persisted_steps(tmp_path):
         conditions=[MaxIterations(10)],
     )
 
-    # 別接続で開き直して復元 (= プロセスをまたいだ resume を模す)。
+    # Reopen through another connection and reconstruct, simulating resume
+    # across processes.
     reopened = LoopStore(connect(path))
     state = reopened.load_or_init("r1")
     assert state.iteration == 3
@@ -164,7 +169,7 @@ def test_load_or_init_rejects_empty_run_id(tmp_path):
         store.load_or_init("")
 
 
-# -- per-step 永続化 (atomic) -------------------------------------------------
+# -- Per-step persistence (atomic) -------------------------------------------
 
 
 def test_every_iteration_is_persisted_in_order(tmp_path):
@@ -199,13 +204,13 @@ def test_run_aggregate_and_events_match_the_steps(tmp_path):
     assert run["iterations"] == 3 and run["tokens_used"] == 30
 
     kinds = [e["kind"] for e in store.read_events("r1")]
-    # begin が 1 件、step が反復数ぶん、end が 1 件、この順で並ぶ。
+    # One begin, one step per iteration, and one end, in this order.
     assert kinds == [EVENT_BEGIN, EVENT_STEP, EVENT_STEP, EVENT_STEP, EVENT_END]
 
 
 def test_records_are_durable_after_each_step_not_only_at_the_end(tmp_path):
-    # Nth on_step の時点で、別接続から読むと既に N 件の step が見える
-    # (= 反復ごとに commit されている。最後に一括ダンプではない)。
+    # At the Nth on_step, another connection can already see N step rows,
+    # proving each iteration is committed instead of dumped in bulk at the end.
     path = tmp_path / "state.db"
     seen_counts = []
 
@@ -226,7 +231,8 @@ def test_records_are_durable_after_each_step_not_only_at_the_end(tmp_path):
 
 
 def test_record_step_overwrites_row_on_same_iteration(tmp_path):
-    # 同一反復を別結果で再永続化すると、重複行ではなく上書きになる。
+    # Repersisting the same iteration with a different result overwrites instead
+    # of creating duplicate rows.
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
     st = LoopState(iteration=1, tokens_used=5)
@@ -242,8 +248,9 @@ def test_record_step_overwrites_row_on_same_iteration(tmp_path):
     assert steps[0]["observation"] == "b"
     assert steps[0]["tokens"] == 7
     assert steps[0]["goal_met"] is True
-    # 内容が変わった再永続化は新しい内容の event を 1 件追記し、最新 event が
-    # 現在の step 行と矛盾しない (event[-1] == 現在値)。
+    # Repersistence with changed content appends one event with the new content,
+    # and the latest event remains consistent with the current step row
+    # (event[-1] == current value).
     step_events = [e for e in store.read_events("r1") if e["kind"] == EVENT_STEP]
     assert len(step_events) == 2
     assert step_events[-1]["payload"]["tokens"] == 7
@@ -251,21 +258,22 @@ def test_record_step_overwrites_row_on_same_iteration(tmp_path):
 
 
 def test_record_step_identical_replay_does_not_duplicate_event(tmp_path):
-    # まったく同じ内容での再永続化 (純粋な resume replay) は step 行も event も
-    # 重ねない (append-only journal が同一内容でノイズを増やさない)。
+    # Repersisting identical content (a pure resume replay) does not duplicate
+    # the step row or event, so the append-only journal does not add noise for
+    # identical content.
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
     rec = StepRecord(iteration=0, observation={"k": 1}, tokens=5, goal_met=False)
     st = LoopState(iteration=1, tokens_used=5, elapsed=0.5)
     store.record_step("r1", rec, st)
-    store.record_step("r1", rec, st)  # 同一内容で replay
+    store.record_step("r1", rec, st)  # Replay with identical content.
 
     assert len(store.read_steps("r1")) == 1
     step_events = [e for e in store.read_events("r1") if e["kind"] == EVENT_STEP]
     assert len(step_events) == 1
 
 
-# -- 終了状態の確定 -----------------------------------------------------------
+# -- Final state confirmation ------------------------------------------------
 
 
 def test_record_result_for_a_capped_run(tmp_path):
@@ -303,11 +311,11 @@ def test_record_result_for_a_goal_met_run(tmp_path):
 
     stop = store.get_stop_reason("r1")
     assert stop["status"] == "goal_met"
-    assert stop["name"] is None  # goal 達成は発火条件なし
+    assert stop["name"] is None  # Goal completion has no triggering condition.
     assert stop["reason"] == "goal met"
 
 
-# -- transaction の atomicity / クラッシュ耐性 -------------------------------
+# -- Transaction atomicity / crash safety ------------------------------------
 
 
 def test_transaction_rolls_back_on_exception(tmp_path):
@@ -321,13 +329,14 @@ def test_transaction_rolls_back_on_exception(tmp_path):
             )
             raise RuntimeError("boom mid-transaction")
 
-    # 例外で巻き戻され、半端な step 行は残らない。
+    # The exception rolls back the transaction, leaving no partial step row.
     assert store.read_steps("r1") == []
 
 
 def test_record_step_is_all_or_nothing_when_event_insert_fails(tmp_path, monkeypatch):
-    # record_step は step 行 + 集計 + event を 1 トランザクションに束ねる。
-    # event 追記で失敗したら step 行も巻き戻る (部分永続化しない)。
+    # record_step groups the step row, aggregate, and event into one
+    # transaction. If appending the event fails, the step row is also rolled back
+    # with no partial persistence.
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
 
@@ -340,12 +349,13 @@ def test_record_step_is_all_or_nothing_when_event_insert_fails(tmp_path, monkeyp
         store.record_step("r1", rec, LoopState(iteration=1, tokens_used=5))
 
     assert store.read_steps("r1") == []
-    assert store.get_run("r1")["iterations"] == 0  # 集計も進んでいない
+    assert store.get_run("r1")["iterations"] == 0  # The aggregate is unchanged.
 
 
 def test_composed_transaction_persists_multiple_steps_atomically(tmp_path):
-    # 呼び出し側の transaction() で複数 step を束ねられる (内側 record_step は外側に
-    # 参加する)。途中の例外で束ね全体が巻き戻る。
+    # The caller's transaction() can group multiple steps; inner record_step
+    # calls join the outer transaction. A midstream exception rolls back the
+    # whole group.
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
     st = LoopState(iteration=1, tokens_used=1)
@@ -359,14 +369,15 @@ def test_composed_transaction_persists_multiple_steps_atomically(tmp_path):
             )
             raise RuntimeError("abort the batch")
 
-    assert store.read_steps("r1") == []  # どちらの step も確定していない
+    assert store.read_steps("r1") == []  # Neither step has been committed.
     assert [e["kind"] for e in store.read_events("r1")] == [EVENT_BEGIN]
 
 
 def test_composed_transaction_commits_multiple_steps_atomically(tmp_path):
-    # join 分岐の commit 側 (在 transaction True -> 最外の transaction() が COMMIT) を
-    # 正常系で検証する: 外側 transaction() で 2 つの record_step を束ね、正常終了後に
-    # 別接続から両 step + 両 loop_step event が一括で見えること。
+    # Verify the normal commit path for the join branch (in transaction True ->
+    # the outermost transaction() commits): group two record_step calls in the
+    # outer transaction, then confirm another connection can see both steps and
+    # both loop_step events at once after successful completion.
     path = tmp_path / "state.db"
     store = LoopStore(connect(path))
     store.load_or_init("r1")
@@ -384,8 +395,9 @@ def test_composed_transaction_commits_multiple_steps_atomically(tmp_path):
 
 
 def test_non_finite_float_observation_is_persisted_not_rejected(tmp_path):
-    # 回帰: 非有限 float (NaN/Infinity) を含む observation でも json_valid CHECK に
-    # 弾かれず永続化される (repr 文字列化)。1 つの変な値が step 永続化全体を壊さない。
+    # Regression: observations containing non-finite floats (NaN/Infinity) are
+    # persisted without being rejected by the json_valid CHECK by stringifying
+    # with repr. One odd value must not break the entire step persistence.
     store = LoopStore(connect(tmp_path / "state.db"))
     store.load_or_init("r1")
     obs = {"score": float("nan"), "ratio": float("inf"), "low": float("-inf"), "ok": 1.5}
@@ -397,28 +409,30 @@ def test_non_finite_float_observation_is_persisted_not_rejected(tmp_path):
     assert stored["score"] == "nan"
     assert stored["ratio"] == "inf"
     assert stored["low"] == "-inf"
-    assert stored["ok"] == 1.5  # 有限 float はそのまま
+    assert stored["ok"] == 1.5  # Finite floats are preserved as-is.
 
 
 def test_committed_steps_survive_a_crash_before_the_next_commit(tmp_path):
-    # クラッシュ耐性: commit 済みの反復は別プロセス (別接続) から読める。続く
-    # 反復を commit する前にプロセスが死んでも (= open トランザクションを commit
-    # せず接続切断)、commit 済みの行は失われず、未 commit の行は現れない。
+    # Crash safety: committed iterations can be read from another process
+    # (another connection). Even if the process dies before committing the next
+    # iteration (closing the connection without committing an open transaction),
+    # committed rows remain and uncommitted rows do not appear.
     path = tmp_path / "state.db"
     store = LoopStore(connect(path))
     store.load_or_init("r1")
     store.record_step(
         "r1", StepRecord(0, "done", 10, False), LoopState(iteration=1, tokens_used=10)
-    )  # ここまで commit 済み
+    )  # Committed through this point.
 
-    # 次の反復を書きかけのまま「クラッシュ」: BEGIN + INSERT して commit せず close。
+    # "Crash" while the next iteration is partially written: BEGIN + INSERT,
+    # then close without committing.
     store.conn.execute("BEGIN")
     store.conn.execute(
         "INSERT INTO step (run_id, iteration, tokens) VALUES ('r1', 1, 77)"
     )
-    store.conn.close()  # commit 前にプロセス終了相当
+    store.conn.close()  # Equivalent to process exit before commit.
 
-    # 開き直すと commit 済みの 1 件だけが残る。
+    # Reopening leaves only the one committed row.
     reopened = LoopStore(connect(path))
     steps = reopened.read_steps("r1")
     assert len(steps) == 1
@@ -427,7 +441,7 @@ def test_committed_steps_survive_a_crash_before_the_next_commit(tmp_path):
 
 
 def test_state_db_persists_across_independent_connections(tmp_path):
-    # SoT がプロセス (接続) をまたいで残る最小の証明。
+    # Minimal proof that the SoT persists across processes (connections).
     path = tmp_path / "state.db"
     _run_with_db(
         connect(path),
@@ -441,7 +455,7 @@ def test_state_db_persists_across_independent_connections(tmp_path):
     assert fresh.get_stop_reason("r1")["name"] == "max_iterations"
 
 
-# -- 複数 run の隔離 / observation の堅牢性 -----------------------------------
+# -- Multiple-run isolation / observation robustness --------------------------
 
 
 def test_multiple_runs_are_isolated_in_one_db(tmp_path):
@@ -481,19 +495,19 @@ def test_unicode_detail_round_trips(tmp_path):
     path = tmp_path / "state.db"
 
     def verify(_outcome):
-        return VerifyOutcome(goal_met=True, detail="収束しました")
+        return VerifyOutcome(goal_met=True, detail="Converged ✓")
 
     _run_with_db(
         connect(path), "r1", act=acting(tokens=0), verify=verify,
         conditions=[MaxIterations(5)],
     )
     store = LoopStore(connect(path))
-    assert store.read_steps("r1")[0]["detail"] == "収束しました"
+    assert store.read_steps("r1")[0]["detail"] == "Converged ✓"
 
 
 def test_foreign_key_cascade_removes_child_rows_with_the_run(tmp_path):
-    # run を削除すると step / event / stop_reason が CASCADE で消える
-    # (foreign_keys=ON + ON DELETE CASCADE の担保)。
+    # Deleting a run removes step / event / stop_reason through CASCADE,
+    # proving foreign_keys=ON + ON DELETE CASCADE.
     path = tmp_path / "state.db"
     _run_with_db(
         connect(path), "r1", act=acting(tokens=1), verify=never_done,
@@ -507,7 +521,7 @@ def test_foreign_key_cascade_removes_child_rows_with_the_run(tmp_path):
     assert store.get_stop_reason("r1") is None
 
 
-# -- ProgressLog 互換 (drop-in) ----------------------------------------------
+# -- ProgressLog compatibility (drop-in) -------------------------------------
 
 
 def test_dbprogresslog_owns_path_connection_and_closes_it(tmp_path):
@@ -516,7 +530,8 @@ def test_dbprogresslog_owns_path_connection_and_closes_it(tmp_path):
         assert db._owns_conn is True
         store = LoopStore(connect(path))
         assert store.get_run("r1") is not None
-    # close 後は接続が使えない (所有接続を閉じた)。
+    # After close, the connection cannot be used because the owned connection
+    # was closed.
     with pytest.raises(sqlite3.ProgrammingError):
         db.conn.execute("SELECT 1")
 
@@ -525,18 +540,19 @@ def test_dbprogresslog_borrows_connection_and_keeps_it_open(tmp_path):
     conn = connect(tmp_path / "state.db")
     db = DBProgressLog(conn, "r1")
     assert db._owns_conn is False
-    db.close()  # 借用接続は閉じない
+    db.close()  # Borrowed connections are not closed.
     assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_loopstore_initializes_a_bare_sqlite_connection(tmp_path):
-    # connect() を介さず素の sqlite3.connect() で開いた借用接続を渡しても、
-    # LoopStore が防御的にスキーマ + PRAGMA + row_factory を適用して動く
-    # ("no such table: run" にならない / 行が列名アクセスできる)。
+    # Even when passed a borrowed connection opened directly with
+    # sqlite3.connect() instead of connect(), LoopStore defensively applies the
+    # schema + PRAGMA + row_factory and works without "no such table: run", with
+    # rows accessible by column name.
     bare = sqlite3.connect(str(tmp_path / "state.db"))
     store = LoopStore(bare)
     store.load_or_init("r1")
-    assert store.get_run("r1")["status"] == "running"  # Row 化されている
+    assert store.get_run("r1")["status"] == "running"  # Converted to Row.
 
 
 def test_dbprogresslog_accepts_a_bare_sqlite_connection(tmp_path):

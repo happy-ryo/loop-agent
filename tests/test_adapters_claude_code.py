@@ -1,17 +1,18 @@
-"""Claude Code adapter (``loop_agent.adapters.claude_code``) の **固有** 検証 (Issue #32)。
+"""**Claude Code-specific** validation for ``loop_agent.adapters.claude_code`` (Issue #32).
 
-``act`` シーム 4 か条と ``ActResult`` の形(成功時の結果形 / ``failed`` セマンティクス /
-timeout・起動失敗の graceful / 予算計上 / Mock 契約 / auth 環境継承 / stdin 安全性)は
-全アダプタ横断の共通ハーネス ``tests/adapters/test_contract.py`` に移譲済み。ここには
-**Claude Code 固有** の挙動だけを残す:
+The four ``act`` seam rules and ``ActResult`` shape (successful result shape /
+``failed`` semantics / graceful timeout and startup failure handling / budget
+accounting / mock contract / auth environment inheritance / stdin safety) have
+been moved to the shared cross-adapter harness in ``tests/adapters/test_contract.py``.
+Only **Claude Code-specific** behavior remains here:
 
-1. ``build_command`` のフラグ組み立て(``--print`` / ``--output-format`` 等)。
-2. ``--output-format json`` の ``is_error`` を失敗判定に使う。
-3. token usage を JSON ``usage`` / stream-json / 正規表現フォールバックで解析する
-   (Claude は input+output+cache_creation を計上し ``cache_read`` を除外する意味論;
-   Issue #55)。
-4. ``render_prompt`` のプレースホルダ整形(Mapping / ``LoopState`` / 素の文字列 / 欠落)。
-5. 実 subprocess 経路(フェイク claude 実行ファイル)。
+1. ``build_command`` flag assembly (``--print`` / ``--output-format`` etc.).
+2. Using ``is_error`` from ``--output-format json`` to determine failure.
+3. Parsing token usage from JSON ``usage`` / stream-json / regex fallback
+   (Claude semantics count input+output+cache_creation and exclude ``cache_read``;
+   Issue #55).
+4. ``render_prompt`` placeholder formatting (Mapping / ``LoopState`` / bare string / missing).
+5. Real subprocess path (fake claude executable).
 """
 
 from __future__ import annotations
@@ -27,11 +28,11 @@ import pytest
 from loop_agent.adapters import ClaudeCodeAct, parse_tokens, render_prompt
 
 
-# -- フェイク runner: subprocess.run を差し替えてコマンド/出力を制御する --------
+# -- Fake runner: replace subprocess.run to control commands/output ----------
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
-    """``subprocess.run`` 互換の戻り値(CompletedProcess)を作る。"""
+    """Create a ``subprocess.run``-compatible return value (CompletedProcess)."""
 
     def _runner(command, **kwargs):
         _runner.calls.append((list(command), kwargs))
@@ -51,7 +52,7 @@ JSON_OK = (
 )
 
 
-# -- 1. build_command(Claude 固有フラグ) -----------------------------------
+# -- 1. build_command(Claude-specific flags) --------------------------------
 
 
 def test_build_command_includes_all_flags():
@@ -71,11 +72,11 @@ def test_build_command_includes_all_flags():
     assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
     assert cmd[cmd.index("--allowed-tools") + 1] == "Read,Edit"
     assert "--add-dir" in cmd
-    # プロンプトは "--" 区切りの後ろの位置引数(可変長オプションに飲まれないため)。
+    # The prompt is a positional argument after "--" so variadic options do not consume it.
     assert cmd[-2:] == ["--", "the prompt"]
 
 
-# -- 2. JSON is_error を失敗判定に使う(Claude 固有) -------------------------
+# -- 2. Use JSON is_error to determine failure (Claude-specific) -------------
 
 
 def test_json_is_error_marks_failed_even_on_zero_exit():
@@ -90,17 +91,17 @@ def test_json_is_error_marks_failed_even_on_zero_exit():
     assert result.tokens == 3
 
 
-# -- 3. token usage パース(input+output+cache_creation を計上、cache_read は除外) --
+# -- 3. Token usage parsing (count input+output+cache_creation, exclude cache_read) --
 
 
 def test_parse_tokens_from_json_usage():
-    # 100(input)+40(output)+10(cache_creation)=150。cache_read(=5)は計上しない。
+    # 100(input)+40(output)+10(cache_creation)=150. cache_read(=5) is not counted.
     assert parse_tokens(JSON_OK) == 150
 
 
 def test_parse_tokens_excludes_cache_read():
-    # Issue #55 の再現/回帰ガード: cache_read を巨大値にしても計上に含めない。
-    # 修正前(全 *tokens* 合算)なら 100+40+10+999999 で落ちる。修正後は 150。
+    # Reproduction/regression guard for Issue #55: even a huge cache_read is excluded.
+    # Before the fix (summing all *tokens*), this was 100+40+10+999999. After the fix, it is 150.
     payload = (
         '{"type": "result", "is_error": false, "result": "ok", '
         '"usage": {"input_tokens": 100, "output_tokens": 40, '
@@ -110,7 +111,7 @@ def test_parse_tokens_excludes_cache_read():
 
 
 def test_parse_tokens_regex_fallback_excludes_cache_read():
-    # 構造化 JSON にならない混在出力でも、フォールバック正規表現は cache_read を拾わない。
+    # Even for mixed output that is not structured JSON, the fallback regex ignores cache_read.
     noisy = (
         'log\n"input_tokens": 100, "output_tokens": 40, '
         '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999 trailing'
@@ -119,7 +120,7 @@ def test_parse_tokens_regex_fallback_excludes_cache_read():
 
 
 def test_actoutcome_tokens_exclude_cache_read():
-    # __call__ -> ActOutcome.tokens の経路でも cache_read を除外する(driver が積む値)。
+    # cache_read is also excluded on the __call__ -> ActOutcome.tokens path (the value the driver records).
     runner = _completed(
         stdout=(
             '{"type": "result", "is_error": false, "result": "ok", '
@@ -144,7 +145,7 @@ def test_parse_tokens_from_stream_json_last_result():
 
 
 def test_parse_tokens_regex_fallback_from_noisy_text():
-    # JSON にならない混在出力でも代表キーを拾う。
+    # Representative keys are still picked up from mixed output that is not JSON.
     noisy = 'log line\nusage: "input_tokens": 20, "output_tokens": 5 trailing'
     assert parse_tokens(noisy) == 25
 
@@ -153,7 +154,7 @@ def test_parse_tokens_returns_zero_when_absent():
     assert parse_tokens("just some plain text, no usage here") == 0
 
 
-# -- 4. render_prompt(プレースホルダ整形) ----------------------------------
+# -- 4. render_prompt(placeholder formatting) -------------------------------
 
 
 def test_render_prompt_from_mapping():
@@ -178,10 +179,10 @@ def test_render_prompt_missing_field_raises_helpful_error():
         render_prompt("{prompt}", {"iteration": 1})
     msg = str(exc.value)
     assert "prompt" in msg
-    assert "iteration" in msg  # 使えるフィールドを示す
+    assert "iteration" in msg  # Shows an available field.
 
 
-# -- 5. 実 subprocess 経路(フェイク claude 実行ファイル) -------------------
+# -- 5. Real subprocess path (fake claude executable) -----------------------
 
 
 def _write_fake_claude(tmp_path: Path, body: str) -> str:
@@ -217,14 +218,14 @@ def test_real_subprocess_timeout(tmp_path):
     bin_path = _write_fake_claude(tmp_path, body)
     act = ClaudeCodeAct(claude_bin=bin_path, timeout=0.5)
 
-    outcome = act({"prompt": "x"})  # 0.5s で kill され failed で返るはず
+    outcome = act({"prompt": "x"})  # Should be killed after 0.5s and returned as failed.
     assert outcome.observation.failed is True
     assert "timeout" in outcome.observation.error
 
 
 def test_real_subprocess_inherits_and_overrides_env(tmp_path):
-    # 子は os.environ を継承し(既存 claude セッション / ANTHROPIC_API_KEY 経路)、
-    # env= で渡した値を上書きマージする。
+    # The child inherits os.environ (existing claude session / ANTHROPIC_API_KEY path),
+    # and values passed via env= are merged as overrides.
     body = (
         "import os, json\n"
         "print(json.dumps({'result': "

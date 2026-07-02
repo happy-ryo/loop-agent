@@ -1,26 +1,29 @@
-"""観測オーケストレーション: loop_begin/step/end を emit し OTel span を張る。
+"""Observation orchestration: emit loop_begin/step/end and create an OTel span.
 
-:class:`LoopObserver` は :class:`~loop_agent.progress.ProgressLog` と同じ作法
-（``on_step`` 観測フック + ``record_result``）に乗りつつ、ループ境界の
-``loop_begin`` / ``loop_end`` も足し、1 本の OTel GenAI span を run 全体に被せる。
+:class:`LoopObserver` follows the same pattern as
+:class:`~loop_agent.progress.ProgressLog` (an ``on_step`` observation hook plus
+``record_result``), while also adding ``loop_begin`` / ``loop_end`` loop boundary
+events and wrapping the whole run in a single OTel GenAI span.
 
-使い方は 2 通り。手で配線する場合（既存 ``ProgressLog`` と同じ形）::
+There are two ways to use it. Manual wiring, in the same shape as the existing
+``ProgressLog``::
 
     obs = LoopObserver(sinks=[JsonlEventSink(path)])
     with obs:
         result = run_loop(act=..., verify=..., conditions=..., on_step=obs.on_step)
         obs.record_result(result)
 
-一括の場合（推奨の入口）::
+All-in-one usage, the recommended entry point::
 
     result = run_observed_loop(
         act=..., verify=..., conditions=..., sinks=[JsonlEventSink(path)]
     )
 
-この層は **ループコアにのみ依存** する。loop_begin は最初のステップ前に、loop_end は
-ループ復帰後に出るので、``MaxIterations(0)`` の即時停止でも begin/end は必ず残る。
-ループ本体が例外で抜けた場合も :meth:`__exit__` が ``status="error"`` の loop_end を
-出して span を ERROR で閉じ、全終了パスが観測可能になる。
+This layer **depends only on the loop core**. ``loop_begin`` is emitted before
+the first step and ``loop_end`` after the loop returns, so begin/end are always
+recorded even for an immediate ``MaxIterations(0)`` stop. If the loop body exits
+with an exception, :meth:`__exit__` emits a ``loop_end`` with ``status="error"``
+and closes the span as ERROR, making every termination path observable.
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ from .state import LoopState, StepRecord
 
 
 def _condition_names(conditions: Conditions) -> list[str]:
-    """停止条件群から名前リストを取り出す（loop_begin の文脈用）。"""
+    """Extract the list of names from stop conditions for the loop_begin context."""
     if isinstance(conditions, AnyOf):
         conds: Sequence[StopCondition] = conditions.conditions
     else:
@@ -64,10 +67,11 @@ def _condition_names(conditions: Conditions) -> list[str]:
 
 
 class LoopObserver:
-    """1 回のループ run を観測し、構造化イベント + OTel span を emit する。
+    """Observe one loop run and emit structured events plus an OTel span.
 
-    sink へは best-effort で配る（sink の例外でループを殺さない）。span は OTel 不在
-    なら自動で no-op になる（:class:`~loop_agent.otel.LoopSpan`）。
+    Events are distributed to sinks on a best-effort basis; sink exceptions do
+    not kill the loop. The span automatically becomes a no-op when OTel is
+    unavailable (:class:`~loop_agent.otel.LoopSpan`).
     """
 
     def __init__(
@@ -87,21 +91,23 @@ class LoopObserver:
         self._span = LoopSpan(tracer=tracer, enabled=otel, span_name=span_name)
         self._begun = False
         self._ended = False
-        # on_step が見た最後の確定累積メトリクス。result を得られない終了パス
-        # （例外/取りこぼし）でも、既に完了した反復ぶんを loop_end / span に残す。
-        # resume では新プロセスがまだ on_step を一度も呼ぶ前に gather/act/条件で例外を
-        # 投げうるので、復元 state の累積値で seed しておき、error/incomplete の
-        # loop_end が「中断前に完了済みの反復ぶん」を 0 に潰さないようにする。
+        # The last confirmed cumulative metrics seen by on_step. Even on
+        # termination paths where no result is available (exception/missed
+        # result), loop_end / span preserve the iterations already completed.
+        # During resume, the new process can raise in gather/act/conditions
+        # before calling on_step even once, so seed from the restored state's
+        # cumulative values to avoid collapsing the iterations completed before
+        # interruption to 0 in an error/incomplete loop_end.
         self._last_iterations = initial_state.iteration if initial_state is not None else 0
         self._last_tokens_used = (
             initial_state.tokens_used if initial_state is not None else 0
         )
         self._last_elapsed = initial_state.elapsed if initial_state is not None else 0.0
 
-    # -- 配線フック（ProgressLog と同じ作法）-------------------------------
+    # -- Wiring hooks, in the same pattern as ProgressLog ------------------
 
     def begin(self) -> None:
-        """``loop_begin`` を emit し OTel span を開始する。冪等。"""
+        """Emit ``loop_begin`` and start the OTel span. Idempotent."""
         if self._begun:
             return
         self._begun = True
@@ -112,9 +118,9 @@ class LoopObserver:
         self._emit(LoopEvent(kind=LOOP_BEGIN, iteration=0, elapsed=0.0, payload=payload))
 
     def on_step(self, record: StepRecord, state: LoopState) -> None:
-        """``loop_step`` を emit する。driver の ``StepHook`` に一致。"""
-        # 確定累積メトリクスを snapshot しておく（state は反復ごとに再利用される
-        # 可変オブジェクトなので、スカラ値を明示的に控える）。
+        """Emit ``loop_step``. Matches the driver's ``StepHook``."""
+        # Snapshot confirmed cumulative metrics. Since state is a mutable
+        # object reused for each iteration, explicitly retain scalar values.
         self._last_iterations = state.iteration
         self._last_tokens_used = state.tokens_used
         self._last_elapsed = state.elapsed
@@ -142,7 +148,7 @@ class LoopObserver:
         )
 
     def record_result(self, result: LoopResult) -> None:
-        """``loop_end`` を emit し、終了理由 + メトリクスで span を閉じる。"""
+        """Emit ``loop_end`` and close the span with the reason and metrics."""
         stop_name = result.stop.name if result.stop is not None else None
         self._emit_end(
             status=result.status,
@@ -155,11 +161,13 @@ class LoopObserver:
         )
 
     def record_error(self, error: BaseException) -> None:
-        """ループが例外で抜けたときに ``status="error"`` の loop_end を残す。
+        """Record a ``loop_end`` with ``status="error"`` when the loop raises.
 
-        反復数/トークン等は on_step で控えた **最後の確定累積値** を載せる（完了済みの
-        反復ぶんのコストを失わない。1 反復も完了していなければ 0）。終了理由に例外内容を
-        載せ、span は ERROR で閉じて例外を記録する。
+        Iterations, tokens, and similar metrics use the **last confirmed
+        cumulative values** retained by on_step, so the cost of completed
+        iterations is not lost. If no iteration completed, they are 0. The
+        exception details are included in the reason, and the span is closed as
+        ERROR with the exception recorded.
         """
         reason = f"{type(error).__name__}: {error}"
         self._emit_end(
@@ -174,10 +182,11 @@ class LoopObserver:
         )
 
     def record_incomplete(self) -> None:
-        """例外なしで result を取りこぼした保険パス用の ``status="incomplete"`` loop_end。
+        """Emit an ``incomplete`` loop_end when the result is missed without an exception.
 
-        record_error と同じく最後の確定累積メトリクスを載せ、span と event sink の
-        終了観測を揃える（begin だけで end が無いレコードを残さない）。
+        Like record_error, this uses the last confirmed cumulative metrics and
+        keeps span and event sink termination observations aligned, avoiding a
+        record with begin but no end.
         """
         self._emit_end(
             status="incomplete",
@@ -197,14 +206,15 @@ class LoopObserver:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc is not None and isinstance(exc, BaseException):
-            # ループ本体が例外で抜けた: record_result 未呼び出しなら error を残す。
+            # The loop body raised: leave an error if record_result was not called.
             self.record_error(exc)
         elif not self._ended:
-            # 例外なしで record_result を呼び忘れたケースの保険（span/sink 終了を揃える）。
+            # Safety path for forgetting record_result without an exception,
+            # keeping span/sink termination aligned.
             self.record_incomplete()
-        return False  # 例外は握り潰さず伝播させる
+        return False  # Propagate exceptions instead of swallowing them.
 
-    # -- 内部 --------------------------------------------------------------
+    # -- Internal ----------------------------------------------------------
 
     def _emit_end(
         self,
@@ -218,10 +228,11 @@ class LoopObserver:
         elapsed: float,
         error: Optional[BaseException] = None,
     ) -> None:
-        """全終了パス共通: span を閉じ、対になる ``loop_end`` event を emit する。
+        """Common path for all termination: close span and emit matching ``loop_end``.
 
-        span 終了と event emit を必ず対で行い、二重 end は冪等に無視する。これにより
-        OTel 側と event sink 側の終了観測が常に一致する。
+        Span termination and event emission always happen as a pair, and a
+        duplicate end is idempotently ignored. This keeps OTel-side and event
+        sink-side termination observations consistent.
         """
         if self._ended:
             return
@@ -270,19 +281,23 @@ def run_observed_loop(
     time_fn: Optional[Callable[[], float]] = None,
     initial_state: Optional[LoopState] = None,
 ) -> LoopResult:
-    """観測を配線して :func:`~loop_agent.loop.run_loop` を回す一括の入口。
+    """All-in-one entry point that wires observation and runs ``run_loop``.
 
-    ``run_loop`` と同じ ``act`` / ``verify`` / ``conditions`` / ``gather`` を取り、
-    観測用に ``sinks`` と OTel 設定を足す。利用者の ``on_step`` があれば観測フックと
-    合成して両方呼ぶ。返り値は ``run_loop`` の :class:`~loop_agent.loop.LoopResult`。
+    Takes the same ``act`` / ``verify`` / ``conditions`` / ``gather`` as
+    ``run_loop`` and adds ``sinks`` plus OTel settings for observation. If the
+    caller supplies ``on_step``, it is composed with the observation hook so
+    both are called. The return value is ``run_loop``'s
+    :class:`~loop_agent.loop.LoopResult`.
 
-    ``initial_state`` を渡すと中断したループを観測を保ったまま **resume** できる
-    (``run_loop`` の同名引数へ素通し; 詳細・限界はそちらの docstring 参照)。観測は
-    新プロセスの run として begin/step/end を出すので、loop_begin の iteration は 0 から
-    だが、step/end の iteration・累積メトリクスは復元 state から継続する。
+    Passing ``initial_state`` lets an interrupted loop **resume** while keeping
+    observation intact. It is forwarded directly to ``run_loop``'s argument of
+    the same name; see that docstring for details and limits. Observation emits
+    begin/step/end as a new-process run, so loop_begin has iteration 0, while
+    step/end iterations and cumulative metrics continue from the restored state.
 
-    loop_begin（最初のステップ前）→ loop_step×N → loop_end（復帰後）の順で必ず emit
-    される。ループ本体の例外は ``status="error"`` の loop_end を残してから再送出する。
+    Events are always emitted in this order: loop_begin before the first step,
+    loop_step N times, then loop_end after return. Exceptions from the loop body
+    are re-raised after recording a loop_end with ``status="error"``.
     """
     observer = LoopObserver(
         sinks,
@@ -310,8 +325,8 @@ def run_observed_loop(
             observer.on_step(record, state)
             return result
 
-    # time_fn / initial_state は渡されたときだけ run_loop に転送し、既定（time.monotonic
-    # / fresh start）を尊重する。
+    # Forward time_fn / initial_state to run_loop only when provided, preserving
+    # the defaults (time.monotonic / fresh start).
     run_kwargs: dict[str, Any] = {}
     if time_fn is not None:
         run_kwargs["time_fn"] = time_fn

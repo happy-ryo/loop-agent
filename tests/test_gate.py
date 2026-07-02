@@ -1,14 +1,17 @@
-"""限定人間ゲート (Issue #15) の検証: 不可逆操作のみ発火・4 種決定・pause/resume 保持.
+"""Validation for the limited human gate (Issue #15): irreversible-only triggering, four decisions, and pause/resume retention.
 
-report.md S4.5 / R6 / S5 Phase2 成功条件 c 「不可逆操作で人間ゲートが発火し
-approve/reject が反映される」を対象に、
+Targets report.md S4.5 / R6 / S5 Phase2 success condition c, "the human gate
+triggers on irreversible operations and approve/reject is reflected":
 
-(a) 不可逆 action でのみ発火し reversible は素通りする (= 全 step ゲートにしない)、
-(b) approve / edit / reject / respond の 4 決定が action 実行へ正しく写像される、
-(c) 決定が state.db に永続化され **pause -> (別接続で) resolve -> resume** をまたいで
-    保持される (人間に二度問わない)、
-(d) store レベルの決定レジスタ (request/resolve/get/list) が冪等・検証付きである、
-ことを実証する。
+(a) triggers only for irreversible actions while reversible actions pass through
+    (= not a gate on every step),
+(b) correctly maps the four decisions, approve / edit / reject / respond, to
+    action execution,
+(c) persists decisions to state.db and retains them across
+    **pause -> (resolve on another connection) -> resume** (does not ask the
+    human twice),
+(d) proves the store-level decision registry (request/resolve/get/list) is
+    idempotent and validated.
 """
 
 from __future__ import annotations
@@ -34,14 +37,15 @@ from loop_agent.store import EVENT_GATE
 from conftest import never_done
 
 
-# -- テスト用の最小ワールド --------------------------------------------------
+# -- Minimal Test World ------------------------------------------------------
 
 
 def make_world(actions):
-    """``gather`` が ``actions[iteration]`` を提案し、``act`` が実行を記録する世界。
+    """A world where ``gather`` proposes ``actions[iteration]`` and ``act`` records executions.
 
-    ゲートが skip した step では ``act`` は呼ばれず実行されない (executed に載らない)
-    一方、iteration は進むので gather は次の action へ移る。
+    For a step skipped by the gate, ``act`` is not called and the action is not
+    executed (it does not appear in executed). The iteration still advances, so
+    gather moves on to the next action.
     """
     executed: list = []
 
@@ -56,7 +60,7 @@ def make_world(actions):
 
 
 def is_deploy(action) -> bool:
-    """``"deploy"`` を不可逆操作とみなす述語 (= 影響範囲大の代表)。"""
+    """Predicate that treats ``"deploy"`` as irreversible (= representative high-impact action)."""
     return action == "deploy"
 
 
@@ -64,11 +68,11 @@ ACTIONS = ["work", "deploy", "work2"]
 RUN_ID = "run-gate"
 
 
-# -- (a) 発火範囲: 不可逆のみ ------------------------------------------------
+# -- (a) Trigger Scope: Irreversible Only ------------------------------------
 
 
 def test_reversible_actions_never_trigger_the_gate(tmp_path):
-    # 不可逆 action を含まない列なら、ゲートがあっても一切 interrupt せず素通りする。
+    # A sequence without irreversible actions passes through without interruption even with a gate.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     gather, act, executed = make_world(["work", "work2"])
@@ -83,7 +87,7 @@ def test_reversible_actions_never_trigger_the_gate(tmp_path):
 
 
 def test_irreversible_action_pauses_and_registers_pending(tmp_path):
-    # 不可逆 action に未解決の決定しか無ければ、その手前で pause して登録する。
+    # An irreversible action with only an unresolved decision pauses before the action and registers it.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     gather, act, executed = make_world(ACTIONS)
@@ -92,34 +96,34 @@ def test_irreversible_action_pauses_and_registers_pending(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    # "work" だけ実行され、"deploy" の手前で停止している (副作用は出ていない)。
+    # Only "work" ran; execution stopped before "deploy" (no side effects occurred).
     assert result.paused is True
     assert result.status == "paused"
     assert result.stop is None
     assert result.succeeded is False
     assert executed == ["work"]
-    # gate key は審査時点の iteration ("work"@0 の次, "deploy"@1) なので "gate-1"。
+    # The gate key uses the iteration at review time (after "work"@0, "deploy"@1), so "gate-1".
     assert result.pending["gate_key"] == "gate-1"
     assert result.pending["action"] == "deploy"
     assert "paused" in result.reason and "gate-1" in result.reason
-    # pending が永続化され、journal に loop_gate(pending) が残る。
+    # The pending decision is persisted, and loop_gate(pending) remains in the journal.
     pendings = store.list_pending_decisions(RUN_ID)
     assert [p["gate_key"] for p in pendings] == ["gate-1"]
     gate_events = [e for e in store.read_events(RUN_ID) if e["kind"] == EVENT_GATE]
     assert gate_events and gate_events[-1]["payload"]["status"] == "pending"
 
 
-# -- (b)+(c) 4 決定が pause -> 別接続 resolve -> resume をまたいで反映される ---
+# -- (b)+(c) Four Decisions Survive pause -> cross-connection resolve -> resume
 
 
 def _resume_after(tmp_path, decision, payload=None):
-    """run1 で pause -> 別接続で resolve -> run2 で resume する共通フロー。
+    """Common flow: pause in run1 -> resolve on another connection -> resume in run2.
 
-    run2 で実行された action 列と、resume 後の結果・記録 step を返す。
+    Returns the actions executed in run2 plus the post-resume result and recorded steps.
     """
     db_path = tmp_path / "s.db"
 
-    # --- run1: pause まで ---
+    # --- run1: up to pause ---
     conn1 = connect(db_path)
     store1 = LoopStore(conn1)
     gather1, act1, executed1 = make_world(ACTIONS)
@@ -131,12 +135,12 @@ def _resume_after(tmp_path, decision, payload=None):
     assert res1.paused and executed1 == ["work"]
     conn1.close()
 
-    # --- 人間が別接続で決定を記録する (プロセスをまたぐ永続性の証明) ---
+    # --- A human records the decision on another connection (proof of cross-process persistence) ---
     conn2 = connect(db_path)
     store2 = LoopStore(conn2)
     store2.resolve_decision(RUN_ID, "gate-1", decision, payload)  # "deploy"@iter1
 
-    # --- run2: resume (新しい gate / 新しい executed) ---
+    # --- run2: resume (new gate / new executed list) ---
     gather2, act2, executed2 = make_world(ACTIONS)
     gate2 = HumanGate(on=is_deploy, store=store2, run_id=RUN_ID)
     steps: list = []
@@ -151,32 +155,32 @@ def _resume_after(tmp_path, decision, payload=None):
 
 def test_approve_executes_action_on_resume(tmp_path):
     executed, res, _ = _resume_after(tmp_path, "approve")
-    # approve: "deploy" がそのまま実行され、最後まで進んで停止する (再 pause しない)。
+    # approve: "deploy" executes as-is, then the loop runs to completion and stops (no second pause).
     assert res.status == "stopped"
     assert executed == ["work", "deploy", "work2"]
 
 
 def test_reject_skips_action_on_resume(tmp_path):
     executed, res, steps = _resume_after(tmp_path, "reject")
-    # reject: "deploy" は実行されず、却下が 1 step として記録され継続する。
+    # reject: "deploy" is not executed; the rejection is recorded as one step and the loop continues.
     assert res.status == "stopped"
     assert executed == ["work", "work2"]
     rejected = [s for s in steps if s.detail.startswith("human rejected")]
     assert len(rejected) == 1
-    # skip step の observation は hashable (NoProgress 既定 key 互換)。
+    # The skipped step observation is hashable (compatible with the default NoProgress key).
     assert rejected[0].observation == "gate-skipped:rejected:gate-1"
 
 
 def test_edit_executes_replacement_action_on_resume(tmp_path):
     executed, res, _ = _resume_after(tmp_path, "edit", payload="deploy-safe")
-    # edit: 人間が差し替えた action が "deploy" の代わりに実行される。
+    # edit: the human-provided replacement action executes instead of "deploy".
     assert res.status == "stopped"
     assert executed == ["work", "deploy-safe", "work2"]
 
 
 def test_respond_records_response_without_executing(tmp_path):
     executed, res, steps = _resume_after(tmp_path, "respond", payload="use staging")
-    # respond: 実行せず人間の応答を記録して継続する。応答本文が observation に載る。
+    # respond: records the human response without executing, then continues. The response body appears in observation.
     assert res.status == "stopped"
     assert executed == ["work", "work2"]
     responded = [s for s in steps if s.detail.startswith("human responded")]
@@ -185,12 +189,12 @@ def test_respond_records_response_without_executing(tmp_path):
 
 
 def test_decision_is_not_re_asked_and_irreversible_runs_at_most_once(tmp_path):
-    # 一度 resolve した決定は再 pause しない (人間に二度問わない)。かつ approve した
-    # 不可逆 action は最初の resume で 1 回だけ実行され、以降の再生では executed として
-    # skip される (at-most-once)。
+    # A resolved decision does not pause again (the human is not asked twice). The approved
+    # irreversible action executes only once on the first resume, then later replays skip it
+    # as executed (at-most-once).
     db_path = tmp_path / "s.db"
     store = LoopStore(connect(db_path))
-    HumanGate(on=is_deploy, store=store, run_id=RUN_ID)  # run 行を確保
+    HumanGate(on=is_deploy, store=store, run_id=RUN_ID)  # ensure the run row exists
     store.request_decision(RUN_ID, "gate-1", "deploy")  # "deploy"@iter1
     store.resolve_decision(RUN_ID, "gate-1", "approve")
 
@@ -202,21 +206,22 @@ def test_decision_is_not_re_asked_and_irreversible_runs_at_most_once(tmp_path):
             act=act, verify=never_done, conditions=[MaxIterations(3)],
             gather=gather, gate=gate,
         )
-        assert res.status == "stopped"  # 再 pause しない
+        assert res.status == "stopped"  # does not pause again
         executions.append(executed)
 
-    # 1 回目: deploy を実行。2 回目以降: executed として skip (deploy 不実行)。
+    # First run: executes deploy. Later runs: skips it as executed (deploy does not run).
     assert executions[0] == ["work", "deploy", "work2"]
     assert executions[1] == ["work", "work2"]
     assert executions[2] == ["work", "work2"]
 
 
-# -- 全停止スイッチ ----------------------------------------------------------
+# -- Stop Condition Integration ---------------------------------------------
 
 
 def test_skip_observation_is_hashable_for_noprogress(tmp_path):
-    # skip step の observation を既定 NoProgress (observation を Counter でハッシュ) と
-    # 併用してもクラッシュしないこと (unhashable dict だと次 guard で TypeError)。
+    # The skipped step observation must not crash when combined with the default NoProgress
+    # behavior (which hashes observations with Counter). An unhashable dict would raise
+    # TypeError at the next guard.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
@@ -248,17 +253,18 @@ def test_inactive_gate_proceeds_without_interrupting(tmp_path):
     assert store.list_pending_decisions(RUN_ID) == []
 
 
-# -- 同期 resolver モード (pause せず inline 解決) ---------------------------
+# -- Synchronous Resolver Mode (inline resolution without pausing) ------------
 
 
 def test_custom_gate_bare_proceed_keeps_gathered_context(tmp_path):
-    # 任意の ActionGate 実装が context を省いた bare proceed を返しても、gather した
-    # 提案 action が act に渡る (None に化けない)。公開拡張点の堅牢性。
+    # Even if an arbitrary ActionGate implementation returns a bare proceed without context,
+    # the action proposed by gather is passed to act (it does not turn into None). This guards
+    # the public extension point.
     seen = []
 
     class EchoGate:
         def review(self, context, state):
-            return GateReview(disposition=GATE_PROCEED)  # context 未設定
+            return GateReview(disposition=GATE_PROCEED)  # context not set
 
     def gather(state):
         return f"ctx@{state.iteration}"
@@ -271,17 +277,17 @@ def test_custom_gate_bare_proceed_keeps_gathered_context(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(2)],
         gather=gather, gate=EchoGate(),
     )
-    assert seen == ["ctx@0", "ctx@1"]  # None ではなく gather した context
+    assert seen == ["ctx@0", "ctx@1"]  # gathered context, not None
 
 
 def test_unknown_gate_disposition_fails_closed(tmp_path):
-    # 不正な disposition (typo 等) は proceed へ fall-through せず loud に弾く
-    # (= 不可逆 action を誤って実行しない fail-closed)。
+    # An invalid disposition (such as a typo) is rejected loudly instead of falling through
+    # to proceed (= fail closed so irreversible actions are not executed by mistake).
     executed = []
 
     class BadGate:
         def review(self, context, state):
-            return GateReview(disposition="paused")  # GATE_PAUSE の typo
+            return GateReview(disposition="paused")  # typo for GATE_PAUSE
 
     def act(action):
         executed.append(action)
@@ -292,7 +298,7 @@ def test_unknown_gate_disposition_fails_closed(tmp_path):
             act=act, verify=never_done, conditions=[MaxIterations(2)],
             gather=lambda s: "x", gate=BadGate(),
         )
-    assert executed == []  # action は実行されない
+    assert executed == []  # action is not executed
 
 
 def test_synchronous_resolver_resolves_inline(tmp_path):
@@ -312,7 +318,7 @@ def test_synchronous_resolver_resolves_inline(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    # pause せず一気に完走し、resolver は不可逆 action でのみ呼ばれる ("deploy"@iter1)。
+    # Completes without pausing, and the resolver is called only for the irreversible action ("deploy"@iter1).
     assert result.status == "stopped"
     assert executed == ["work", "deploy", "work2"]
     assert seen == ["gate-1"]
@@ -320,19 +326,19 @@ def test_synchronous_resolver_resolves_inline(tmp_path):
 
 
 def test_existing_resolution_is_honored_over_resolver(tmp_path):
-    # 既に resolved 済みの決定 (= 並行 resume の勝者が先に解決した状況) は、resolver が
-    # 設定されていても resolver を呼ばず保存済み決定を適用する (再 check の保証)。
+    # An already resolved decision (= a competing resume winner resolved it first) applies the
+    # stored decision without calling the resolver even when one is configured (re-check guarantee).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
     store.request_decision(RUN_ID, "gate-1", "deploy")
-    store.resolve_decision(RUN_ID, "gate-1", "reject")  # 別者が先に reject
+    store.resolve_decision(RUN_ID, "gate-1", "reject")  # another actor rejected first
 
     resolver_calls = []
 
     def resolver(pending):
         resolver_calls.append(pending["gate_key"])
-        return Decision("approve")  # resolver は approve したいが、保存済み reject が勝つ
+        return Decision("approve")  # resolver wants to approve, but the stored reject wins
 
     gather, act, executed = make_world(ACTIONS)
     gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID, resolver=resolver)
@@ -340,14 +346,14 @@ def test_existing_resolution_is_honored_over_resolver(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    assert resolver_calls == []  # 既決のため resolver は呼ばれない
-    assert executed == ["work", "work2"]  # reject が反映され deploy は実行されない
+    assert resolver_calls == []  # resolver is not called because the decision is already settled
+    assert executed == ["work", "work2"]  # reject is applied, so deploy is not executed
     assert store.get_decision(RUN_ID, "gate-1")["decision"] == "reject"
 
 
 def test_run_gated_loop_forwards_initial_state(tmp_path):
-    # run_gated_loop に initial_state を渡すと #14 の中断地点継続 resume になる
-    # (iteration 0 からの replay でなく、既実行 reversible を再実行しない)。
+    # Passing initial_state to run_gated_loop performs #14 resume from the interruption point
+    # (not a replay from iteration 0, and it does not re-execute completed reversible actions).
     db_path = tmp_path / "s.db"
     actions = ["work", "deploy", "work2"]
 
@@ -374,7 +380,7 @@ def test_run_gated_loop_forwards_initial_state(tmp_path):
         on_step=db2.on_step, initial_state=db2.state,
     )
     assert res2.status == "stopped"
-    assert ex2 == ["deploy", "work2"]  # "work" を再実行しない (中断地点から継続)
+    assert ex2 == ["deploy", "work2"]  # does not re-execute "work" (continues from interruption point)
     conn2.close()
 
 
@@ -388,10 +394,10 @@ def test_run_gated_loop_helper_wires_the_gate(tmp_path):
         resolver=lambda pending: Decision("reject"),
     )
     assert result.status == "stopped"
-    assert executed == ["work", "work2"]  # "deploy" は reject で実行されない
+    assert executed == ["work", "work2"]  # "deploy" is not executed because of reject
 
 
-# -- store レベル: 決定レジスタの冪等性・検証 --------------------------------
+# -- Store Level: Decision Registry Idempotency and Validation ----------------
 
 
 def test_request_decision_is_idempotent(tmp_path):
@@ -400,10 +406,10 @@ def test_request_decision_is_idempotent(tmp_path):
     store.load_or_init(RUN_ID)
     first = store.request_decision(RUN_ID, "g1", {"do": "x"})
     second = store.request_decision(RUN_ID, "g1", {"do": "DIFFERENT"})
-    # 2 回目は既存 pending をそのまま返し、action を上書きしない。
+    # The second request returns the existing pending decision as-is and does not overwrite the action.
     assert first["id"] == second["id"]
     assert second["action"] == {"do": "x"}
-    # loop_gate(pending) は 1 件だけ (重複登録でイベントを増やさない)。
+    # There is only one loop_gate(pending) event (duplicate registration does not add events).
     pending_events = [
         e for e in store.read_events(RUN_ID)
         if e["kind"] == EVENT_GATE and e["payload"]["status"] == "pending"
@@ -421,7 +427,7 @@ def test_resolve_decision_roundtrip_and_payload(tmp_path):
     assert resolved["decision"] == "edit"
     assert resolved["payload"] == {"safe": True}
     assert resolved["resolved_at"] is not None
-    assert store.list_pending_decisions(RUN_ID) == []  # もう pending ではない
+    assert store.list_pending_decisions(RUN_ID) == []  # no longer pending
 
 
 def test_resolve_unknown_gate_key_raises(tmp_path):
@@ -443,8 +449,9 @@ def test_double_resolve_is_rejected(tmp_path):
 
 
 def test_gated_action_must_be_json_native(tmp_path):
-    # gated action は resume の同一性比較の基準になるため JSON ネイティブ厳守。
-    # 非ネイティブ (repr に潰れて別 action と誤一致しうる) は登録時に loud に弾く。
+    # Gated actions must be JSON-native because they are used for identity comparison on resume.
+    # Non-native values (which could collapse to repr and falsely match another action) are
+    # rejected loudly at registration time.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     store.load_or_init(RUN_ID)
@@ -454,33 +461,34 @@ def test_gated_action_must_be_json_native(tmp_path):
 
     with pytest.raises(ValueError, match="JSON-native"):
         store.request_decision(RUN_ID, "g1", Obj())
-    # tuple も list へ化けて lossy なので弾く (誤一致防止)。
+    # Tuples are also rejected because they become lists and are lossy (prevents false matches).
     with pytest.raises(ValueError, match="JSON-native"):
         store.request_decision(RUN_ID, "g2", (1, 2))
-    # str/dict/list/数値はそのまま通る。
+    # str/dict/list/numbers pass through unchanged.
     assert store.request_decision(RUN_ID, "g3", {"cmd": "deploy"})["action"] == {"cmd": "deploy"}
 
 
 def test_edit_payload_must_be_json_native(tmp_path):
-    # edit の置換 action は resume で store から復元されて実行されるため、JSON 往復で
-    # 欠損する非ネイティブ値 (任意オブジェクト) は記録時に loud に弾く。
+    # Edit replacement actions are restored from the store and executed on resume, so
+    # non-native values that would be lost in a JSON round trip (arbitrary objects) are
+    # rejected loudly when recorded.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     store.load_or_init(RUN_ID)
     store.request_decision(RUN_ID, "g1", "deploy")
 
-    class Obj:  # 非 JSON ネイティブ (repr に潰れてしまう)
+    class Obj:  # non-JSON-native (collapses to repr)
         pass
 
     with pytest.raises(ValueError, match="JSON-native"):
         store.resolve_decision(RUN_ID, "g1", "edit", payload=Obj())
-    # JSON ネイティブな置換 action は通る (dict/list/str/数値)。
+    # JSON-native replacement actions pass (dict/list/str/numbers).
     ok = store.resolve_decision(RUN_ID, "g1", "edit", payload={"cmd": "deploy", "safe": True})
     assert ok["payload"] == {"cmd": "deploy", "safe": True}
 
 
 def test_edit_with_structured_payload_executes_on_resume(tmp_path):
-    # JSON ネイティブな構造化 edit payload が resume 後そのまま act に渡る (fidelity)。
+    # A JSON-native structured edit payload is passed to act unchanged after resume (fidelity).
     db_path = tmp_path / "s.db"
     actions = ["deploy"]
     replacement = {"cmd": "deploy", "target": "staging"}
@@ -503,7 +511,7 @@ def test_edit_with_structured_payload_executes_on_resume(tmp_path):
         act=act2, verify=never_done, conditions=[MaxIterations(1)],
         gather=gather2, gate=HumanGate(on=is_deploy, store=store2, run_id=RUN_ID),
     )
-    assert executed2 == [replacement]  # 構造化置換 action がそのまま実行された
+    assert executed2 == [replacement]  # structured replacement action executed unchanged
 
 
 def test_resolve_unknown_decision_kind_raises(tmp_path):
@@ -518,12 +526,12 @@ def test_resolve_unknown_decision_kind_raises(tmp_path):
 def test_decision_dataclass_rejects_bad_kind():
     with pytest.raises(ValueError, match="unknown decision"):
         Decision("bogus")
-    # 正規の 4 種はすべて構築可能。
+    # All four valid kinds can be constructed.
     for kind in DECISION_KINDS:
         assert Decision(kind).kind == kind
 
 
-# -- (c) 複数ゲート: 不可逆 action は resume をまたいで exactly-once -----------
+# -- (c) Multiple Gates: irreversible actions are exactly-once across resume ---
 
 
 def is_deploy_prefix(action) -> bool:
@@ -531,10 +539,10 @@ def is_deploy_prefix(action) -> bool:
 
 
 def test_multi_gate_resume_executes_each_irreversible_action_once(tmp_path):
-    # 2 つの不可逆 action を含む replay resume (initial_state なし)。再生は iteration 0
-    # から起きるが、approve 済みで実行した不可逆 action は executed として skip され
-    # 二度実行されない (= ゲートの中核保証。二重 deploy を防ぐ)。gate key は iteration
-    # ベースなので deploy1@0 -> gate-0、deploy2@2 -> gate-2。
+    # Replay resume (without initial_state) with two irreversible actions. Replay starts from
+    # iteration 0, but approved irreversible actions that have already executed are skipped as
+    # executed and do not run twice (= core gate guarantee; prevents double deploy). Gate keys
+    # are iteration-based, so deploy1@0 -> gate-0 and deploy2@2 -> gate-2.
     db_path = tmp_path / "s.db"
     actions = ["deploy1", "work", "deploy2"]
 
@@ -547,40 +555,40 @@ def test_multi_gate_resume_executes_each_irreversible_action_once(tmp_path):
         )
         return res, executed
 
-    # run1: deploy1 (gate-0) の手前で pause。
+    # run1: pause before deploy1 (gate-0).
     conn1 = connect(db_path)
     res1, ex1 = run_once(LoopStore(conn1))
     assert res1.paused and res1.pending["gate_key"] == "gate-0" and ex1 == []
     conn1.close()
 
-    # gate-0 approve (別接続) → run2: deploy1 を実行し、deploy2 (gate-2) で pause。
+    # gate-0 approve (another connection) -> run2: execute deploy1, then pause at deploy2 (gate-2).
     conn2 = connect(db_path)
     store2 = LoopStore(conn2)
     store2.resolve_decision(RUN_ID, "gate-0", "approve")
     res2, ex2 = run_once(store2)
     assert res2.paused and res2.pending["gate_key"] == "gate-2"
-    assert ex2 == ["deploy1", "work"]  # deploy1 はここで 1 回だけ実行
+    assert ex2 == ["deploy1", "work"]  # deploy1 executes exactly once here
     conn2.close()
 
-    # gate-2 approve → run3: iteration 0 から再生するが deploy1 は executed で skip。
+    # gate-2 approve -> run3: replays from iteration 0, but deploy1 is skipped as executed.
     conn3 = connect(db_path)
     store3 = LoopStore(conn3)
     store3.resolve_decision(RUN_ID, "gate-2", "approve")
     res3, ex3 = run_once(store3)
     assert res3.status == "stopped"
-    # deploy1 は再実行されず、work(再生) と deploy2 だけが実行される。
+    # deploy1 is not re-executed; only work (replayed) and deploy2 run.
     assert ex3 == ["work", "deploy2"]
     assert "deploy1" not in ex3
-    # 結果: deploy1 / deploy2 ともプロセス全体で 1 回ずつのみ実行された。
+    # Result: deploy1 and deploy2 each executed only once across the whole process.
     assert store3.get_decision(RUN_ID, "gate-0")["status"] == "executed"
     assert store3.get_decision(RUN_ID, "gate-2")["status"] == "executed"
     conn3.close()
 
 
 def test_same_gate_instance_reused_across_resume(tmp_path):
-    # 同じ HumanGate インスタンスを pause→resume で使い回しても、gate key は審査時点の
-    # iteration から決まる (instance 状態を持たない) ので、再生でも "deploy"@iter1 ->
-    # gate-1 に揃い、承認を取りこぼさない (キーのドリフトが起きない)。
+    # Even when the same HumanGate instance is reused across pause->resume, the gate key is
+    # derived from the iteration at review time (no instance state), so replay still maps
+    # "deploy"@iter1 to gate-1 and does not miss the approval (no key drift).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     gate = HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
@@ -594,7 +602,7 @@ def test_same_gate_instance_reused_across_resume(tmp_path):
 
     store.resolve_decision(RUN_ID, "gate-1", "approve")
 
-    # 同一 gate インスタンスのまま resume。
+    # Resume with the same gate instance.
     gather2, act2, ex2 = make_world(ACTIONS)
     res2 = run_loop(
         act=act2, verify=never_done, conditions=[MaxIterations(3)],
@@ -602,15 +610,15 @@ def test_same_gate_instance_reused_across_resume(tmp_path):
     )
     assert res2.status == "stopped"
     assert ex2 == ["work", "deploy", "work2"]
-    # 余計な pending は増えず、決定はちょうど 1 件 (gate-1) で executed。
+    # No extra pending decision is added, and exactly one decision (gate-1) is executed.
     assert store.list_pending_decisions(RUN_ID) == []
     assert store.get_decision(RUN_ID, "gate-1")["status"] == "executed"
     assert store.get_decision(RUN_ID, "gate-0") is None
 
 
 def test_multi_gate_resume_with_db_does_not_corrupt_step_history(tmp_path):
-    # DBProgressLog 併用で複数ゲートを resume しても、既実行ゲートの replay skip が
-    # 前 run の本来の step 行 (observation/tokens) を上書きで壊さないこと。
+    # When resuming multiple gates with DBProgressLog, replay skips for already executed gates
+    # must not overwrite and corrupt the original step rows (observation/tokens) from prior runs.
     db_path = tmp_path / "s.db"
     actions = ["deploy1", "work", "deploy2"]
 
@@ -619,7 +627,7 @@ def test_multi_gate_resume_with_db_does_not_corrupt_step_history(tmp_path):
         gather, act, _ = make_world(actions)
 
         def act_with_tokens(action):
-            # 不可逆 action には目に見えるトークンを課す (上書きされたら 0 になる)。
+            # Give irreversible actions visible tokens (they would become 0 if overwritten).
             tokens = 10 if action.startswith("deploy") else 1
             return ActOutcome(observation=action, tokens=tokens)
 
@@ -632,12 +640,12 @@ def test_multi_gate_resume_with_db_does_not_corrupt_step_history(tmp_path):
         return res
 
     conn1 = connect(db_path)
-    assert run_once(conn1).paused  # gate-0 で pause
+    assert run_once(conn1).paused  # pause at gate-0
     LoopStore(conn1).resolve_decision(RUN_ID, "gate-0", "approve")
     conn1.close()
 
     conn2 = connect(db_path)
-    assert run_once(conn2).paused  # deploy1 実行後 gate-2 (deploy2@iter2) で pause
+    assert run_once(conn2).paused  # after executing deploy1, pause at gate-2 (deploy2@iter2)
     LoopStore(conn2).resolve_decision(RUN_ID, "gate-2", "approve")
     conn2.close()
 
@@ -645,23 +653,24 @@ def test_multi_gate_resume_with_db_does_not_corrupt_step_history(tmp_path):
     assert run_once(conn3).status == "stopped"
     conn3.close()
 
-    # 永続化された step 履歴は deploy1 / work / deploy2 が本来の observation・tokens で
-    # 揃い、replay skip プレースホルダ (observation=gate-skipped..., tokens=0) で
-    # 上書き・破壊されていないこと (= codex P1 の step 履歴破壊の修正)。
+    # Persisted step history has deploy1 / work / deploy2 with the original observation/tokens
+    # and has not been overwritten or corrupted by replay skip placeholders
+    # (observation=gate-skipped..., tokens=0) (= fix for codex P1 step-history corruption).
     store = LoopStore(connect(db_path))
     steps = store.read_steps(RUN_ID)
     assert [s["observation"] for s in steps] == ["deploy1", "work", "deploy2"]
     assert [s["tokens"] for s in steps] == [10, 1, 10]
-    # per-step の永続値 (監査の正本) は完全。これらの合計が真のコスト。
+    # Persisted per-step values (audit source of truth) are complete. Their sum is the true cost.
     assert sum(s["tokens"] for s in steps) == 21
-    # 注: run 集計 tokens_used は replay-resume では最後の run の in-memory 累計を映し、
-    # 全 run を跨いだ総和にはならない (skip した deploy1 分を再加算しない)。完全な
-    # 集計復元 = loop-state 復元は #14 の領分。step 行が正本という契約は守られる。
+    # Note: on replay-resume, run-level tokens_used reflects the last run's in-memory total and
+    # is not the sum across all runs (it does not re-add skipped deploy1). Full aggregate
+    # restoration = loop-state restoration belongs to #14. The contract that step rows are the
+    # source of truth is preserved.
 
 
 def test_pending_re_asks_again_on_resume_without_resolution(tmp_path):
-    # 登録済みだが未 resolve のまま resume すると、再び同じ gate_key で pause する
-    # (pending を二重登録せず、loop_gate(pending) も 1 件のまま)。
+    # If a registered decision is still unresolved on resume, the loop pauses again with the
+    # same gate_key (without double-registering pending, and with only one loop_gate(pending)).
     db_path = tmp_path / "s.db"
 
     conn1 = connect(db_path)
@@ -693,7 +702,7 @@ def test_pending_re_asks_again_on_resume_without_resolution(tmp_path):
 
 
 def test_respond_response_reaches_next_gather(tmp_path):
-    # respond で記録した応答を、次の gather が state.history[-1] 経由で取り込めること。
+    # The next gather can pick up the response recorded by respond via state.history[-1].
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy, store=store, run_id=RUN_ID)
@@ -705,7 +714,7 @@ def test_respond_response_reaches_next_gather(tmp_path):
     def gather(state):
         if state.history:
             last = state.history[-1]
-            # respond の step は detail で識別し、応答本文は observation から読む。
+            # Identify the respond step by detail and read the response body from observation.
             if last.detail.startswith("human responded"):
                 seen_followup.append(last.observation)
                 return f"follow-up:{last.observation}"
@@ -719,21 +728,21 @@ def test_respond_response_reaches_next_gather(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    # respond を skip した直後の iteration で、gather が応答を読めている。
+    # On the iteration immediately after respond is skipped, gather can read the response.
     assert seen_followup == ["use staging"]
 
 
-# -- gate × #14 initial_state resume の相互作用 -----------------------------
+# -- Gate and #14 initial_state resume interaction ---------------------------
 
 
 def test_gate_resume_via_initial_state_honors_decision_and_continues(tmp_path):
-    # #14 の initial_state resume 経路 (中断地点から継続) で gate の決定が保持され、
-    # かつ既実行の reversible action を再実行しないこと。gate key は iteration ベース
-    # なので initial_state.iteration が復元されれば「中断したゲート」へ正しく再対応する。
+    # The #14 initial_state resume path (continue from the interruption point) preserves gate
+    # decisions and does not re-execute completed reversible actions. Because gate keys are
+    # iteration-based, restoring initial_state.iteration maps back to the interrupted gate.
     db_path = tmp_path / "s.db"
     actions = ["work", "deploy", "work2"]
 
-    # run1: step を永続化しつつ deploy (gate-1) で pause。
+    # run1: persist steps while pausing at deploy (gate-1).
     conn1 = connect(db_path)
     db1 = DBProgressLog(conn1, RUN_ID)
     g1, a1, ex1 = make_world(actions)
@@ -746,12 +755,12 @@ def test_gate_resume_via_initial_state_honors_decision_and_continues(tmp_path):
     assert res1.paused and res1.pending["gate_key"] == "gate-1" and ex1 == ["work"]
     conn1.close()
 
-    # 人間が approve。
+    # Human approves.
     conn2 = connect(db_path)
     store2 = LoopStore(conn2)
     store2.resolve_decision(RUN_ID, "gate-1", "approve")
 
-    # run2: initial_state=db.state で中断地点 (iter1) から継続する #14 resume。
+    # run2: #14 resume with initial_state=db.state continues from the interruption point (iter1).
     db2 = DBProgressLog(conn2, RUN_ID)
     assert db2.state.iteration == 1 and [r.observation for r in db2.state.history] == ["work"]
     g2, a2, ex2 = make_world(actions)
@@ -761,19 +770,19 @@ def test_gate_resume_via_initial_state_honors_decision_and_continues(tmp_path):
         on_step=db2.on_step, initial_state=db2.state,
     )
     db2.record_result(res2)
-    # 中断地点から継続: "work" は **再実行されず**、deploy(承認) と work2 だけ実行。
+    # Continue from the interruption point: "work" is **not re-executed**; only deploy (approved) and work2 run.
     assert res2.status == "stopped"
     assert ex2 == ["deploy", "work2"]
     assert store2.get_decision(RUN_ID, "gate-1")["status"] == "executed"
-    # 永続 step 履歴は work / deploy / work2 が揃い、全体で 3 反復。
+    # Persisted step history contains work / deploy / work2, three iterations total.
     steps = store2.read_steps(RUN_ID)
     assert [s["observation"] for s in steps] == ["work", "deploy", "work2"]
     conn2.close()
 
 
 def test_multi_gate_resume_via_initial_state_aligns_keys(tmp_path):
-    # 複数ゲートを initial_state resume で再開しても、iteration ベースのキーで「中断した
-    # ゲート」へ正しく再対応する (seq 方式だと実行済みゲートを跨いだ resume でずれる箇所)。
+    # Even when multiple gates resume via initial_state, iteration-based keys map back to the
+    # interrupted gate correctly (a seq-based scheme would drift when resuming past executed gates).
     db_path = tmp_path / "s.db"
     actions = ["deploy1", "work", "deploy2"]  # deploy1@0 -> gate-0, deploy2@2 -> gate-2
 
@@ -788,14 +797,14 @@ def test_multi_gate_resume_via_initial_state_aligns_keys(tmp_path):
         db.record_result(res)
         return res, ex
 
-    # leg1: deploy1 (gate-0) で pause。
+    # leg1: pause at deploy1 (gate-0).
     conn1 = connect(db_path)
     res1, ex1 = resume_leg(conn1)
     assert res1.paused and res1.pending["gate_key"] == "gate-0" and ex1 == []
     LoopStore(conn1).resolve_decision(RUN_ID, "gate-0", "approve")
     conn1.close()
 
-    # leg2: deploy1 実行 → deploy2 (gate-2) で pause。initial_state は iter0 (deploy1 未実行)。
+    # leg2: execute deploy1 -> pause at deploy2 (gate-2). initial_state is iter0 (deploy1 not executed).
     conn2 = connect(db_path)
     res2, ex2 = resume_leg(conn2)
     assert res2.paused and res2.pending["gate_key"] == "gate-2"
@@ -803,11 +812,11 @@ def test_multi_gate_resume_via_initial_state_aligns_keys(tmp_path):
     LoopStore(conn2).resolve_decision(RUN_ID, "gate-2", "approve")
     conn2.close()
 
-    # leg3: initial_state は iter2 (deploy1/work 済み)。deploy1 を再訪せず deploy2 のみ実行。
+    # leg3: initial_state is iter2 (deploy1/work done). Do not revisit deploy1; execute only deploy2.
     conn3 = connect(db_path)
     res3, ex3 = resume_leg(conn3)
     assert res3.status == "stopped"
-    assert ex3 == ["deploy2"]  # 中断ゲート deploy2 を 1 回だけ実行、deploy1 は再訪しない
+    assert ex3 == ["deploy2"]  # execute interrupted gate deploy2 exactly once; do not revisit deploy1
     store3 = LoopStore(conn3)
     assert store3.get_decision(RUN_ID, "gate-0")["status"] == "executed"
     assert store3.get_decision(RUN_ID, "gate-2")["status"] == "executed"
@@ -816,7 +825,7 @@ def test_multi_gate_resume_via_initial_state_aligns_keys(tmp_path):
     conn3.close()
 
 
-# -- DBProgressLog 統合: pause した結果を record_result に渡してもクラッシュしない ---
+# -- DBProgressLog integration: record_result accepts paused results without crashing
 
 
 def test_db_progress_log_record_result_handles_paused(tmp_path):
@@ -829,8 +838,8 @@ def test_db_progress_log_record_result_handles_paused(tmp_path):
             gather=gather, gate=gate, on_step=db.on_step,
         )
         assert result.paused
-        db.record_result(result)  # CHECK 制約でクラッシュしてはならない
-    # pause は終端でない: run は running のまま、stop_reason も書かれない。
+        db.record_result(result)  # must not crash on a CHECK constraint
+    # pause is not terminal: the run remains running, and stop_reason is not written.
     store = LoopStore(connect(tmp_path / "s.db"))
     assert store.get_run(RUN_ID)["status"] == "running"
     assert store.get_stop_reason(RUN_ID) is None
@@ -841,19 +850,20 @@ def test_db_progress_log_record_result_handles_paused(tmp_path):
     assert len(paused_events) == 1
 
 
-# -- 防御ガード / 周辺 API --------------------------------------------------
+# -- Defensive Guards / Surrounding API --------------------------------------
 
 
 def test_resume_with_diverged_action_is_rejected(tmp_path):
-    # 提案列が resume 間でずれ、別の不可逆 action に同じ gate_key が割り当たると、
-    # 記録済み action と一致しないため loud に弾く (誤適用を silent に許さない)。
+    # If the proposed sequence shifts between resumes and a different irreversible action gets
+    # the same gate_key, reject loudly because it does not match the recorded action (do not
+    # silently allow misapplication).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
     store.request_decision(RUN_ID, "gate-0", "deploy-A")
     store.resolve_decision(RUN_ID, "gate-0", "approve")
 
-    # 同じ gate-0 に別 action "deploy-B" が来る世界で再開する。
+    # Resume in a world where a different action, "deploy-B", arrives at the same gate-0.
     gather, act, _ = make_world(["deploy-B"])
     gate = HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
     with pytest.raises(ValueError, match="does not match"):
@@ -864,14 +874,15 @@ def test_resume_with_diverged_action_is_rejected(tmp_path):
 
 
 def test_resume_with_diverged_action_on_executed_gate_is_rejected(tmp_path):
-    # executed 済みのゲートに、提案列のずれで *別の* 不可逆 action が同じキーで来た場合も
-    # silent に skip せず loud に弾く (新しい不可逆 action を握り潰さない)。
+    # If a *different* irreversible action arrives at the same key for an already executed gate
+    # because the proposal sequence shifted, reject loudly instead of silently skipping (do not
+    # suppress a new irreversible action).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
     store.request_decision(RUN_ID, "gate-0", "deploy-A")
     store.resolve_decision(RUN_ID, "gate-0", "approve")
-    store.claim_execution(RUN_ID, "gate-0")  # 既に実行済みにする
+    store.claim_execution(RUN_ID, "gate-0")  # mark as already executed
 
     gather, act, _ = make_world(["deploy-B"])
     gate = HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
@@ -883,13 +894,13 @@ def test_resume_with_diverged_action_on_executed_gate_is_rejected(tmp_path):
 
 
 def test_resume_with_diverged_action_on_pending_gate_is_rejected(tmp_path):
-    # 前の run で登録済みの pending (action="deploy-A") を、提案列のずれた resume
-    # (resolver あり) で別 action "deploy-B" として拾った場合、resolver が古い pending を
-    # 承認して現在の別 action を実行する事故を防ぐため loud に弾く。
+    # If a pending decision registered in a previous run (action="deploy-A") is encountered as
+    # another action, "deploy-B", on a shifted resume with a resolver, reject loudly to prevent
+    # the resolver from approving the old pending decision and executing the current different action.
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     HumanGate(on=is_deploy_prefix, store=store, run_id=RUN_ID)
-    store.request_decision(RUN_ID, "gate-0", "deploy-A")  # 未 resolve の pending
+    store.request_decision(RUN_ID, "gate-0", "deploy-A")  # unresolved pending decision
 
     executed = []
 
@@ -909,7 +920,7 @@ def test_resume_with_diverged_action_on_pending_gate_is_rejected(tmp_path):
             act=act, verify=never_done, conditions=[MaxIterations(1)],
             gather=gather, gate=gate,
         )
-    assert executed == []  # 別 action は実行されない
+    assert executed == []  # different action is not executed
 
 
 def test_resolver_must_return_a_decision(tmp_path):
@@ -918,7 +929,7 @@ def test_resolver_must_return_a_decision(tmp_path):
     gather, act, _ = make_world(ACTIONS)
     gate = HumanGate(
         on=is_deploy, store=store, run_id=RUN_ID,
-        resolver=lambda pending: "approve",  # Decision ではなく素の文字列
+        resolver=lambda pending: "approve",  # raw string instead of Decision
     )
     with pytest.raises(TypeError, match="must return a Decision"):
         run_loop(
@@ -939,22 +950,23 @@ def test_claim_execution_is_single_winner(tmp_path):
     store = LoopStore(conn)
     store.load_or_init(RUN_ID)
     store.request_decision(RUN_ID, "g1", "deploy")
-    # 未解決は実行権を主張できない。
+    # Unresolved decisions cannot claim execution rights.
     with pytest.raises(ValueError, match="cannot mark unresolved"):
         store.claim_execution(RUN_ID, "g1")
     store.resolve_decision(RUN_ID, "g1", "approve")
-    # 最初の主張は勝者 (True) で executed へ遷移。
+    # The first claim is the winner (True) and transitions to executed.
     assert store.claim_execution(RUN_ID, "g1") is True
     row = store.get_decision(RUN_ID, "g1")
     assert row["status"] == "executed" and row["executed_at"] is not None
-    # 二度目以降は敗者 (False): 二重実行を許さない。
+    # Subsequent claims lose (False): double execution is not allowed.
     assert store.claim_execution(RUN_ID, "g1") is False
     assert store.claim_execution(RUN_ID, "g1") is False
 
 
 def test_claim_execution_rejects_non_executable_decisions(tmp_path):
-    # reject/respond は action を実行しないので、store API を直接叩いても executed へ
-    # 遷移させない (誤遷移すると後続 resume が却下/応答の記録を skip して状態を壊す)。
+    # reject/respond do not execute actions, so even direct store API calls must not transition
+    # them to executed (a bad transition would make later resumes skip rejection/response records
+    # and corrupt state).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     store.load_or_init(RUN_ID)
@@ -963,12 +975,12 @@ def test_claim_execution_rejects_non_executable_decisions(tmp_path):
         store.resolve_decision(RUN_ID, key, kind, payload=("msg" if kind == "respond" else None))
         with pytest.raises(ValueError, match="not executable"):
             store.claim_execution(RUN_ID, key)
-        # status は resolved のまま (executed に化けていない)。
+        # status remains resolved (it has not turned into executed).
         assert store.get_decision(RUN_ID, key)["status"] == "resolved"
 
 
 def test_claim_execution_single_winner_across_connections(tmp_path):
-    # 別接続 (= 並行 resume を模擬) からの主張でも、勝者は 1 者だけ。
+    # Even with claims from another connection (= simulating concurrent resumes), there is only one winner.
     db_path = tmp_path / "s.db"
     store_a = LoopStore(connect(db_path))
     store_a.load_or_init(RUN_ID)
@@ -977,4 +989,4 @@ def test_claim_execution_single_winner_across_connections(tmp_path):
 
     store_b = LoopStore(connect(db_path))
     assert store_a.claim_execution(RUN_ID, "g1") is True
-    assert store_b.claim_execution(RUN_ID, "g1") is False  # 敗者は実行しない
+    assert store_b.claim_execution(RUN_ID, "g1") is False  # loser does not execute

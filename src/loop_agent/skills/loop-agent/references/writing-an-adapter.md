@@ -1,98 +1,116 @@
 > This file is a load-on-demand bundled copy of `docs/adapters/writing-an-adapter.md`. The canonical source is `docs/adapters/writing-an-adapter.md` in the repository.
 
-# 新しい act アダプタの書き方
+# Writing a New `act` Adapter
 
-loop-agent の `act` シームは「1 反復の実行体」を 1 つの関数
-（`Callable[[context], ActOutcome]`）に閉じ込めます。外部のエージェント CLI
-（Claude Code・Codex・将来の任意のツール）を headless 起動して `act` に差し込む
-ものを **アダプタ** と呼びます。`loop_agent.adapters` には参照実装として
-[`ClaudeCodeAct`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/claude_code.py) と
-[`CodexAct`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/codex.py) があり、両者は
-**subprocess コマンド・フラグ・token/output 解析だけ** が違い、結果の形と
-プロンプト整形は完全に同型です。
+The loop-agent `act` seam wraps the executor for one iteration in a single
+function (`Callable[[context], ActOutcome]`). An **adapter** is the component that
+starts an external agent CLI (Claude Code, Codex, or any future tool) headlessly
+and connects it to `act`. `loop_agent.adapters` includes
+[`ClaudeCodeAct`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/claude_code.py) and
+[`CodexAct`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/codex.py) as reference
+implementations. They differ **only in subprocess command flags and token/output
+parsing**; the result shape and prompt formatting are completely isomorphic.
 
-この文書は、3 つ目以降のアダプタ（例: `GeminiAct`・`AiderAct`・社内ツール）を
-**同じ契約に従って正しく書く** ための canonical な手引きです。落とし穴は
-[`ClaudeCodeAct` / `CodexAct` が既に踏んだもの](#hard-won-lessons実走で踏んだ落とし穴)
-を 1 か所に集約してあります。まずそこを読んでから書き始めると速いです。
+This document is the canonical guide for writing a third adapter and any later
+adapters, such as `GeminiAct`, `AiderAct`, or internal tools, **correctly under
+the same contract**. The pitfalls that
+[`ClaudeCodeAct` / `CodexAct` already ran into](#hard-won-lessons-from-real-runs)
+are collected in one place. Reading that section before you start is the fastest
+way to orient yourself.
 
-> アダプタは loop-agent の新機能ではありません。`act` シームで user が今日でも
-> 書けるパターンを、落とし穴ごと正規化したものです。新しいアダプタも
-> 「`ActOutcome` を返す関数」である限り、コア（`run_loop`）を一切変更せずに差し込めます。
+> Adapters are not a new loop-agent feature. They standardize a pattern that
+> users can already write through the `act` seam today, including its pitfalls.
+> A new adapter can be plugged in without changing the core (`run_loop`) at all,
+> as long as it is a function that returns `ActOutcome`.
 
-> **2 種類のアダプタがある。** この文書が扱うのは外部 CLI を **subprocess 起動する
-> 実行体アダプタ**（`ClaudeCodeAct` / `CodexAct`）で、以下の 4 か条・token 解析・
-> Mock の話はそれ向けです。もう 1 種類、**他の `act` フックを合成するアダプタ** が
-> あり、その正準例が
-> [`ModelLadder`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/model_ladder.py)（困難タスクで
-> 強いモデルへ自動エスカレーション、Issue #53）です。合成アダプタは subprocess を
-> 起動しないので `build_command` / `runner` / `parse_tokens` を持たず、下の共通契約
-> ハーネス（`ADAPTER_SPECS`）には**載せません**（token / `failed` / graceful 終了の
-> 保証は合成される各段の実行体アダプタが満たし、合成側は段の `ActOutcome` を透過
-> します）。`ModelLadder` は「`act` が `Callable` だから user も書けるパターン」を
-> packagize した例で、stateful な試行カウント・`act` が `verify` の goal 判定を
-> 見られない制約・異種合成（`ClaudeCodeAct` + `CodexAct`）の落とし穴をヘッジして
-> います。新しい合成アダプタを書くなら `ModelLadder` を雛形にしてください。
-
----
-
-## act シームの契約（4 か条）
-
-アダプタは loop コアの性質（境界で必ず止まる / 予算が効く / 認証は外部に委譲）を
-壊さないために、次の 4 つを必ず守ります。`ClaudeCodeAct` / `CodexAct` はいずれも
-これを満たしています。
-
-1. **例外でループを殺さない。** timeout 超過・非 0 終了・実行ファイル不在など
-   「実行できなかった/失敗した」は、例外を送出せず `failed=True` の結果を
-   `ActOutcome.observation` に載せて graceful に返します。これにより verify が
-   `outcome.observation.failed` を見て続行/終了を判断でき、境界で評価される
-   `Timeout` / `MaxIterations` は常に効きます。**外に漏らしてよい例外は原則ゼロ**
-   です（`subprocess.TimeoutExpired` と `OSError` は捕まえて `failed` に変換する）。
-   唯一の例外は `render_prompt`: `prompt_template` が context に無いフィールドを
-   参照していると **eager に `KeyError` を送出** します（実行前の設定ミスは握り潰さず
-   即失敗させる設計。下のスケルトンでも `render_prompt` は `try` の外で呼ぶ）。この
-   `KeyError` は意図的に `LoopError` 階層の外に置いた唯一の組み込み例外です（`str.format`
-   の意味論を踏襲）。ライブラリの例外階層全体は [../errors.md](errors.md) を参照。
-
-2. **token を予算に積む。** 応答から処理トークン総数を取り出し
-   `ActOutcome.tokens` に載せます。driver がこれを `state.tokens_used` に積むので
-   `TokenBudget` がそのまま効きます。**取れないときは 0**（テキスト出力で usage が
-   無いのは正常。0 は安全側）。トークンは **成否に関わらず計上** します（失敗試行も
-   実際にトークンを消費しうる）。
-
-3. **auth は CLI に委譲する。** 子プロセスは既定で起動側の `os.environ` を継承し、
-   外部 CLI の既存セッション（`~/.claude` / `~/.codex` 等のログイン）を第一義に
-   使わせます。API キー（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等）が環境にあれば
-   CLI 側のフォールバックとして働きます。アダプタ自身がキーを読んだり貼ったりしない
-   こと。秘匿値を注入したいときは `env=` で **上書きマージ** する経路のみ用意します。
-
-4. **stdin を塞ぐ（ハング防止）。** headless ループでは親 stdin が pipe/閉端の
-   ことがあり、子 CLI が「追加入力」を読みに行くと **ハング** します。プロンプトは
-   必ず位置引数（`--` の後ろ）で確定させ、対話入力を読む CLI には
-   `stdin=subprocess.DEVNULL` を渡します（[Codex の実害](#1-codex-は-stdin-が-pipe-だと追加入力を読みハングする)を参照）。
+> **There are two kinds of adapters.** This document covers **executor adapters**
+> that start an external CLI as a subprocess (`ClaudeCodeAct` / `CodexAct`), and
+> the four rules, token parsing, and mock guidance below are for that kind. The
+> other kind is an **adapter that composes other `act` hooks**. The canonical
+> example is
+> [`ModelLadder`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/model_ladder.py)
+> (automatic escalation to a stronger model for difficult tasks, Issue #53).
+> Composition adapters do not start subprocesses, so they do not have
+> `build_command`, `runner`, or `parse_tokens`, and they **are not listed** in the
+> common contract harness (`ADAPTER_SPECS`). The token, `failed`, and graceful
+> termination guarantees are satisfied by each composed executor adapter, while
+> the composition layer passes through the step's `ActOutcome`. `ModelLadder`
+> packages a pattern that users can also write because `act` is `Callable`, and
+> it avoids pitfalls around stateful attempt counts, the constraint that `act`
+> cannot see the `verify` goal decision, and heterogeneous composition
+> (`ClaudeCodeAct` + `CodexAct`). Use `ModelLadder` as the template when writing a
+> new composition adapter.
 
 ---
 
-## 結果の形（`ActResult` 契約）
+## The `act` Seam Contract: Four Rules
 
-`ActOutcome.observation` に載せる結果オブジェクトは、共通の構造的契約
-[`ActResult`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/base.py)（`Protocol`）に従います。
-8 フィールドと `__str__`（応答本文を返す）を持ちます:
+Adapters must always follow the four rules below so they do not break core loop
+properties: always stopping at boundaries, respecting budgets, and delegating
+authentication externally. Both `ClaudeCodeAct` and `CodexAct` satisfy these
+rules.
 
-| フィールド | 型 | 意味 |
+1. **Do not kill the loop with exceptions.** Cases where execution did not happen
+   or failed, such as a timeout, non-zero exit, or missing executable, should
+   return gracefully with `failed=True` in `ActOutcome.observation` instead of raising
+   an exception. This lets `verify` inspect `outcome.observation.failed` and
+   decide whether to continue or stop, while boundary checks such as `Timeout`
+   and `MaxIterations` remain effective. As a rule, **no exceptions should leak
+   out**. Catch `subprocess.TimeoutExpired` and `OSError` and convert them to
+   `failed`. The only exception is `render_prompt`: when `prompt_template`
+   references a field that is not present in the context, it **eagerly raises
+   `KeyError`**. This is intentional: a pre-execution configuration error should
+   fail immediately rather than be swallowed. The skeleton below also calls
+   `render_prompt` outside the `try` block. This `KeyError` is the one deliberate
+   built-in exception outside the `LoopError` hierarchy, following the semantics
+   of `str.format`. See [../errors.md](errors.md) for the full library exception
+   hierarchy.
+
+2. **Add tokens to the budget.** Extract the total number of processing tokens
+   from the response and put it in `ActOutcome.tokens`. The driver adds this to
+   `state.tokens_used`, so `TokenBudget` works as-is. **Use 0 when the count is
+   unavailable**; text output without usage data is normal, and 0 is the safe
+   fallback. Count tokens **regardless of success or failure**, because failed
+   attempts can still consume tokens.
+
+3. **Delegate authentication to the CLI.** By default, the child process inherits the
+   launcher's `os.environ`, so the external CLI can primarily use its existing
+   session, such as login state under `~/.claude` or `~/.codex`. If API keys such
+   as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are present in the environment, they
+   can act as a CLI-side fallback. The adapter itself must not read or paste
+   keys. If callers need to inject secret values, provide only an `env=` path that
+   performs an **override merge**.
+
+4. **Close stdin to prevent hangs.** In headless loops, the parent stdin may be a
+   pipe or closed endpoint. If a child CLI tries to read "additional input", it
+   can **hang**. Always finalize the prompt as a positional argument after `--`,
+   and pass `stdin=subprocess.DEVNULL` to CLIs that read interactive input. See
+   [the Codex failure mode](#1-codex-reads-additional-input-and-hangs-when-stdin-is-a-pipe).
+
+---
+
+## Result Shape: The `ActResult` Contract
+
+The result object placed in `ActOutcome.observation` follows the common
+structural contract
+[`ActResult`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/base.py)
+(`Protocol`). It has eight fields and `__str__`, which returns the response body.
+
+| Field | Type | Meaning |
 |---|---|---|
-| `text` | `str` | アシスタント応答の本文。`str(result)` も同じ本文を返す。 |
-| `tokens` | `int` | この呼び出しが消費したトークン総数（予算計上用）。 |
-| `failed` | `bool` | 失敗（非 0 終了 / CLI 報告エラー / timeout / 起動失敗）か。 |
-| `returncode` | `Optional[int]` | 子プロセスの終了コード（起動失敗・timeout では `None`）。 |
-| `error` | `str` | 失敗時の簡潔なエラー本文（成功時は空文字）。 |
-| `stdout` / `stderr` | `str` | 子プロセスの生出力（デバッグ・再解析用）。 |
-| `command` | `tuple[str, ...]` | 実際に実行したコマンド（引数列）。 |
+| `text` | `str` | The assistant response body. `str(result)` returns the same body. |
+| `tokens` | `int` | Total tokens consumed by this call, used for budget accounting. |
+| `failed` | `bool` | Whether the call failed: non-zero exit, CLI-reported error, timeout, or launch failure. |
+| `returncode` | `Optional[int]` | Child process exit code; `None` for launch failures and timeouts. |
+| `error` | `str` | Concise error body on failure; empty string on success. |
+| `stdout` / `stderr` | `str` | Raw child process output for debugging and reparsing. |
+| `command` | `tuple[str, ...]` | The command that was actually executed, as an argument sequence. |
 
-自分のアダプタの Result は、共通の具体 dataclass
-[`ActResultBase`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/base.py) を継承するのが最短です。
-全フィールドに既定値があるので、`@dataclass` を付けて docstring を足すだけで、
-8 フィールドの形・キーワード生成・`str(result)` -> 本文 がそのまま揃います:
+The shortest path for your adapter's Result is to inherit from the common
+concrete dataclass
+[`ActResultBase`](https://github.com/happy-ryo/loop-agent/blob/main/src/loop_agent/adapters/base.py).
+Because all fields have defaults, adding `@dataclass` and a docstring is enough
+to get the eight-field shape, keyword construction, and `str(result)` -> body:
 
 ```python
 from dataclasses import dataclass
@@ -100,29 +118,32 @@ from loop_agent.adapters import ActResultBase
 
 @dataclass
 class GeminiResult(ActResultBase):
-    """1 回の Gemini 呼び出しの構造化結果。"""
-    # フィールド再定義は不要。8 フィールドを ActResultBase から継承する。
+    """Structured result for one Gemini call."""
+    # No field redefinition is needed. The eight fields come from ActResultBase.
 ```
 
-> なぜ Protocol と base dataclass の両方があるのか:
-> **`ActResult`（Protocol）は「満たすべき契約」**、**`ActResultBase`（dataclass）は
-> 「契約を満たす最短の実装」** です。結果を別の dataclass で独自に作っても、8
-> フィールド + `__str__` を持てば `ActResult` 契約に構造的に適合します
-> （`isinstance(result, ActResult)` も `True`）。異種アダプタを混ぜたチェーンでも
-> verify 側は `ActResult` だけを見ればよく、合成性が保てます。
+> Why both a Protocol and a base dataclass exist:
+> **`ActResult` (Protocol) is the contract to satisfy**, while **`ActResultBase`
+> (dataclass) is the shortest implementation that satisfies it**. You may build a
+> result as a separate custom dataclass; as long as it has the eight fields plus
+> `__str__`, it structurally conforms to the `ActResult` contract
+> (`isinstance(result, ActResult)` is also `True`). Even in chains that mix
+> heterogeneous adapters, `verify` only needs to look at `ActResult`, preserving
+> composability.
 
 ---
 
-## アダプタ本体の骨格
+## Adapter Body Skeleton
 
-`ClaudeCodeAct` / `CodexAct` と同じ骨格を `@dataclass` で書きます。要点だけ抜き出すと:
+Write the adapter with `@dataclass` using the same skeleton as `ClaudeCodeAct` and
+`CodexAct`. The essential shape is:
 
 ```python
 import os, subprocess
 from dataclasses import dataclass
 from typing import Any, Optional, Mapping
 from loop_agent import ActOutcome
-from loop_agent.adapters import Runner, render_prompt   # 共通の実行シーム/整形
+from loop_agent.adapters import Runner, render_prompt   # Common execution seam/formatting
 
 @dataclass
 class GeminiAct:
@@ -131,17 +152,17 @@ class GeminiAct:
     env: Optional[Mapping[str, str]] = None
     gemini_bin: str = "gemini"
     cwd: Optional[str] = None
-    runner: Optional[Runner] = None        # テストで subprocess.run を差し替える注入点
+    runner: Optional[Runner] = None        # Injection point for replacing subprocess.run in tests
 
     def build_command(self, prompt: str) -> list[str]:
         cmd = [self.gemini_bin, "...flags..."]
-        cmd += ["--", prompt]              # プロンプトは必ず "--" の後ろの位置引数
+        cmd += ["--", prompt]              # The prompt must be a positional arg after "--"
         return cmd
 
     def _build_env(self) -> dict[str, str]:
-        base = dict(os.environ)            # 既存 CLI セッションを継承
+        base = dict(os.environ)            # Inherit the existing CLI session
         if self.env:
-            base.update(self.env)          # env= で上書きマージ(秘匿値はこの経路)
+            base.update(self.env)          # Override-merge through env= (secret values use this path)
         return base
 
     def __call__(self, context: Any) -> ActOutcome:
@@ -152,118 +173,141 @@ class GeminiAct:
             proc = run(
                 command, capture_output=True, text=True,
                 timeout=self.timeout, env=self._build_env(), cwd=self.cwd,
-                stdin=subprocess.DEVNULL,  # 対話入力を読む CLI ならハング防止に必須
+                stdin=subprocess.DEVNULL,  # Required to prevent hangs for CLIs that read interactive input
             )
         except subprocess.TimeoutExpired:
             return ActOutcome(observation=GeminiResult(
                 failed=True, error=f"timeout ({self.timeout:g}s)",
                 command=tuple(command)), tokens=0)
-        except OSError as exc:             # 実行ファイル不在/権限なし(FileNotFound 等)
+        except OSError as exc:             # Missing executable / permission error (FileNotFound, etc.)
             return ActOutcome(observation=GeminiResult(
                 failed=True, error=f"could not launch {self.gemini_bin!r}: {exc}",
                 command=tuple(command)), tokens=0)
 
         stdout, stderr = proc.stdout or "", proc.stderr or ""
-        text, tokens, is_error = _parse_result(stdout, stderr)   # CLI 固有の解析
+        text, tokens, is_error = _parse_result(stdout, stderr)   # CLI-specific parsing
         failed = proc.returncode != 0 or is_error
         error = (stderr.strip() or text.strip() or f"exit={proc.returncode}") if failed else ""
         result = GeminiResult(text=text, tokens=tokens, failed=failed,
                               returncode=proc.returncode, error=error,
                               stdout=stdout, stderr=stderr, command=tuple(command))
-        return ActOutcome(observation=result, tokens=tokens)  # tokens は成否に依らず計上
+        return ActOutcome(observation=result, tokens=tokens)  # Count tokens regardless of success
 ```
 
-CLI 固有なのは `build_command`（フラグ）と `_parse_result`/`parse_tokens`
-（output/token 解析）だけです。`render_prompt` / `Runner` / `_build_env` の形・
-4 か条の守り方は全アダプタ共通なので、上の骨格をそのまま写せます。
+Only `build_command` (flags) and `_parse_result` / `parse_tokens` (output and
+token parsing) are CLI-specific. The shape of `render_prompt`, `Runner`,
+`_build_env`, and the way the four rules are enforced are common to all adapters,
+so you can copy the skeleton above directly.
 
 ---
 
-## token 計上の注意点（最重要）
+## Token Accounting Notes (Most Important)
 
-トークン解析は **二重計上が最も起きやすい** 箇所です。アダプタごとに usage の
-意味論が違うので、各 CLI のスキーマを確認してから合算ルールを決めます。
+Token parsing is the place where **double counting is most likely**. Each adapter
+must confirm the usage semantics of its CLI before deciding the summation rule,
+because those semantics differ by adapter.
 
-- **Claude Code**: `usage` の `input_tokens` / `output_tokens` /
-  `cache_creation_input_tokens` / `cache_read_input_tokens` は互いに素な加算
-  バケットですが、計上するのは **`input_tokens + output_tokens +
-  cache_creation_input_tokens` の 3 種だけ** です（`_sum_token_fields` の
-  allowlist `_COUNTED_TOKEN_FIELDS`）。`cache_read_input_tokens` は **除外** します
-  ―― 課金重みが軽く（通常 input の ~0.1x で実質ほぼ無料）、内部マルチターンで
-  毎ターン cache を読み直すため累積が桁違いに膨らみ、`TokenBudget` を誤発火させる
-  からです（[Issue #55](#2-token-を二重計上すると-tokenbudget-が誤発火する)）。
-- **Codex / OpenAI**: `usage` の `cached_input_tokens` は `input_tokens` の、
-  `reasoning_output_tokens` は `output_tokens` の **部分集合** です。全部足すと
-  二重計上になるので、総処理量は **`input_tokens + output_tokens` のみ** を足し、
-  内訳が無く `total_tokens` だけのときはそれにフォールバックします
-  （`_sum_codex_tokens`）。
+- **Claude Code**: The `usage` fields `input_tokens`, `output_tokens`,
+  `cache_creation_input_tokens`, and `cache_read_input_tokens` are mutually
+  disjoint additive buckets, but only **three fields are counted:
+  `input_tokens + output_tokens + cache_creation_input_tokens`**. This is the
+  allowlist `_COUNTED_TOKEN_FIELDS` used by `_sum_token_fields`.
+  `cache_read_input_tokens` is **excluded** because it has a low billing weight
+  (usually about 0.1x normal input and effectively close to free), and because
+  internal multi-turn execution rereads cache every turn, making the cumulative
+  value grow by orders of magnitude and falsely trigger `TokenBudget`. See
+  [Issue #55](#2-double-counting-tokens-makes-tokenbudget-fire-too-early).
+- **Codex / OpenAI**: In `usage`, `cached_input_tokens` is a **subset** of
+  `input_tokens`, and `reasoning_output_tokens` is a **subset** of
+  `output_tokens`. Adding all fields would double count them, so total processing
+  volume is **only `input_tokens + output_tokens`**. When those breakdown fields
+  are absent and only `total_tokens` exists, fall back to it (`_sum_codex_tokens`).
 
-> **必ず CLI の usage スキーマを確認し、「加算バケットか / 部分集合か」を見極めて
-> から合算ルールを書く。** 「全フィールド足す」をコピーすると、部分集合を持つ CLI で
-> 静かに二重計上し、`TokenBudget` が早期誤発火します（[Issue #55 の bug class](#2-token-を二重計上すると-tokenbudget-が誤発火する)）。
+> **Always confirm the CLI's usage schema and determine whether fields are
+> additive buckets or subsets before writing the summation rule.** Copying an
+> "add every field" rule silently double counts subset fields for CLIs that have
+> them and causes `TokenBudget` to fire too early. This is the
+> [Issue #55 bug class](#2-double-counting-tokens-makes-tokenbudget-fire-too-early).
 
-JSON/JSONL で usage が取れないとき用の **正規表現フォールバック** も、部分集合
-キーに誤マッチしないよう先頭引用符でアンカーします（`"input_tokens"` だけに当て、
-`"cached_input_tokens"` には当てない）。複数ソース（stdout/stderr）で **合算しない**
-（最初にヒットしたソースの値を返す）のも二重計上回避のためです。
-
----
-
-## hard-won lessons（実走で踏んだ落とし穴）
-
-### 1. Codex は stdin が pipe だと「追加入力」を読みハングする
-
-headless ループでは親 stdin が pipe/閉端のことがあり、`codex exec` はそれを
-「追加入力」と解釈して読みに行き、**プロンプトを位置引数で渡していてもハング**
-します。`stdin=subprocess.DEVNULL` を渡して塞ぐのが必須です。対話入力を読む CLI を
-アダプタ化するときは、まずこれを疑ってください。
-
-### 2. token を二重計上すると TokenBudget が誤発火する
-
-Self-translation PoC で `ClaudeCodeAct` の初期実装が `cache_read` を毎反復累積し、
-`TokenBudget` を実際よりずっと早く発火させる bug が見つかりました（Issue #55）。
-原因は「usage の全フィールドを足す」ロジックが、課金が軽く累積で膨らむ
-`cache_read_input_tokens` まで貪欲に拾っていたこと。**修正済み**: 計上対象を
-`input_tokens + output_tokens + cache_creation_input_tokens` の allowlist に絞り、
-`cache_read` は除外しました（token-cost ポリシ。`_sum_token_fields`）。
-**新しいアダプタを足すたびに「コストでない/部分集合の usage を計上していないか」の
-parametrize テストを必ず追加** してください
-（[`tests/adapters/test_contract.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/test_contract.py) の
-token guard が全アダプタ横断で構造的に catch します）。
-
-### 3. CLI の `--json` スキーマはバージョンで揺れる
-
-`codex exec --json` のイベント型は dotted（`item.completed`）と snake_case
-（`item_completed` / `task_complete`）がバージョンで揺れます。応答本文の在処も
-`item.completed` の `agent_message` / 直接の `agent_message` イベント /
-ストリーミング delta / 完了イベントの `last_agent_message` と複数あります。
-**代表形を網羅して「どれか取れれば本文」とし、完全な本文 > last_message > delta
-連結の優先順位** で拾うと壊れにくくなります。Claude Code 側も `--output-format`
-が `json` と `stream-json` で形が違い、後者は最終 `result` 行を拾います。
-**実 CLI の出力を 1 度キャプチャしてからスキーマを書く** のが安全です。
-
-### 4. 可変長オプションがプロンプトを飲む
-
-`--allowed-tools <tools...>` や `--add-dir <path>` のような **値を取る/可変長の
-オプション** は、区切り無しだと直後のプロンプトを「次の値」として貪欲に飲み込み、
-CLI がプロンプトを失って空リクエスト or timeout までハングします。POSIX 慣例の
-`--` でオプション解析を打ち切り、プロンプトを位置引数に確定させます
-（`cmd += ["--", prompt]`）。
+The **regex fallback** for cases where JSON/JSONL usage is unavailable must also
+anchor on the leading quote so it does not accidentally match subset keys. For
+example, match only `"input_tokens"`, not `"cached_input_tokens"`. Likewise, do
+**not sum across multiple sources** such as stdout and stderr; return the value
+from the first source that matches to avoid double counting.
 
 ---
 
-## Mock の書き方（テスト用差し替え点）
+<a id="hard-won-lessons-from-real-runs"></a>
 
-subprocess を使わずに `act` 契約を満たす in-memory 版を用意すると、ループの
-組み立て・`TokenBudget`・失敗系を高速に検証できます。`MockClaudeCodeAct` /
-`MockCodexAct` と同じ契約で書きます:
+## Hard-Won Lessons
 
-- `responses`（`str` / `Mapping` / Result のいずれか）を順に返し、使い切ったら
-  最後の応答に張り付く（`MaxIterations` 等の境界で安全に止まる）。
-- `str` -> `text`（tokens 0）、`Mapping` -> Result フィールド展開、Result -> そのまま。
-- レンダリング済みプロンプトを `prompts` に記録し、テストから検証できる。
-- `responses=[]` も未対応の型も `ConfigError`（`LoopError` 階層。後方互換のため
-  それぞれ `ValueError` / `TypeError` も継承する。[../errors.md](errors.md)）。
+<a id="1-codex-reads-additional-input-and-hangs-when-stdin-is-a-pipe"></a>
+
+### 1. Codex Hangs When stdin Is a Pipe and It Reads "Additional Input"
+
+In headless loops, the parent stdin may be a pipe or closed endpoint, and
+`codex exec` interprets it as "additional input" and tries to read it. It can
+**hang even when the prompt was passed as a positional argument**. Passing
+`stdin=subprocess.DEVNULL` to close that input path is required. When adapting any
+CLI that reads interactive input, suspect this first.
+
+<a id="2-double-counting-tokens-makes-tokenbudget-fire-too-early"></a>
+
+### 2. Double-Counting Tokens Causes TokenBudget to Fire Incorrectly
+
+The self-translation PoC found a bug where an early `ClaudeCodeAct`
+implementation accumulated `cache_read` every iteration and triggered
+`TokenBudget` much earlier than reality (Issue #55). The cause was an "add all
+usage fields" rule that greedily included `cache_read_input_tokens`, whose
+billing weight is low and whose cumulative value grows large. **Fixed**: counted
+fields were narrowed to the allowlist
+`input_tokens + output_tokens + cache_creation_input_tokens`, and `cache_read`
+was excluded (token-cost policy, `_sum_token_fields`). **Every time you add a new
+adapter, add a parametrized test that proves it is not counting non-cost or
+subset usage fields**. The token guard in
+[`tests/adapters/test_contract.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/test_contract.py)
+catches this structurally across all adapters.
+
+### 3. CLI `--json` Schemas Vary by Version
+
+The event types emitted by `codex exec --json` vary by version between dotted
+forms (`item.completed`) and snake_case forms (`item_completed` /
+`task_complete`). The response body can also appear in several places:
+`agent_message` inside `item.completed`, a direct `agent_message` event,
+streaming deltas, or `last_agent_message` on a completion event. The robust
+approach is to cover the representative shapes, accept the body from whichever
+one is present, and use the priority **complete body > last_message >
+concatenated deltas**. On the Claude Code side, `--output-format` also differs
+between `json` and `stream-json`; the latter reads the final `result` line.
+**Capture real CLI output once before writing the schema.**
+
+### 4. Variable-Length Options Consume the Prompt
+
+Options that take values or variable-length values, such as
+`--allowed-tools <tools...>` and `--add-dir <path>`, greedily consume the
+following prompt as "the next value" when there is no separator. The CLI then
+loses the prompt and may send an empty request or hang until timeout. Use the
+POSIX convention `--` to stop option parsing and make the prompt a positional
+argument (`cmd += ["--", prompt]`).
+
+---
+
+## How to Write Mocks (Test Replacement Points)
+
+An in-memory implementation that satisfies the `act` contract without using
+subprocesses lets tests verify loop construction, `TokenBudget`, and failure
+paths quickly. Follow the same contract as `MockClaudeCodeAct` and
+`MockCodexAct`:
+
+- Return `responses` (`str`, `Mapping`, or Result) in order, and after they are
+  exhausted, keep returning the final response. This lets boundaries such as
+  `MaxIterations` stop safely.
+- Convert `str` to `text` with 0 tokens; expand `Mapping` into Result fields; and
+  return Result values as-is.
+- Record rendered prompts in `prompts` so tests can inspect them.
+- Treat `responses=[]` and unsupported response types as `ConfigError`
+  (`LoopError` hierarchy; for backward compatibility these also inherit from
+  `ValueError` and `TypeError`, respectively. See [../errors.md](errors.md)).
 
 ```python
 from loop_agent.adapters import MockClaudeCodeAct
@@ -272,61 +316,71 @@ act = MockClaudeCodeAct(responses=[{"text": "work", "tokens": 1200}, "DONE"])
 
 ---
 
-## テストの書き方
+## How to Write Tests
 
-3 層で検証します。最初の 2 層は **共通ハーネスに登録するだけ** で大半が揃います。
+Verify adapters in three layers. The first two layers are mostly covered by
+**registering the adapter with the common harness**.
 
-1. **共通ハーネス（横断契約）** —
-   [`tests/adapters/conftest.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/conftest.py) の `AdapterSpec`
-   に自分のアダプタ（Act / Result / Mock / `parse_tokens` / 成功時 stdout サンプル /
-   token guard サンプル / stdin 期待値）を 1 つ登録すると、
-   [`tests/adapters/test_contract.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/test_contract.py) の
-   parametrize 群（結果の形 / `failed` セマンティクス / timeout graceful /
-   起動失敗 graceful / **token 二重計上ガード** / 予算計上 / Mock 契約 /
-   auth 環境継承 / stdin 安全性）が自動的に自分のアダプタにも適用されます。
-2. **mock 経由のループ** — `run_loop` に Mock を差し込み、`goal_met` や
-   `TokenBudget` 停止が期待通りかを subprocess 無しで確認します。
-3. **実 subprocess（CLI 固有）** — `sys.executable` をインタプリタにした
-   フェイク実行ファイル（その CLI の出力フォーマットを `print` するスクリプト）を
-   `tmp_path` に書き、`<bin>_bin=` で差し替えて実起動経路を 1 度通します。
-   token 解析（`parse_tokens`）の CLI 固有ケースもここで固定します。
+1. **Common harness (cross-adapter contract)** -
+   Register your adapter once in the `AdapterSpec` in
+   [`tests/adapters/conftest.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/conftest.py)
+   with its Act, Result, Mock, `parse_tokens`, success stdout sample, token guard
+   sample, and expected stdin value. Then the parametrized tests in
+   [`tests/adapters/test_contract.py`](https://github.com/happy-ryo/loop-agent/blob/main/tests/adapters/test_contract.py)
+   automatically apply to your adapter as well: result shape, `failed`
+   semantics, graceful timeout, graceful launch failure, **token double-counting
+   guard**, budget accounting, mock contract, inherited auth environment, and
+   stdin safety.
+2. **Loop through mock** - Plug the Mock into `run_loop` and verify that
+   `goal_met` and `TokenBudget` stopping behavior work as expected without
+   subprocesses.
+3. **Real subprocess path (CLI-specific)** - Write a fake executable to
+   `tmp_path` using `sys.executable` as the interpreter. The script should
+   `print` that CLI's output format. Substitute it through `<bin>_bin=` and run
+   through the real launch path once. Pin CLI-specific token parsing
+   (`parse_tokens`) cases here too.
 
-実 CLI が無い CI でも 1〜2 はフェイク runner / フェイク実行ファイルで完結します。
-`codex` / `claude` 実バイナリに触る統合テストは、未導入環境で skip する設計に
-してください。
+Even when the real CLI is unavailable in CI, layers 1 and 2 are complete with a
+fake runner or fake executable. Integration tests that touch real `codex` or
+`claude` binaries should skip when the binary is not installed.
 
 ---
 
-## 外部 CLI 互換性の監視
+## Monitoring External CLI Compatibility
 
-`ClaudeCodeAct` / `CodexAct` は外部 CLI の JSON / JSONL イベントを読むため、CLI 側の
-バージョンアップで schema drift が起きえます。通常の単体テストは速く・再現可能な
-契約テストとして維持し、実 CLI 監視は opt-in の煙検査として分離します。
+`ClaudeCodeAct` and `CodexAct` read JSON / JSONL events from external CLIs, so
+schema drift can happen when those CLIs are updated. Keep normal unit tests as
+fast, reproducible contract tests, and separate real CLI monitoring into an
+opt-in smoke check.
 
-### 1. 必須: fake-runner / fake-subprocess 契約テスト
+### 1. Required: fake-runner / fake-subprocess contract tests
 
-通常 CI で常に走らせるのはこの層です。
+This is the layer that always runs in normal CI.
 
 ```bash
 python -m pytest tests/adapters tests/test_adapters_claude_code.py tests/test_adapters_codex.py
 ```
 
-この層が保証すること:
+This layer guarantees:
 
-- `ActResult` の 8 フィールド、`failed=True` graceful 終了、timeout / 起動失敗の扱い。
-- `TokenBudget` に積む token の意味論（部分集合や安価な cache read を二重計上しない）。
-- 代表的な既知 schema（Claude の `json` / `stream-json`、Codex の dotted / snake_case
-  JSONL イベント）を parser が読めること。
-- stdin / env / cwd / prompt separator など、loop-agent 側で固定できる subprocess 契約。
+- The eight `ActResult` fields, `failed=True` graceful termination, and handling
+  of timeouts and launch failures.
+- Token semantics for `TokenBudget`, including not double-counting subset fields
+  or cheap cache reads.
+- Parser support for representative known schemas: Claude `json` /
+  `stream-json`, and Codex dotted / snake_case JSONL events.
+- Subprocess contracts that loop-agent can fix on its side, including stdin,
+  env, cwd, and the prompt separator.
 
-この層は実 `claude` / `codex` を起動しません。外部 CLI の未導入、未ログイン、課金、
-ネットワーク不調で落ちないことが重要です。
+This layer does not start real `claude` or `codex`. It is important that tests do
+not fail because the external CLI is not installed, the user is not logged in,
+billing is unavailable, or the network is unhealthy.
 
-### 2. 任意: real-CLI smoke job
+### 2. Optional: real-CLI smoke job
 
-実 CLI の schema drift を早く見つけたいメンテナは、手元または scheduled CI で
-小さな smoke job を opt-in 実行します。CLI が見つからない環境では skip し、通常 CI の
-必須条件にしません。
+Maintainers who want early detection of real CLI schema drift can run a small
+smoke job locally or in scheduled CI as opt-in. It should skip when the CLI is
+not found and must not be a required condition for normal CI.
 
 ```yaml
 name: adapter-real-cli-smoke
@@ -372,59 +426,79 @@ jobs:
           PY
 ```
 
-運用ルール:
+Operational rules:
 
-- `workflow_dispatch` で手動実行できるようにし、必要なら週 1 回程度の schedule にする。
-- CLI 未導入なら `exit 0` で skip する。未ログインや auth 失敗は、CLI が導入済みなら
-  smoke failure として扱う。
-- プロンプトは公開して問題ない固定文字列だけにする。リポジトリ内容、顧客データ、
-  Issue 本文、API key、ローカルパスなどを送らない。
-- smoke job は「schema がまだ読めるか」を見るだけに留める。品質評価や長い生成は
-  ここに入れない。
+- Make the job runnable manually with `workflow_dispatch`; add a schedule of
+  about once per week if needed.
+- If the CLI is not installed, skip with `exit 0`. If the CLI is installed but
+  login or auth fails, treat that as a smoke failure.
+- Use only a fixed prompt string that is safe to disclose. Do not send repository
+  contents, customer data, issue bodies, API keys, local paths, or similar data.
+- Keep the smoke job limited to checking whether the schema is still readable. Do
+  not put quality evaluation or long generations here.
 
-### 3. 実出力 fixture の扱い
+### 3. Handling real-output fixtures
 
-実 CLI の stdout / stderr を fixture として残すのは、次の条件を満たすときだけです。
+Keep real CLI stdout / stderr as fixtures only when all of the following are
+true:
 
-- プロンプトが公開可能な短い固定文で、出力にも秘密・個人情報・内部パスが無い。
-- CLI の利用規約や出力の再配布条件に反しない。
-- fixture は最小化し、parser に必要な event / usage だけを残す。不要な会話本文や
-  trace ID は削る。
-- 新しい fixture には、取得した CLI 名・バージョン・取得日・どの parser 分岐を固定するかを
-  テストコメントに書く。
+- The prompt is a short fixed public-safe string, and the output contains no
+  secrets, personal information, or internal paths.
+- Keeping the fixture does not violate the CLI's terms of use or redistribution
+  conditions for outputs.
+- The fixture is minimized to only the events and usage fields required by the
+  parser. Remove unnecessary conversation body text and trace IDs.
+- For every new fixture, add a test comment that records the CLI name, version,
+  capture date, and which parser branch it pins.
 
-安全に残せない出力は commit しません。その場合は、field 名と event 形だけを手書きの
-最小 JSON / JSONL サンプルにして parser test に追加します。
+Do not commit outputs that cannot be kept safely. Instead, add a minimal
+handwritten JSON / JSONL sample containing only the field names and event shape
+to the parser test.
 
-### 4. upstream schema が変わったときの更新手順
+### 4. Update procedure when an upstream schema changes
 
-1. real-CLI smoke failure の stdout / stderr を、秘密が含まれない範囲でローカルに保存する。
-2. 失敗が adapter 契約違反なのか、parser が新しい event 形を知らないだけなのかを切り分ける。
-3. 新しい schema 形を `tests/test_adapters_claude_code.py` または
-   `tests/test_adapters_codex.py` に最小 fixture として追加し、まず failing test にする。
-4. parser を更新する。既存 schema のテストと横断契約テストは残し、古い CLI 形も読める限り
-   後方互換を保つ。
-5. token usage の意味論が変わった場合は、`tests/adapters/conftest.py` の token guard
-   サンプルも更新し、二重計上しないことを横断契約で固定する。
-6. fixture を commit する前に、秘密・個人情報・private prompt・ローカル絶対パスが無いことを
-   再確認する。
+1. Save stdout / stderr from the real-CLI smoke failure locally, limited to the
+   parts that do not contain secrets.
+2. Determine whether the failure is an adapter contract violation or simply a
+   parser that does not know the new event shape yet.
+3. Add the new schema shape as a minimal fixture in
+   `tests/test_adapters_claude_code.py` or `tests/test_adapters_codex.py`, and
+   first make it a failing test.
+4. Update the parser. Keep existing schema tests and cross-adapter contract tests,
+   and preserve backward compatibility for old CLI shapes as long as they can
+   still be read.
+5. If token usage semantics changed, also update the token guard sample in
+   `tests/adapters/conftest.py` and pin non-double-counting through the
+   cross-adapter contract.
+6. Before committing a fixture, re-check that it contains no secrets, personal
+   information, private prompts, or local absolute paths.
 
 ---
 
-## 新規アダプタ追加チェックリスト
+## Checklist for Adding a New Adapter
 
-- [ ] `XxxResult(ActResultBase)` を定義（8 フィールド再定義しない）。`isinstance(r, ActResult)` が `True`。
-- [ ] `XxxAct` が `@dataclass` で `runner` 注入点・`<bin>_bin` 差し替え・`cwd`・`env` を持つ。
-- [ ] `build_command` がプロンプトを `--` の後ろの位置引数に置く。
-- [ ] `__call__` が `TimeoutExpired` / `OSError` を捕まえ `failed=True` で graceful に返す（例外を漏らさない）。
-- [ ] 対話入力を読む CLI なら `stdin=subprocess.DEVNULL`。
-- [ ] token 解析が CLI の usage 意味論（加算バケット / 部分集合）に従い、二重計上しない。usage 無しは 0。
-- [ ] token は成否に関わらず計上する。
-- [ ] `_build_env` が `os.environ` 継承 + `env=` 上書きマージ（auth は CLI 委譲）。
-- [ ] `MockXxxAct` を提供（`str` / `Mapping` / Result、空も未対応型も `ConfigError`）。
-- [ ] `tests/adapters/conftest.py` の `AdapterSpec` に登録し、共通契約テストを通す。
-- [ ] **token 二重計上ガード**のサンプル（部分集合キーを含む usage と期待トークン）を spec に入れる。
-- [ ] 実 subprocess 経路（フェイク実行ファイル）の成功 / timeout / env 継承を 1 度ずつ通す。
-- [ ] 実 CLI schema drift 監視が必要なら、上の real-CLI smoke job に追加し、CLI 未導入時は clean skip する。
-- [ ] `loop_agent.adapters.__init__` の `__all__` に公開シンボルを追加。
-- [ ] `mypy` / `pytest` green。
+- [ ] Define `XxxResult(ActResultBase)` without redefining the eight fields.
+  `isinstance(r, ActResult)` is `True`.
+- [ ] `XxxAct` is a `@dataclass` and has a `runner` injection point, a
+  replaceable `<bin>_bin`, `cwd`, and `env`.
+- [ ] `build_command` places the prompt as a positional argument after `--`.
+- [ ] `__call__` catches `TimeoutExpired` / `OSError` and returns gracefully with
+  `failed=True`; it does not leak those exceptions.
+- [ ] For CLIs that read interactive input, pass `stdin=subprocess.DEVNULL`.
+- [ ] Token parsing follows the CLI's usage semantics: additive buckets vs.
+  subsets. It does not double count. Missing usage means 0.
+- [ ] Tokens are counted regardless of success or failure.
+- [ ] `_build_env` inherits `os.environ` and override-merges `env=`. Auth is
+  delegated to the CLI.
+- [ ] Provide `MockXxxAct` supporting `str`, `Mapping`, and Result. Empty
+  responses and unsupported types raise `ConfigError`.
+- [ ] Register the adapter in `AdapterSpec` in `tests/adapters/conftest.py` and
+  pass the common contract tests.
+- [ ] Add a **token double-counting guard** sample to the spec, including usage
+  with subset keys and the expected token count.
+- [ ] Run the real subprocess path through a fake executable once each for
+  success, timeout, and env inheritance.
+- [ ] If real CLI schema drift monitoring is needed, add the adapter to the
+  real-CLI smoke job above and cleanly skip when the CLI is not installed.
+- [ ] Add public symbols to `__all__` in `loop_agent.adapters.__init__`.
+- [ ] `mypy` / `pytest` are green.
