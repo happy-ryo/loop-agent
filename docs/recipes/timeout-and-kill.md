@@ -1,10 +1,10 @@
-# Recipe — act / review / verify の per-call timeout / kill（Issue #42）
+# Recipe: Per-Call Timeout / Kill for act / review / verify (Issue #42)
 
-1 回の `act` / `review` / `verify` 呼び出し（モデル呼び出しやツール実行）が暴走したときに、**ループ全体を諦めずに**その 1 回だけを打ち切る機構です。`run_loop` / `async_run_loop` の `timeout=` 引数に渡します。全実装は async-first core（`_drive_loop`）に入っているので **sync / async 両 API へ同一挙動で効きます**。
+This mechanism stops only a single runaway `act` / `review` / `verify` call (a model call or tool execution) **without giving up on the whole loop**. Pass it to the `timeout=` argument of `run_loop` / `async_run_loop`. The full implementation lives in the async-first core (`_drive_loop`), so it applies with the **same behavior to both the sync and async APIs**.
 
-> **whole-run `Timeout` *stop 条件* との違い** — `loop_agent.Timeout(seconds)` は累積 wall-clock を **iteration 境界で**上限化する stop 条件で、**進行中の step は中断しません**（「締切を過ぎたら新しい仕事を始めない」）。本 recipe の `timeout=` は **1 回の呼び出し**を中断するもので、別物です。両方を併用できます。
+> **Difference from the whole-run `Timeout` *stop condition***: `loop_agent.Timeout(seconds)` is a stop condition that limits cumulative wall-clock time **at iteration boundaries** and **does not interrupt a step already in progress** ("do not start new work after the deadline has passed"). The `timeout=` described in this recipe interrupts **one call**. It is a separate mechanism, and you can use both together.
 
-## 書き方
+## Usage
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations
@@ -12,28 +12,29 @@ from loop_agent import run_loop, TimeoutPolicy, MaxIterations
 result = run_loop(
     act=my_act, verify=my_verify,
     conditions=[MaxIterations(20)],
-    # act は 30s、review は 20s、verify は 10s で打ち切り。超過したシームは諦めて次 iteration へ。
+    # Stop act after 30s, review after 20s, and verify after 10s.
+    # Give up on the timed-out seam and continue to the next iteration.
     timeout=TimeoutPolicy(act=30.0, review=20.0, verify=10.0, on_timeout="graceful"),
 )
 ```
 
-- `TimeoutPolicy(act=, review=, verify=, default=, on_timeout=)` — シーム別の秒数。各シームは自分の値、無ければ `default`、それも無ければ無制限。
-- `timeout=30.0`（裸の秒数）— 全 timed seam に `default=30.0` の **graceful** を適用する短縮形。
-- `timeout=None`（既定）— per-call timeout なし（追加コストゼロの従来パス）。
+- `TimeoutPolicy(act=, review=, verify=, default=, on_timeout=)`: per-seam timeout values in seconds. Each seam uses its own value; if absent, it uses `default`; if that is also absent, it is unlimited.
+- `timeout=30.0` (a bare number of seconds): shorthand that applies **graceful** handling with `default=30.0` to every timed seam.
+- `timeout=None` (the default): no per-call timeout, preserving the previous zero-overhead path.
 
-## 2 つのモード
+## Two Modes
 
-| `on_timeout` | 超過時の挙動 |
+| `on_timeout` | Behavior on timeout |
 |---|---|
-| `"graceful"`（既定） | 当該シームを諦め、`goal_met=False` の **合成 step** を記録して **次 iteration** へ。ループは返り続ける（例外を投げない）。 |
-| `"kill"` | 当該シームを cancel し、`SeamTimeout` を **ループ外へ送出**（`LoopResult` は返らない）。 |
+| `"graceful"` (default) | Give up on the affected seam, record a **synthetic step** with `goal_met=False`, and continue to the **next iteration**. The loop keeps returning normally and does not raise an exception. |
+| `"kill"` | Cancel the affected seam and raise `SeamTimeout` **out of the loop**. No `LoopResult` is returned. |
 
-graceful の合成 step は observation がマーカー文字列（`ACT_TIMEOUT_OBSERVATION` / `REVIEW_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`）になります。これは JSON ネイティブで hashable なので **永続化 / resume を通っても安定**し、`NoProgress` の既定 key（observation そのもの）で「timeout の連続」を検出できます:
+For a graceful timeout, the synthetic step's observation is a marker string (`ACT_TIMEOUT_OBSERVATION` / `REVIEW_TIMEOUT_OBSERVATION` / `VERIFY_TIMEOUT_OBSERVATION`). This value is JSON-native and hashable, so it remains **stable through persistence / resume**, and `NoProgress` can detect "consecutive timeouts" using its default key (the observation itself):
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations, NoProgress
 
-# act が 3 連続で時間切れになったら「進んでいない」として打ち切る
+# Stop as "no progress" if act times out 3 times in a row.
 result = run_loop(
     act=flaky_slow_act, verify=my_verify,
     conditions=[MaxIterations(100), NoProgress(window=3, repeat=3)],
@@ -42,7 +43,7 @@ result = run_loop(
 assert result.stop.name in ("no_progress", "max_iterations")
 ```
 
-kill は明示的に止めたいとき:
+Use kill when you want to stop explicitly:
 
 ```python
 from loop_agent import async_run_loop, TimeoutPolicy, SeamTimeout, MaxIterations
@@ -54,31 +55,31 @@ try:
         timeout=TimeoutPolicy(act=60.0, on_timeout="kill"),
     )
 except SeamTimeout as e:
-    print(f"{e.seam} が {e.seconds}s で打ち切られた")
+    print(f"{e.seam} was stopped after {e.seconds}s")
 ```
 
-`SeamTimeout` は `LoopError` 統一階層の一員で、`StateError` 派生です（#71）。したがって `except SeamTimeout`（属性 `seam` / `seconds` を読む）に加えて、`except StateError` や `except LoopError` でも捕捉できます。#71 以前は素の `Exception` だったため、これは捕捉できる経路を広げるだけで、既存の `except SeamTimeout` は不変です。詳細な階層は [../errors.md](../errors.md)。
+`SeamTimeout` is part of the unified `LoopError` hierarchy and derives from `StateError` (#71). Therefore, in addition to `except SeamTimeout` (where you can read the `seam` / `seconds` attributes), you can also catch it with `except StateError` or `except LoopError`. Before #71 it was a bare `Exception`; this change only broadens the catch paths, and existing `except SeamTimeout` handlers are unchanged. See [../errors.md](../errors.md) for the full hierarchy.
 
-## 既知の制限（プラットフォーム差）— 必読
+## Known Limitations (Platform Differences): Read This
 
-per-call timeout を **実際に中断する**機構はシームの種別とプラットフォームで変わります。
+The mechanism that **actually interrupts** a per-call timeout depends on the seam type and platform.
 
-| シーム | 中断機構 | 移植性 |
+| Seam | Interruption mechanism | Portability |
 |---|---|---|
-| **async**（`async def` / awaitable を返す） | asyncio の task cancel（`asyncio.wait` + `task.cancel()`）で await 点で実 cancel | **全プラットフォーム**（イベントループがあれば。= `async_run_loop`） |
-| **sync**（POSIX main thread） | `SIGALRM`（`signal.setitimer`）で実中断 | Linux / macOS の **main thread のみ** |
-| **sync**（Windows / 非 main thread） | 強制中断 **不能** | — |
+| **async** (`async def` / returns an awaitable) | Real cancellation at await points via asyncio task cancellation (`asyncio.wait` + `task.cancel()`) | **All platforms** (as long as there is an event loop; i.e. `async_run_loop`) |
+| **sync** (POSIX main thread) | Real interruption via `SIGALRM` (`signal.setitimer`) | **Main thread only** on Linux / macOS |
+| **sync** (Windows / non-main thread) | Forced interruption is **not possible** | - |
 
-`SIGALRM` が使えない環境（Windows、または非 main thread）では同期シームのブロッキング呼び出しを強制的に止められません。そのため:
+In environments where `SIGALRM` is unavailable (Windows or a non-main thread), blocking synchronous seam calls cannot be forcibly stopped. Therefore:
 
-- **`graceful`** — 呼び出しが **返ってきた後**に超過を検出する best-effort になります（`time.sleep` のような **本当にハングした呼び出しは縛れません**）。確実に縛りたいなら **async シームにする**（`run_in_executor` で同期処理を包む等）。
-- **`kill`** — 同期シームに対しては、呼び出しに入る **前**に `UnsupportedTimeoutKill` を送出します（縛れない hard kill を黙ってハングさせるより、明示エラーで失敗させる方針）。async シームなら asyncio の task cancel で止まるので問題ありません。`UnsupportedTimeoutKill` は `LoopError` 統一階層の `ConfigError` 派生で（#71、seam/環境の設定不整合）、`except ConfigError` / `except LoopError` でも捕捉できます。#71 以前の素の `RuntimeError` でも引き続き捕捉できるよう `RuntimeError` も基底に残しています（後方互換）。
+- **`graceful`**: timeout detection is best-effort and happens **after the call returns**. It **cannot constrain a truly hung call** such as `time.sleep`. If you need reliable enforcement, make the seam **async** (for example, wrap synchronous work with `run_in_executor`).
+- **`kill`**: for a synchronous seam, `UnsupportedTimeoutKill` is raised **before** entering the call. The policy is to fail with an explicit error rather than silently hang on a hard kill that cannot be enforced. Async seams are fine because they can be stopped with asyncio task cancellation. `UnsupportedTimeoutKill` derives from `ConfigError` in the unified `LoopError` hierarchy (#71, because it is a seam/environment configuration mismatch), so it can also be caught with `except ConfigError` / `except LoopError`. It also keeps `RuntimeError` as a base class for backward compatibility, so handlers for the pre-#71 bare `RuntimeError` continue to work.
 
-その他の注意:
+Additional notes:
 
-- **async の cancel は協調的**。timeout 時は seam の task を cancel し（次の await 点で `asyncio.CancelledError`）、**cleanup を待たず即座に** timeout を報告します（締切時点で task が pending かで判定するので、`CancelledError` を握り潰して値を返す seam でも kill は効き、ループはハングしません。seam 自身が投げた `asyncio.TimeoutError` は別物として伝播します）。`CancelledError` を握り潰して完了しない seam は **orphan background task としてリーク**するだけ（ループはブロックしない）なので、timeout を効かせる seam で `CancelledError` を catch-and-ignore しないこと。`async def` seam 内の**同期ブロッキング区間**も、次に await するまでは中断できません。
-- **per-call budget は単一**。締切は 1 回の呼び出し全体に効きます。「同期ブロッキング → awaitable を返す」変則 seam でも、同期区間で消費した実時間は await 区間（`asyncio.wait`）の予算から差し引かれ（同期区間で締切を使い切っていれば即 timeout）、合計は単一の締切で縛られます（~2 倍にはなりません）。
-- **人間ゲートとの併用**: `graceful` で gated action（`GATE_PROCEED` + `on_complete`）が時間切れになった場合、合成 step を記録した後にリースを **executed 確定**します（その action は一度だけ消費され、再試行されない）。`kill` ではリースを in-progress のまま残す（`SeamTimeout` が完了確定の前に抜ける）ので、失効して別プロセスが取り直します（クラッシュ復旧経路）。
-- **締切は実 wall-clock 基準**。`SIGALRM` / `asyncio.wait` の予算はループの注入クロック `time_fn` を見ません（`time_fn` は stop 条件用クロックと、非 `SIGALRM` の post-hoc 計測（完了した同期呼び出しの検出）にのみ作用）。
-- **`SIGALRM` は再入不可**（プロセス共有の `ITIMER_REAL` を使うため）。timeout を効かせた同期シームの内側で、さらに `SIGALRM` ベースの timeout を仕掛けるのは避けてください。組み込み先アプリが自前の `ITIMER_REAL` を張っていても、本機構は呼び出し終了時に**元のタイマーを復元**します（残り時間を再 arm、呼び出し中は実質一時停止）。
-- kill で中断された同期シームは任意の地点で `BaseException` が上がるため、副作用が途中状態になりうる（preemptive な timeout 一般の性質）。`kill` を選ぶ側の責任で、その step は失敗扱いにしてください。
+- **Async cancellation is cooperative**. On timeout, the seam's task is cancelled (`asyncio.CancelledError` at the next await point), and the timeout is reported **immediately without waiting** for cleanup. The decision is based on whether the task is pending at the deadline, so kill still works even if a seam swallows `CancelledError` and returns a value, and the loop does not hang. An `asyncio.TimeoutError` raised by the seam itself is different and propagates as-is. A seam that swallows `CancelledError` and never completes merely leaks as an **orphan background task** (the loop does not block), so do not catch and ignore `CancelledError` in seams where timeout enforcement matters. A **synchronous blocking section** inside an `async def` seam also cannot be interrupted until the next await.
+- **The per-call budget is singular**. The deadline applies to the entire call. Even for an unusual seam that "blocks synchronously, then returns an awaitable", the real time spent in the synchronous section is subtracted from the await section's budget (`asyncio.wait`); if the synchronous section has already used up the deadline, it times out immediately. The total is constrained by one deadline and does not become roughly twice as long.
+- **Use with human gates**: if a gated action (`GATE_PROCEED` + `on_complete`) times out under `graceful`, the lease is marked **executed** after recording the synthetic step. That action is consumed exactly once and is not retried. Under `kill`, the lease remains in progress (`SeamTimeout` exits before completion is confirmed), so it expires and another process can reclaim it through the crash-recovery path.
+- **Deadlines use real wall-clock time**. The `SIGALRM` / `asyncio.wait` budget does not look at the loop's injected `time_fn`. `time_fn` only affects stop-condition clocks and non-`SIGALRM` post-hoc measurement (detecting completed synchronous calls after the fact).
+- **`SIGALRM` is not reentrant** because it uses the process-wide `ITIMER_REAL`. Avoid setting another `SIGALRM`-based timeout inside a synchronous seam that already has this timeout enabled. If the embedding application has installed its own `ITIMER_REAL`, this mechanism **restores the previous timer** when the call finishes (re-arming the remaining time, so it is effectively paused during the call).
+- A synchronous seam interrupted by kill can raise `BaseException` at an arbitrary point, so side effects may be left in an intermediate state. This is a general property of preemptive timeouts. If you choose `kill`, treat that step as failed.

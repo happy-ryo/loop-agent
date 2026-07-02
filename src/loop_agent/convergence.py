@@ -1,22 +1,27 @@
-"""外側 Reflexion ループの収束/停止条件 (report.md S2.6 / S4.5 / Issue #22).
+"""Convergence/stop conditions for the outer Reflexion loop (report.md S2.6 / S4.5 / Issue #22).
 
-内側ループの :mod:`loop_agent.conditions` と **同じ合成プロトコル** (``name`` +
-``check(state) -> reason | None``) を踏襲し、:class:`~loop_agent.conditions.AnyOf` /
-:class:`~loop_agent.conditions.StopTrigger` を **そのまま再利用** する。違いは check が
-:class:`OuterState` (episode/epoch 粒度) を見る点だけ。
+This follows the **same composition protocol** as the inner-loop
+:mod:`loop_agent.conditions` (``name`` + ``check(state) -> reason | None``), and
+reuses :class:`~loop_agent.conditions.AnyOf` /
+:class:`~loop_agent.conditions.StopTrigger` **as-is**. The only difference is
+that check observes :class:`OuterState` (episode/epoch granularity).
 
-収束判定は report.md S2.6 (AWS evaluator reflect-refine) の三本柱:
-**rubric しきい値超え** (:class:`RubricThreshold`) / **改善の頭打ち** (:class:`ScorePlateau`)
-/ **反復上限** (:class:`MaxEpisodes`)。さらに self-improving の罠 (report.md S6) を抑える
-**反省予算** (:class:`ReflectionBudget`) と **評価器更新予算** (:class:`EvaluatorUpdateBudget`)
-を足す。
+The convergence decision has the three pillars from report.md S2.6
+(AWS evaluator reflect-refine): **rubric threshold exceeded**
+(:class:`RubricThreshold`) / **improvement plateau** (:class:`ScorePlateau`) /
+**iteration limit** (:class:`MaxEpisodes`). It also adds a **reflection budget**
+(:class:`ReflectionBudget`) and an **evaluator update budget**
+(:class:`EvaluatorUpdateBudget`) to curb self-improving traps (report.md S6).
 
-**最重要の安全設計**: これらが見る ``gt_aggregate_history`` / ``best_gt_aggregate`` は
-すべて **ground-truth 一次信号** (内側 verify 由来) であり、epoch 内で固定される rubric
-評価器の出力 (reward) には **依存しない**。よって「gameable な評価器スカラを押し上げて
-収束を宣言する」抜け道が構造的に存在しない (report.md 原則: ground-truth 優先)。
-``ground_truth_backed=False`` の episode は driver が ``gt_aggregate_history`` に積まない
-ので、実信号の無い episode は収束/頭打ち判定に算入されない。
+**Most important safety design**: the ``gt_aggregate_history`` /
+``best_gt_aggregate`` observed by these conditions are all **ground-truth
+primary signals** (from inner verify), and they **do not depend** on the output
+(reward) of the rubric evaluator fixed within an epoch. Therefore, there is no
+structural path for "inflating a gameable evaluator scalar and declaring
+convergence" (report.md principle: ground-truth first). Episodes with
+``ground_truth_backed=False`` are not pushed into ``gt_aggregate_history`` by
+the driver, so episodes without real signals are excluded from convergence and
+plateau decisions.
 """
 
 from __future__ import annotations
@@ -29,16 +34,16 @@ from .errors import ConfigError
 
 @dataclass(frozen=True)
 class OuterState:
-    """外側ループの累積状態 (収束条件が毎 episode 評価する射影)。
+    """Cumulative state for the outer loop (projection evaluated each episode by convergence conditions).
 
-    - ``episode``               : 完了した episode 数 (全 episode。MaxEpisodes が見る)。
-    - ``epoch``                 : 現在の epoch 番号 (境界でのみ進む)。
-    - ``evaluator_version``     : 現行 (固定) 評価器の version。
-    - ``gt_aggregate_history``  : **ground_truth_backed な** episode の集約値列 (一次信号)。
-    - ``best_gt_aggregate``     : これまでの最良集約値 (頭打ち/成功判定の基準)。
-    - ``reflections``           : memory に取り込まれた lesson の累計 (bloat 予算)。
-    - ``evaluator_updates``     : 評価器昇格を試行した境界の累計 (overfit 予算)。
-    - ``declared_keys``         : 多様評価の宣言軸 (監査・文脈用)。
+    - ``episode``               : Number of completed episodes (all episodes; observed by MaxEpisodes).
+    - ``epoch``                 : Current epoch number (advanced only at boundaries).
+    - ``evaluator_version``     : Version of the current (fixed) evaluator.
+    - ``gt_aggregate_history``  : Aggregate values for **ground_truth_backed** episodes (primary signal).
+    - ``best_gt_aggregate``     : Best aggregate value so far (basis for plateau/success decisions).
+    - ``reflections``           : Cumulative lessons incorporated into memory (bloat budget).
+    - ``evaluator_updates``     : Cumulative boundaries where evaluator promotion was attempted (overfit budget).
+    - ``declared_keys``         : Declared axes for diverse evaluation (for audit/context).
     """
 
     episode: int = 0
@@ -53,7 +58,7 @@ class OuterState:
 
 @dataclass(frozen=True)
 class MaxEpisodes:
-    """外側ループのハード上限 (report.md R3: 無限ループ防止の最後の砦)。"""
+    """Hard limit for the outer loop (report.md R3: last line of defense against infinite loops)."""
 
     limit: int
     name: ClassVar[str] = "max_episodes"
@@ -70,17 +75,19 @@ class MaxEpisodes:
 
 @dataclass(frozen=True)
 class RubricThreshold:
-    """**成功**収束: 一次信号の集約値が ``target`` 以上を ``sustain`` 連続で満たす。
+    """**Success** convergence: primary-signal aggregates meet or exceed ``target`` for ``sustain`` consecutive checks.
 
-    ``sustain`` 回連続で超えることを要求するので、分散による単発スパイクでは発火しない
-    (variance gaming 耐性)。これは **成功**条件で (``success=True``)、ハード上限や頭打ちの
-    打ち切りと区別される。判定は ground-truth 一次の ``gt_aggregate_history`` のみを見る。
+    Because this requires exceeding the threshold for ``sustain`` consecutive
+    checks, it is not triggered by a one-off variance spike (resistant to
+    variance gaming). This is a **success** condition (``success=True``), and is
+    distinguished from hard-limit or plateau termination. The decision only
+    observes the ground-truth primary ``gt_aggregate_history``.
     """
 
     target: float
     sustain: int = 1
     name: ClassVar[str] = "rubric_threshold"
-    # 成功収束であることのマーカ (driver が成否を順序非依存に判定するのに使う)。
+    # Marker for success convergence (used by the driver to decide success independent of order).
     success: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
@@ -101,18 +108,22 @@ class RubricThreshold:
 
 @dataclass(frozen=True)
 class ScorePlateau:
-    """**頭打ち**打ち切り: best-so-far が ``window`` の間 ``min_delta`` 未満しか伸びない。
+    """**Plateau** termination: best-so-far improves by less than ``min_delta`` across ``window``.
 
-    best-so-far の **トレンド** (max(now) - max(window 前)) を見るので、ゆっくりでも
-    単調改善していれば発火せず、改善が止まった (flat / sawtooth で正味ゲイン無し) ときに
-    発火する。range(max-min) ベースだと、緩い実進捗を誤って打ち切り、sawtooth を永遠に
-    打ち切れない (それを避ける)。これは成功ではない打ち切り。
+    This observes the **trend** in best-so-far (max(now) - max(before window)),
+    so it does not trigger while there is monotonic improvement, even if slow;
+    it triggers when improvement has stopped (flat / sawtooth with no net gain).
+    A range(max-min)-based check would wrongly terminate gentle real progress
+    and fail to terminate sawtooth behavior forever (this avoids that). This is
+    a non-success termination.
 
-    判定は「window 区間の best-so-far の伸びが ``min_delta`` **以下**」(``<=``)。``<`` だと
-    best-so-far は単調非減少なので伸びは常に ``>= 0`` となり、``min_delta=0`` (= 正味ゲインゼロで
-    打ち切りたい flat/sawtooth) が一度も発火しない no-op になってしまう。``<=`` にすることで
-    ``min_delta=0`` は「全く伸びていない」ときだけ発火し、正の ``min_delta`` は「規定の最小進捗に
-    届かない」ときに発火する。
+    The decision is "best-so-far growth across the window is **at most**
+    ``min_delta``" (``<=``). With ``<``, because best-so-far is monotonically
+    non-decreasing, growth is always ``>= 0`` and ``min_delta=0`` (= flat/sawtooth
+    cases with zero net gain that should terminate) would become a no-op that
+    never triggers. Using ``<=`` makes ``min_delta=0`` trigger only when there is
+    no growth at all, and positive ``min_delta`` trigger when the specified
+    minimum progress is not reached.
     """
 
     window: int
@@ -142,7 +153,7 @@ class ScorePlateau:
 
 @dataclass(frozen=True)
 class ReflectionBudget:
-    """反省 (取込 lesson) 累計の上限 (report.md S6: reflection 出力の肥大化・劣化を防ぐ)。"""
+    """Cumulative cap on reflections (incorporated lessons) (report.md S6: prevents reflection output bloat/decay)."""
 
     max_reflections: int
     name: ClassVar[str] = "reflection_budget"
@@ -162,7 +173,7 @@ class ReflectionBudget:
 
 @dataclass(frozen=True)
 class EvaluatorUpdateBudget:
-    """評価器昇格試行の累計上限 (held-out への adaptive overfit を抑える予算)。"""
+    """Cumulative cap on evaluator promotion attempts (budget to curb adaptive overfit to held-out data)."""
 
     max_updates: int
     name: ClassVar[str] = "evaluator_update_budget"
@@ -181,7 +192,7 @@ class EvaluatorUpdateBudget:
 
 
 def is_success_condition(condition: object) -> bool:
-    """その条件が **成功**収束を表すか (``success=True`` を持つか)。"""
+    """Return whether the condition represents **success** convergence (has ``success=True``)."""
     return bool(getattr(condition, "success", False))
 
 

@@ -230,9 +230,9 @@ Read next: `safety.md`.
 
 ## If The User Asks For Reflexion
 
-Use Reflexion only when failures are stochastic or strategic and a verbal lesson
-can improve the next episode. Do not add it for systematic failures that a sharper
-verifier or better prompt can fix.
+Use Reflexion when failures are systematic or strategic and a verbal lesson can
+improve the next episode. Do not add it for one-off stochastic misses that a
+blind retry can fix, or for failures that require only a sharper verifier.
 
 Use:
 

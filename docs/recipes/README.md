@@ -1,12 +1,12 @@
-# Recipes — coding-agent driven なループの組み方（動線 E）
+# Recipes — How to build coding-agent-driven loops (Path E)
 
-ここは **動線 E**（coding-agent driven）の具体例集です。各 recipe は次の形をとります:
+This directory contains concrete examples for **Path E** (coding-agent driven). Each recipe has the following shape:
 
-1. **prose intent** — Claude Code（や Cursor / Codex）にそのまま渡せる自然言語の指示。
-2. **組み上がる harness** — coding agent が書く `gather / act / verify / conditions / gate` のおおよその姿。
-3. **要点** — そのタスク特有の落とし穴と、verify を ground truth で sharp に書くコツ。
+1. **prose intent** — Natural-language instructions that can be passed directly to Claude Code (or Cursor / Codex).
+2. **resulting harness** — The approximate shape of the `gather / act / verify / conditions / gate` code that the coding agent writes.
+3. **key points** — Task-specific pitfalls and tips for writing a sharp `verify` function against ground truth.
 
-共通する設計の芯は 1 つ: **verify は機械的な ground truth で書く**（pytest の exit-code / AST / 文字列スキャン等）。LLM-as-judge に成功判定を委ねると、ループが「成功したフリ」に収束します。
+The common design principle is simple: **write `verify` against machine-checkable ground truth** (pytest exit codes, ASTs, string scans, and so on). If success is delegated to an LLM-as-judge, the loop converges on pretending it succeeded.
 ## Canonical production harnesses
 
 If you need a production starting point, start with [production-harnesses.md](./production-harnesses.md). It narrows the catalog to three first-choice shapes:
@@ -19,43 +19,43 @@ If you need a production starting point, start with [production-harnesses.md](./
 
 The rest of this directory is supporting material for those shapes.
 
-| Recipe | タスク種別 | verify の ground truth |
+| Recipe | Task type | Ground truth for `verify` |
 |---|---|---|
-| [production-harnesses.md](./production-harnesses.md) | 代表 production harness の選択ガイド | single verified edit / multi-item / gated irreversible action |
-| [flaky-test-stabilization.md](./flaky-test-stabilization.md) | flaky test の安定化（N 件） | 修正後に対象テストが N 回連続 pass |
-| [translation.md](./translation.md) | docstring/コメントの一括翻訳（N ファイル） | 翻訳対象に対象言語が 0 + AST 不変 + 当該テスト pass |
-| [refactor.md](./refactor.md) | 挙動不変リファクタ（N module） | 既存テスト全 pass + AST レベルで挙動同値 |
-| [multi-item-work-list.md](./multi-item-work-list.md) | N 件を 1 本のループで公平に回す（横断） | （上記各 recipe の verify をそのまま per-item 適用） |
-| [self-maintenance.md](./self-maintenance.md) | loop-agent 自身の小さな整合性修正 | stale wording scan + docs link + pytest |
-| [review-driven-loop.md](./review-driven-loop.md) | LLM-backed edit の post-act review | review approval + ground-truth verify |
-| [circuit-breakers.md](./circuit-breakers.md) | 同じ失敗の繰り返しを早く止める | `NoProgress` / custom `StopCondition` |
+| [production-harnesses.md](./production-harnesses.md) | Selection guide for representative production harnesses | single verified edit / multi-item / gated irreversible action |
+| [flaky-test-stabilization.md](./flaky-test-stabilization.md) | Stabilizing flaky tests (N items) | After the fix, the target tests pass N consecutive times |
+| [translation.md](./translation.md) | Bulk translation of docstrings/comments (N files) | 0 instances of the target language in translated regions + unchanged AST + relevant tests pass |
+| [refactor.md](./refactor.md) | Behavior-preserving refactor (N modules) | All existing tests pass + behavior equivalence at the AST level |
+| [multi-item-work-list.md](./multi-item-work-list.md) | Fairly process N items in one loop (cross-cutting) | Apply each recipe's `verify` unchanged per item |
+| [self-maintenance.md](./self-maintenance.md) | Small consistency fixes in loop-agent itself | stale wording scan + docs link + pytest |
+| [review-driven-loop.md](./review-driven-loop.md) | Post-act review for LLM-backed edits | review approval + ground-truth verify |
+| [circuit-breakers.md](./circuit-breakers.md) | Stop repeated failures early | `NoProgress` / custom `StopCondition` |
 
-> 「このタスクは loop-agent に向いているか?」の最初のフィルタは **verify が sharp に書けるか**。書けないタスク（「もっと良い文章にして」等、機械判定できない目標）は coding agent 側で triage 除外するのが規律です。
+> The first filter for "is this task a good fit for loop-agent?" is **whether `verify` can be written sharply**. Tasks where it cannot, such as "make this writing better" or other goals that cannot be judged mechanically, should be triaged out by the coding agent as a matter of discipline.
 
-## multi-item ループの公平性（全 recipe 共通の注意）
+## Fairness in multi-item loops (note for all recipes)
 
-上の recipe はどれも「N 件を回す」multi-item ループです。素朴な `gather`（先頭の未完を返す）だと、1 件が verify 失敗を連続したときに `MaxIterations` を独占し、残りが starve します。これを正規化したのが `WorkListGather`（`loop_agent.discovery.work_list`, Issue #56）— **公平 scheduling + per-item 上限 + done 判定フック**を `gather` として注入できます:
+All of the recipes above are multi-item loops that process N items. With a naive `gather` implementation that returns the first unfinished item, one item can monopolize `MaxIterations` when it fails `verify` repeatedly, starving the rest. `WorkListGather` (`loop_agent.discovery.work_list`, Issue #56) standardizes this pattern: it lets you inject **fair scheduling + per-item limits + a done-check hook** as `gather`:
 
 ```python
 from loop_agent import WorkListGather, WorkListDrained, run_loop, MaxIterations
 
 gather = WorkListGather(
     ["a.py", "b.py", "c.py"],
-    strategy="fewest_attempts",     # 試行回数最小から選ぶ round-robin
-    max_attempts_per_item=3,        # 1 件が独占しないよう per-item で打ち止め
-    done_when=lambda item, rec: rec.observation["passed"],   # この item は終わったか
+    strategy="fewest_attempts",     # round-robin: pick from the fewest attempts
+    max_attempts_per_item=3,        # stop each item individually so one item cannot monopolize the loop
+    done_when=lambda item, rec: rec.observation["passed"],   # whether this item is done
 )
 result = run_loop(
     act=my_act, verify=my_verify, gather=gather,
-    conditions=[WorkListDrained(gather), MaxIterations(50)],  # drained で停止
+    conditions=[WorkListDrained(gather), MaxIterations(50)],  # stop when drained
 )
 ```
 
-詳しい組み方・戦略の選び方は **[multi-item-work-list.md](./multi-item-work-list.md)**。手書きの round-robin（`min(rem, key=lambda x: (attempts[x], items.index(x)))`）でも同じことはできますが、attempt counter / done 集合の管理と resume 安全を `WorkListGather` が肩代わりします。
+For detailed construction patterns and strategy selection, see **[multi-item-work-list.md](./multi-item-work-list.md)**. You can do the same thing with a handwritten round-robin expression such as `min(rem, key=lambda x: (attempts[x], items.index(x)))`, but `WorkListGather` takes over attempt-counter management, the done set, and resume safety.
 
-## 暴走する 1 回の呼び出しを止める（per-call timeout / kill）
+## Stop a runaway single call (per-call timeout / kill)
 
-`act` / `review` / `verify` の 1 回が暴走（モデルの長考・ツールのハング）したとき、**ループ全体を諦めずに**その 1 回だけを打ち切れます。`run_loop` / `async_run_loop` の `timeout=` 引数に `TimeoutPolicy` を渡します（`graceful` = 諦めて次 iteration / `kill` = `SeamTimeout` を送出）。whole-run の `Timeout` *stop 条件*（進行中 step は中断しない）とは別物です。
+When a single `act` / `review` / `verify` call runs away because the model thinks too long or a tool hangs, you can terminate just that one call **without giving up on the entire loop**. Pass a `TimeoutPolicy` to the `timeout=` argument of `run_loop` / `async_run_loop` (`graceful` = abandon that call and continue to the next iteration; `kill` = raise `SeamTimeout`). This is separate from the whole-run `Timeout` *stop condition*, which does not interrupt an in-progress step.
 
 ```python
 from loop_agent import run_loop, TimeoutPolicy, MaxIterations
@@ -66,4 +66,4 @@ result = run_loop(
 )
 ```
 
-書き方・モード・**プラットフォーム差（sync シームの hard kill は POSIX main thread のみ／Windows は明示エラー）** は **[timeout-and-kill.md](./timeout-and-kill.md)**。
+For syntax, modes, and **platform differences (hard kill for sync seams is available only on the POSIX main thread; Windows raises an explicit error)**, see **[timeout-and-kill.md](./timeout-and-kill.md)**.

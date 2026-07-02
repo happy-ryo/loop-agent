@@ -1,17 +1,20 @@
-"""複数プロセス同時 resume の協調 (Issue #21, Phase3) の検証.
+"""Validate coordination for concurrent multi-process resume (Issue #21, Phase 3).
 
-report.md S5 Phase3 / Issue #21 の成功条件「並行 resume で不可逆 action exactly-once
-かつ順序整合」を、in-progress リース (pending -> resolved -> executing -> executed の
-多段化) で実証する:
+Demonstrate the success criteria from report.md S5 Phase 3 / Issue #21:
+"exactly-once irreversible actions under concurrent resume, with order consistency,"
+using in-progress leases (multi-stage pending -> resolved -> executing -> executed):
 
-(a) store レベル: ``acquire_lease`` が single-winner で ``resolved -> executing`` を取得し、
-    敗者は WAIT を受ける。``complete_execution`` はリース保持者だけが executed を確定する。
-    勝者クラッシュ時はリース失効で別プロセスが取り直す (``took_over``)。
-(b) gate レベル: 敗者は executing を見て ``executed`` まで pause する (順序整合)。勝者が
-    完了すれば敗者は skip する。失効リースは別プロセスが取り直して実行を完遂する。
-(c) end-to-end: 並行プロセス (スレッド + 独立接続) を模擬し、不可逆 action が
-    プロセス全体で 1 回だけ実行され、敗者が完了前に後続へ進まないことを示す。
-(d) 既存 v1 DB は executing/lease 列へ非破壊に migration される。
+(a) Store level: ``acquire_lease`` is single-winner and claims
+    ``resolved -> executing``; losers receive WAIT. ``complete_execution`` only lets
+    the lease holder finalize executed. If the winner crashes, another process
+    reclaims the expired lease (``took_over``).
+(b) Gate level: losers see executing and pause until ``executed`` (order
+    consistency). Once the winner completes, losers skip. Another process
+    reclaims expired leases and completes execution.
+(c) End-to-end: simulate concurrent processes (threads + independent connections)
+    and show that an irreversible action runs exactly once across the whole
+    process set, and losers do not proceed to later work before completion.
+(d) Existing v1 DBs are migrated nondestructively to executing/lease columns.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ RUN = "run-concurrent"
 
 
 def make_world(actions):
-    """``gather`` が ``actions[iteration]`` を提案し ``act`` が実行を記録する世界。"""
+    """A world where ``gather`` proposes ``actions[iteration]`` and ``act`` records execution."""
     executed: list = []
 
     def gather(state):
@@ -63,7 +66,7 @@ def is_deploy(action) -> bool:
 
 
 def _seed_resolved(db_path, gate_key="gate-0", action="deploy", decision="approve"):
-    """run を作り、不可逆 action を 1 件 resolve した状態の DB を用意する。"""
+    """Create a run and prepare a DB with one irreversible action resolved."""
     store = LoopStore(connect(db_path))
     store.load_or_init(RUN)
     store.request_decision(RUN, gate_key, action)
@@ -71,11 +74,12 @@ def _seed_resolved(db_path, gate_key="gate-0", action="deploy", decision="approv
     return store
 
 
-# -- (a) store レベル: リースの single-winner / 完了 / 失効取り直し -----------
+# -- (a) store level: lease single-winner / completion / expired-lease takeover --
 
 
 def test_acquire_lease_is_single_winner_across_connections(tmp_path):
-    # 別接続 (並行 resume 模擬) からの取得でも resolved->executing に成功するのは 1 者。
+    # Even when acquired from separate connections (simulated concurrent resume),
+    # only one party can move resolved->executing.
     db_path = tmp_path / "s.db"
     store_a = _seed_resolved(db_path)
     store_b = LoopStore(connect(db_path))
@@ -83,14 +87,15 @@ def test_acquire_lease_is_single_winner_across_connections(tmp_path):
     ra = store_a.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=30)
     rb = store_b.acquire_lease(RUN, "gate-0", "B", now=0.0, ttl=30)
     assert ra["outcome"] == LEASE_ACQUIRED and ra["took_over"] is False
-    # 敗者は有効リース保持者 (A) を見て WAIT。
+    # The loser sees the active lease holder (A) and waits.
     assert rb["outcome"] == LEASE_WAIT and rb["owner"] == "A"
-    # status は executing でリース情報が載る。
+    # The status is executing and includes lease information.
     row = store_a.get_decision(RUN, "gate-0")
     assert row["status"] == "executing" and row["lease_owner"] == "A"
     assert row["lease_expires_at"] == 30.0
 
-    # 勝者が完了 -> executed。敗者の再取得は EXECUTED (skip)、敗者 complete は False。
+    # Winner completes -> executed. Loser reacquire returns EXECUTED (skip), and
+    # loser complete returns False.
     assert store_a.complete_execution(RUN, "gate-0", "A") is True
     done = store_a.get_decision(RUN, "gate-0")
     assert done["status"] == "executed" and done["lease_owner"] is None
@@ -104,7 +109,7 @@ def test_complete_execution_only_by_current_lease_holder(tmp_path):
     db_path = tmp_path / "s.db"
     store = _seed_resolved(db_path)
     store.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=30)
-    # 別 owner は完了確定できない (リース保持者ではない)。
+    # Another owner cannot finalize completion because it is not the lease holder.
     assert store.complete_execution(RUN, "gate-0", "B") is False
     assert store.get_decision(RUN, "gate-0")["status"] == "executing"
     assert store.complete_execution(RUN, "gate-0", "A") is True
@@ -114,28 +119,30 @@ def test_lease_reentrant_same_owner_extends_expiry(tmp_path):
     db_path = tmp_path / "s.db"
     store = _seed_resolved(db_path)
     store.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=10)  # expires 10
-    r2 = store.acquire_lease(RUN, "gate-0", "A", now=5.0, ttl=10)  # 再入 -> expires 15
+    r2 = store.acquire_lease(RUN, "gate-0", "A", now=5.0, ttl=10)  # reentrant -> expires 15
     assert r2["outcome"] == LEASE_ACQUIRED and r2["took_over"] is False
     assert store.get_decision(RUN, "gate-0")["lease_expires_at"] == 15.0
 
 
 def test_expired_lease_is_taken_over_after_winner_crash(tmp_path):
-    # 勝者がリースを取得後にクラッシュ (complete しない) -> 失効後に別プロセスが取り直す。
+    # Winner crashes after acquiring the lease (does not complete) -> another
+    # process reclaims it after expiration.
     db_path = tmp_path / "s.db"
     store_a = _seed_resolved(db_path)
     store_b = LoopStore(connect(db_path))
     store_a.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=10)
-    # 失効前: B は待たされる。
+    # Before expiration: B is made to wait.
     assert store_b.acquire_lease(RUN, "gate-0", "B", now=5.0, ttl=10)["outcome"] == (
         LEASE_WAIT
     )
-    # 失効後 (now > expires=10): B が取り直す (took_over)。
+    # After expiration (now > expires=10): B reclaims it (took_over).
     taken = store_b.acquire_lease(RUN, "gate-0", "B", now=20.0, ttl=10)
     assert taken["outcome"] == LEASE_ACQUIRED and taken["took_over"] is True
-    # 旧勝者 A の遅れた完了は no-op (リースを失っている)。二重 executed を防ぐ。
+    # The old winner A's delayed completion is a no-op because it lost the lease.
+    # This prevents duplicate executed finalization.
     assert store_a.complete_execution(RUN, "gate-0", "A") is False
     assert store_b.complete_execution(RUN, "gate-0", "B") is True
-    # 取り直しは loop_gate(executing, took_over=True) を journal に残す。
+    # The takeover leaves loop_gate(executing, took_over=True) in the journal.
     gate_events = [
         e
         for e in store_b.read_events(RUN)
@@ -157,14 +164,14 @@ def test_acquire_lease_validation_and_errors(tmp_path):
         store.acquire_lease(RUN, "g", "o", now=0.0, ttl=0)
     with pytest.raises(ValueError, match="unresolved"):
         store.acquire_lease(RUN, "g", "o", now=0.0, ttl=1)  # pending
-    # reject/respond は実行系でないのでリースを張れない。
+    # reject/respond are not execution decisions, so they cannot be leased.
     store.request_decision(RUN, "gr", "deploy")
     store.resolve_decision(RUN, "gr", "reject")
     with pytest.raises(ValueError, match="not executable"):
         store.acquire_lease(RUN, "gr", "o", now=0.0, ttl=1)
 
 
-# -- (b) gate レベル: 敗者 pause / 勝者完了後 skip / 失効取り直し -------------
+# -- (b) gate level: loser pause / skip after winner completion / takeover ------
 
 
 def test_loser_gate_pauses_while_winner_holds_lease(tmp_path):
@@ -180,22 +187,23 @@ def test_loser_gate_pauses_while_winner_holds_lease(tmp_path):
     )
     state = LoopState()  # iteration 0 -> gate-0
 
-    # A が deploy@0 のリースを取得 -> proceed (まだ complete していない)。
+    # A acquires the deploy@0 lease -> proceed (not completed yet).
     review_a = gate_a.review("deploy", state)
     assert review_a.disposition == GATE_PROCEED
     assert review_a.on_complete is not None
 
-    # A 実行中に B が同じゲートを審査 -> 順序整合のため pause (executed まで待つ)。
+    # While A is executing, B reviews the same gate -> pause for order consistency
+    # until executed.
     review_b = gate_b.review("deploy", state)
     assert review_b.disposition == GATE_PAUSE
     assert review_b.pending["status"] == "executing"
     assert review_b.pending["gate_key"] == "gate-0"
 
-    # A が完了確定 -> executed。
+    # A finalizes completion -> executed.
     review_a.on_complete()
     assert store_a.get_decision(RUN, "gate-0")["status"] == "executed"
 
-    # B が再審査 -> 既実行なので skip (二重実行しない)。
+    # B reviews again -> already executed, so skip (no duplicate execution).
     review_b2 = gate_b.review("deploy", state)
     assert review_b2.disposition == GATE_SKIP
 
@@ -213,14 +221,14 @@ def test_loser_gate_takes_over_after_winner_lease_expires(tmp_path):
     )
     state = LoopState()
 
-    # A が取得 -> proceed。だが complete せずクラッシュしたとする。
+    # A acquires -> proceed, but assume it crashes without completing.
     assert gate_a.review("deploy", state).disposition == GATE_PROCEED
 
-    # 失効前は B は待たされる。
+    # Before expiration, B is made to wait.
     clock.now = 5.0
     assert gate_b.review("deploy", state).disposition == GATE_PAUSE
 
-    # 失効後は B が取り直して実行する (proceed)。
+    # After expiration, B reclaims and executes (proceed).
     clock.now = 100.0
     review_b = gate_b.review("deploy", state)
     assert review_b.disposition == GATE_PROCEED
@@ -229,19 +237,21 @@ def test_loser_gate_takes_over_after_winner_lease_expires(tmp_path):
 
 
 def test_winner_crash_recovery_records_step_via_loop(tmp_path):
-    # 勝者クラッシュ -> 失効 -> 別プロセスが full loop で取り直し、step が欠落しない。
+    # Winner crash -> expiration -> another process reclaims through the full loop,
+    # and the step is not lost.
     db_path = tmp_path / "s.db"
     seed = _seed_resolved(db_path)
     clock = ManualClock(0.0)
 
-    # 勝者 A: リースを取得 (proceed) するが act/on_complete を呼ばず "クラッシュ"。
+    # Winner A: acquires the lease (proceed) but "crashes" without calling
+    # act/on_complete.
     gate_a = HumanGate(
         on=is_deploy, store=seed, run_id=RUN, owner="A", now_fn=clock, lease_ttl=5
     )
     assert gate_a.review("deploy", LoopState()).disposition == GATE_PROCEED
     assert seed.get_decision(RUN, "gate-0")["status"] == "executing"
 
-    # リース失効後、敗者 B が full loop で resume して取り直す。
+    # After lease expiration, loser B resumes through the full loop and reclaims it.
     clock.now = 100.0
     conn_b = connect(db_path)
     db_b = DBProgressLog(conn_b, RUN)
@@ -263,25 +273,29 @@ def test_winner_crash_recovery_records_step_via_loop(tmp_path):
         on_step=db_b.on_step,
     )
     assert res.status == "stopped"
-    assert executed == ["deploy", "work2"]  # B が deploy を取り直して実行
+    assert executed == ["deploy", "work2"]  # B reclaims and executes deploy
     assert db_b.store.get_decision(RUN, "gate-0")["status"] == "executed"
-    # deploy の step 行が永続化されている (勝者クラッシュでも step が欠落しない)。
+    # The deploy step row is persisted, so the step is not lost even after winner crash.
     steps = db_b.store.read_steps(RUN)
     assert any(s["observation"] == "deploy" for s in steps)
     conn_b.close()
 
 
-# -- (c) end-to-end: 並行プロセス模擬で exactly-once + 順序整合 ----------------
+# -- (c) end-to-end: simulated concurrent processes with exactly-once + ordering -
 
 
 def test_concurrent_resume_runs_irreversible_action_exactly_once(tmp_path):
-    # 2 スレッド + 独立接続で同一 run_id を *同時に* resume する。各ラウンドで不可逆 action
-    # (deploy) はプロセス全体で 1 回だけ実行され、敗者は完了前に後続へ進まない (順序整合)。
-    # barrier で両者をゲート審査時点で衝突させ、複数ラウンドで競合を繰り返し叩く。
+    # Resume the same run_id *simultaneously* using two threads + independent
+    # connections. In each round, the irreversible action (deploy) runs exactly
+    # once across the whole process set, and losers do not proceed to later work
+    # before completion (order consistency). The barrier makes both parties
+    # collide at gate review time and repeats the race across multiple rounds.
     actions = ["deploy", "work2"]
-    # 各スレッドの executed として許される形:
-    #   ("deploy","work2") 勝者 / () WAIT で pause した敗者 / ("work2",) 既実行 skip の敗者。
-    # いずれも「deploy より前に work2 を実行しない」順序整合と「deploy は高々 1 回」を満たす。
+    # Allowed executed shapes for each thread:
+    #   ("deploy","work2") winner / () loser paused on WAIT /
+    #   ("work2",) loser skipped already-executed deploy.
+    # All satisfy order consistency ("do not execute work2 before deploy") and
+    # "deploy runs at most once."
     allowed = {("deploy", "work2"), (), ("work2",)}
 
     for i in range(20):
@@ -299,14 +313,15 @@ def test_concurrent_resume_runs_irreversible_action_exactly_once(tmp_path):
         lock = threading.Lock()
 
         def worker(name: str) -> None:
-            # setup 失敗で barrier 手前で抜けると相手が無限待ちするため、worker 全体を
-            # try で囲み、barrier には timeout を付けて fail-fast にする (deadlock 防止)。
+            # If setup fails before reaching the barrier, the peer would wait
+            # forever. Wrap the whole worker in try and give the barrier a timeout
+            # to fail fast (deadlock prevention).
             try:
                 conn = connect(db_path)
                 store = LoopStore(conn)
                 gather, act, executed = make_world(actions)
                 gate = HumanGate(on=is_deploy, store=store, run_id=run_id, owner=name)
-                barrier.wait(timeout=10)  # 両スレッドをゲート審査直前で揃える。
+                barrier.wait(timeout=10)  # Align both threads just before gate review.
                 res = run_loop(
                     act=act,
                     verify=never_done,
@@ -317,11 +332,11 @@ def test_concurrent_resume_runs_irreversible_action_exactly_once(tmp_path):
                 conn.close()
                 with lock:
                     results[name] = (res, executed)
-            except BaseException as exc:  # noqa: BLE001 - テスト失敗を握り潰さず記録
+            except BaseException as exc:  # noqa: BLE001 - record test failures without swallowing them
                 with lock:
                     errors[name] = exc
                 try:
-                    barrier.abort()  # 相手の barrier 待ちを即座に解く。
+                    barrier.abort()  # Release the peer from barrier wait immediately.
                 except Exception:
                     pass
 
@@ -336,24 +351,24 @@ def test_concurrent_resume_runs_irreversible_action_exactly_once(tmp_path):
         assert set(results) == {"A", "B"}, (i, set(results))
         ex_a = tuple(results["A"][1])
         ex_b = tuple(results["B"][1])
-        # 各スレッドの実行列は許容形のいずれか (順序整合)。
+        # Each thread's execution sequence is one of the allowed shapes (order consistency).
         assert ex_a in allowed, (i, ex_a)
         assert ex_b in allowed, (i, ex_b)
-        # deploy はプロセス全体でちょうど 1 回 (exactly-once)。
+        # deploy runs exactly once across the whole process set.
         assert (ex_a + ex_b).count("deploy") == 1, (i, ex_a, ex_b)
-        # ちょうど 1 スレッドが勝者 (deploy を実行)。
+        # Exactly one thread is the winner (executes deploy).
         winners = [n for n in ("A", "B") if "deploy" in results[n][1]]
         assert len(winners) == 1, (i, ex_a, ex_b)
-        # 最終的にゲートは executed (勝者が完了確定)。
+        # The gate is eventually executed (winner finalized completion).
         final = LoopStore(connect(db_path))
         assert final.get_decision(run_id, "gate-0")["status"] == "executed"
         final.conn.close()
 
 
-# -- (d) 既存 v1 DB の非破壊 migration ----------------------------------------
+# -- (d) nondestructive migration for existing v1 DBs ---------------------------
 
 
-# v1 (Issue #15) 時点の pending_decision DDL: executing status と lease 列が無い。
+# pending_decision DDL from v1 (Issue #15): no executing status or lease columns.
 _OLD_SCHEMA = """
 CREATE TABLE run (
   run_id TEXT PRIMARY KEY,
@@ -391,14 +406,14 @@ def test_old_pending_decision_schema_is_migrated_nondestructively(tmp_path):
     raw.commit()
     raw.close()
 
-    # connect が migration を走らせる。
+    # connect runs migration.
     store = LoopStore(connect(db_path))
     decision = store.get_decision(RUN, "gate-0")
-    # 既存行は保存される。新リース列が追加される (default NULL)。
+    # Existing rows are preserved. New lease columns are added (default NULL).
     assert decision["status"] == "resolved" and decision["action"] == "deploy"
     assert decision["lease_owner"] is None
     assert "lease_expires_at" in decision
-    # executing が許可される (= CHECK が再構築された) ことをリース取得で確認。
+    # Confirm by acquiring a lease that executing is allowed (= CHECK was rebuilt).
     res = store.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=10)
     assert res["outcome"] == LEASE_ACQUIRED
     assert store.get_decision(RUN, "gate-0")["status"] == "executing"
@@ -406,8 +421,9 @@ def test_old_pending_decision_schema_is_migrated_nondestructively(tmp_path):
 
 
 def test_migration_recovers_from_leftover_temp_table(tmp_path):
-    # 前回中断で一時テーブル pending_decision_mig が残っていても、migration はそれを落として
-    # やり直せる (CREATE は IF NOT EXISTS でないため、放置すると connect が恒久失敗する)。
+    # Even if the temporary table pending_decision_mig was left by a previous
+    # interruption, migration can drop it and retry. CREATE is not IF NOT EXISTS,
+    # so leaving it behind would make connect fail permanently.
     db_path = tmp_path / "stale.db"
     raw = sqlite3.connect(str(db_path))
     raw.executescript(_OLD_SCHEMA)
@@ -417,18 +433,18 @@ def test_migration_recovers_from_leftover_temp_table(tmp_path):
         'VALUES (?, ?, ?, ?, ?)',
         (RUN, "gate-0", "resolved", "approve", '"deploy"'),
     )
-    # 中断で取り残された一時テーブルを模擬。
+    # Simulate a temporary table left behind by an interruption.
     raw.execute("CREATE TABLE pending_decision_mig (id INTEGER PRIMARY KEY)")
     raw.commit()
     raw.close()
 
-    # connect が落ちずに migration を完遂し、本来の決定が保たれる。
+    # connect completes migration without failing, and the original decision is preserved.
     store = LoopStore(connect(db_path))
     assert store.get_decision(RUN, "gate-0")["status"] == "resolved"
     assert store.acquire_lease(RUN, "gate-0", "A", now=0.0, ttl=5)["outcome"] == (
         LEASE_ACQUIRED
     )
-    # 一時テーブルは残っていない。
+    # The temporary table is gone.
     leftover = store.conn.execute(
         "SELECT name FROM sqlite_master WHERE name='pending_decision_mig'"
     ).fetchone()
@@ -436,7 +452,8 @@ def test_migration_recovers_from_leftover_temp_table(tmp_path):
 
 
 def test_migration_is_idempotent_on_already_v2_db(tmp_path):
-    # 新スキーマで作った DB を再度開いても migration は no-op で、決定は壊れない。
+    # Reopening a DB created with the new schema leaves migration as a no-op and
+    # does not corrupt the decision.
     db_path = tmp_path / "v2.db"
     store = _seed_resolved(db_path)
     store.conn.close()

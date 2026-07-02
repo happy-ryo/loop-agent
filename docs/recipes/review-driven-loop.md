@@ -1,8 +1,8 @@
 # Review-driven Loop
 
-LLM-backed な `act` がファイルを編集する場合に、テストだけでは scope、設計 fit、release risk を判断しきれないときの recipe です。
+This recipe is for cases where an LLM-backed `act` edits files and tests alone cannot fully judge scope, design fit, or release risk.
 
-安定 API として `review=` を明示的に使います。`review` に渡す callable は `ReviewHook` で、`ReviewOutcome` を返します。
+Use `review=` explicitly as the stable API. The callable passed to `review` is a `ReviewHook`, and it returns a `ReviewOutcome`.
 
 ```text
 gather finding -> act fix -> review artifact -> verify ground truth -> repeat
@@ -10,9 +10,9 @@ gather finding -> act fix -> review artifact -> verify ground truth -> repeat
 
 ## Prose Intent
 
-coding agent へ渡す自然言語指示の例:
+Example natural-language instruction to pass to a coding agent:
 
-> loop-agent で、小さな LLM-backed code-editing task 用の harness を作ってください。`act` はファイル編集までに限定し、commit/push/deploy はループ外に置きます。各 edit の後に `review` を実行し、scope、公開 API との整合、タスク意図との一致を確認してください。blocking review の場合は `verify` を走らせず、review feedback を次の iteration に渡してください。review が通ったら pytest による ground-truth verification を実行します。multi-item では `WorkListDrained` と `MaxIterations` を使い、item ごとの試行回数を cap してください。
+> In loop-agent, create a harness for small LLM-backed code-editing tasks. Limit `act` to file edits, and keep commit/push/deploy outside the loop. After each edit, run `review` to check scope, alignment with the public API, and consistency with the task intent. For a blocking review, do not run `verify`; pass the review feedback into the next iteration. Once review passes, run ground-truth verification with pytest. For multi-item work, use `WorkListDrained` and `MaxIterations`, and cap the number of attempts per item.
 
 ## Harness Shape
 
@@ -55,8 +55,8 @@ gather = WorkListGather(
 
 def act(ctx):
     target = ctx["payload"]["target"]
-    # 実 harness では ClaudeCodeAct/CodexAct を呼び、直前の
-    # state.history[-1].detail にある review feedback を prompt に含める。
+    # In a real harness, call ClaudeCodeAct/CodexAct and include the review
+    # feedback from the previous state.history[-1].detail in the prompt.
     return ActOutcome(observation={"target": target, "changed": True})
 
 
@@ -91,7 +91,7 @@ result = run_loop(
 
 ## Structured LLM Review
 
-`review` を LLM に任せる場合は、自然文ではなく JSON decision を要求します。`No findings` や `LGTM` の文字列一致で承認すると、review agent の文体が少し変わっただけで loop が誤停止したり、逆に曖昧な返答を成功扱いしたりします。
+When delegating `review` to an LLM, require a JSON decision rather than free-form prose. If approval is based on exact string matches such as `No findings` or `LGTM`, a minor change in the review agent's writing style can incorrectly stop the loop, or an ambiguous response can be treated as success.
 
 ```python
 import json
@@ -135,11 +135,11 @@ Artifact summary:
     return ReviewOutcome(True, residual_risk)
 ```
 
-Dogfood harness では、review の JSON decision に加えて「実 adapter を使った」ことも検証します。たとえば Codex を `act` と `review` の両方に使うなら、act 側は `verify` で `CodexResult.command` が `codex exec` を含むことと `tokens > 0` を確認します。review 側は `review_artifact` の中で `review_act(...)` の結果をすぐ確認するか、command / tokens を外部記録に保存してから `verify` で読むようにします。`VerifyHook` が直接受け取るのは act の `ActOutcome` だけなので、review 側の adapter 結果を暗黙に参照できるとは考えないでください。これにより、手編集を後から `ActOutcome(tokens=0)` として記録するだけの post-hoc recorder を dogfood と誤認しません。
+In a dogfood harness, also verify that a real adapter was used, in addition to checking the review JSON decision. For example, if Codex is used for both `act` and `review`, the act side should have `verify` confirm that `CodexResult.command` contains `codex exec` and that `tokens > 0`. On the review side, either check the result of `review_act(...)` immediately inside `review_artifact`, or store command / tokens in an external record and read them from `verify`. Do not assume the review-side adapter result is implicitly available to `VerifyHook`, because `VerifyHook` directly receives only the act `ActOutcome`. This prevents a post-hoc recorder that merely records manual edits afterward as `ActOutcome(tokens=0)` from being mistaken for dogfooding.
 
 ## Feedback Representation
 
-blocking review の場合、`ReviewOutcome` は `StepRecord.detail` の JSON に入ります。review が blocking でない場合は `verify` が走り、detail は従来どおり `verify.detail` の生文字列です。
+For a blocking review, the `ReviewOutcome` is placed in `StepRecord.detail` as JSON. If the review is not blocking, `verify` runs, and `detail` is the raw `verify.detail` string as before.
 
 ```json
 {"review":{"approved":false,"feedback":"missing target docs/api-reference.md","severity":"blocking"}}
@@ -149,12 +149,12 @@ blocking review の場合、`ReviewOutcome` は `StepRecord.detail` の JSON に
 pytest passed
 ```
 
-大きな diff 全体を detail に入れず、finding summary、severity、file path だけを保存してください。次の `act` は repository を直接読めます。
+Do not put the entire large diff in `detail`; store only the finding summary, severity, and file path. The next `act` can read the repository directly.
 
 ## WorkListGather Interaction
 
-`done_when` は review approval と ground-truth verify の両方を要求します。`max_attempts_per_item` を設定し、1 件の noisy な review feedback が loop budget 全体を消費しないようにします。
+`done_when` should require both review approval and ground-truth verification. Set `max_attempts_per_item` so that one noisy review feedback item cannot consume the entire loop budget.
 
 ## HumanGate Boundary
 
-`review` は post-act artifact の評価です。不可逆操作は `HumanGate` の責務です。commit、push、tag、publish、deploy はループ外に置くか、明示的な gated action にしてください。
+`review` evaluates the post-act artifact. Irreversible operations are the responsibility of `HumanGate`. Keep commit, push, tag, publish, and deploy outside the loop, or make them explicit gated actions.

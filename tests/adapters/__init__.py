@@ -1,6 +1,7 @@
-# tests/adapters を 1 つのパッケージにして、この配下の ``conftest`` がトップレベル
-# ``tests/conftest.py`` (ループコア共通ヘルパ) と **モジュール名衝突しない** ように
-# する。pytest の prepend import mode では、__init__.py が無いと両 conftest がともに
-# モジュール名 ``conftest`` になり、ルートの ``from conftest import ...`` がこちらの
-# アダプタ用 conftest を誤って拾う。__init__.py を置くとこの配下は ``adapters.*``
-# として import され、衝突を避けられる。
+# Make tests/adapters a package so the ``conftest`` under it does not have a
+# module-name collision with the top-level ``tests/conftest.py`` (shared loop
+# core helpers). In pytest's prepend import mode, without __init__.py both
+# conftest files are named ``conftest``, so a root-level
+# ``from conftest import ...`` can accidentally pick up this adapter conftest.
+# With __init__.py in place, this subtree is imported as ``adapters.*``, which
+# avoids the collision.

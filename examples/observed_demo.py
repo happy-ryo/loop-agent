@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""観測層デモ: loop_begin/step/end を JSONL へ流し、終了理由/メトリクスを見る。
+"""Observation layer demo: stream loop_begin/step/end to JSONL and inspect stop reasons/metrics.
 
-``run_observed_loop`` にループを通すと、loop_begin -> loop_step x N -> loop_end の
-構造化イベントが sink へ流れる。ここでは journal 風の JSONL sink と in-memory sink を
-同時に張り、終了理由と累積トークンが追えることを示す。OTel が入っていれば同じ run が
-1 本の GenAI span にもなる（未導入環境では no-op に degrade）。
+Passing the loop through ``run_observed_loop`` sends structured events to sinks in the
+loop_begin -> loop_step x N -> loop_end sequence. This demo attaches both a
+journal-style JSONL sink and an in-memory sink to show that stop reasons and
+cumulative tokens can be tracked. If OTel is installed, the same run also becomes a
+single GenAI span; in environments without OTel, it degrades to a no-op.
 
-実行:
+Run:
 
     python3 examples/observed_demo.py
 """

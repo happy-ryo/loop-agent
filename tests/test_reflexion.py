@@ -1,7 +1,8 @@
-"""外側 Reflexion 駆動 + RQGM 安全核の統合/不変条件テスト (Issue #22 の核心)。
+"""Integration/invariant tests for the outer Reflexion driver + RQGM safety kernel (core of Issue #22).
 
-ここが「安全不変条件をテストで実証」の本体。各不変条件を **正例** と、ガードを外すと
-攻撃が通る **反証例 (falsification)** の対で固める (ガードが load-bearing であることの証明)。
+This is the main body that demonstrates safety invariants with tests. Each invariant is locked down
+with a **positive example** and a paired **falsification** where the attack succeeds if the guard is
+removed (proving that the guard is load-bearing).
 """
 
 from __future__ import annotations
@@ -17,13 +18,13 @@ from loop_agent.reflexion import ReflexionContext, run_reflexion
 from loop_agent.state import LoopState, StepRecord
 
 
-# -- 共通スタブ ----------------------------------------------------------------
+# -- Shared stubs ---------------------------------------------------------------
 
 DECLARED = ("primary",)
 
 
 def make_result(succeeded: bool, observation: object = "obs") -> LoopResult:
-    """内側 ``run_loop`` の結果スタンド (succeeded で goal_met / stopped を切替)。"""
+    """Result stand-in for the inner ``run_loop`` (switches goal_met/stopped by succeeded)."""
     step = StepRecord(iteration=0, observation=observation, tokens=1,
                       goal_met=succeeded, detail=str(observation))
     state = LoopState(iteration=1, history=[step], goal_met=succeeded)
@@ -37,7 +38,7 @@ def make_result(succeeded: bool, observation: object = "obs") -> LoopResult:
 
 
 def gt_from_success(hi: float = 0.9, lo: float = 0.2, backed: bool = True):
-    """outcome.succeeded から一次信号を作る (内側 verify 由来; 評価器ではない)。"""
+    """Build a primary signal from outcome.succeeded (from inner verify; not the evaluator)."""
 
     def gt(outcome):
         val = hi if outcome.succeeded else lo
@@ -52,7 +53,7 @@ def gt_from_success(hi: float = 0.9, lo: float = 0.2, backed: bool = True):
 
 
 def _truth(o):
-    """評価器が EpisodeOutcome / probe dict のどちらでも採点できるよう読む。"""
+    """Read either EpisodeOutcome or probe dict so evaluators can score both."""
     if hasattr(o, "succeeded"):
         return 1.0 if o.succeeded else 0.0
     return o["truth"]
@@ -64,7 +65,7 @@ LENIENT = Evaluator(score=lambda o: Score(ground_truth=1.0), name="lenient")
 
 
 def held_out_matching(*golds: float) -> HeldOut:
-    """gold==truth な probe 群 (honest が完全一致、flat/lenient は乖離)。"""
+    """Probes where gold==truth (honest matches exactly; flat/lenient diverge)."""
     return HeldOut(
         tuple(Probe(f"probe-{i}", {"truth": g}, gold_label=g) for i, g in enumerate(golds))
     )
@@ -75,7 +76,7 @@ def no_reflect(history, signal, reward):
 
 
 def true_reflect(history, signal, reward):
-    """失敗軌跡から grounded な言語的指針を抽出 (Reflexion 本来の挙動)。"""
+    """Extract a grounded natural-language instruction from a failure trajectory (native Reflexion behavior)."""
     if signal.succeeded:
         return None
     return Lesson(text="use-the-fix", episode=0,
@@ -91,7 +92,7 @@ def reject_all(lesson, outcome):
 
 
 # ==============================================================================
-# 構成時バリデーション
+# Construction-time validation
 # ==============================================================================
 
 
@@ -113,10 +114,10 @@ def _base_kwargs(**override):
 @pytest.mark.parametrize(
     "override",
     [
-        {"epoch_len": 1},          # 動く評価器への退化
-        {"epsilon": 0.0},          # churn 防止余白の喪失
+        {"epoch_len": 1},          # Degenerates into a moving evaluator.
+        {"epsilon": 0.0},          # Loses anti-churn margin.
         {"epsilon": -0.1},
-        {"declared_keys": ()},     # 多様評価の喪失
+        {"declared_keys": ()},     # Loses diverse evaluation.
         {"production_tasks": []},
     ],
 )
@@ -126,53 +127,53 @@ def test_constructor_validation_rejects_unsafe_config(override):
 
 
 def test_dual_component_overlap_rejected():
-    """production task と held-out probe の名前空間が交差したら拒否 (dual-component 分離)。"""
+    """Reject intersecting production task and held-out probe namespaces (dual-component separation)."""
     with pytest.raises(ValueError):
         run_reflexion(
             **_base_kwargs(
-                production_tasks=["probe-0"],  # held_out_matching の case_id と衝突
+                production_tasks=["probe-0"],  # Collides with held_out_matching's case_id.
                 held_out=held_out_matching(0.2, 0.8),
             )
         )
 
 
 def test_epoch_len_one_is_moving_evaluator_rejected():
-    """INV1 反証: epoch_len==1 (毎 episode 更新 = 動く評価器) は構造的に禁止。"""
+    """INV1 falsification: epoch_len==1 (per-episode updates = moving evaluator) is structurally forbidden."""
     with pytest.raises(ValueError):
         run_reflexion(**_base_kwargs(epoch_len=1))
 
 
 # ==============================================================================
-# INV1: epoch 内で評価器が固定される (reward hacking 抑止)
+# INV1: the evaluator is frozen within each epoch (reward hacking prevention)
 # ==============================================================================
 
 
 def test_evaluator_frozen_within_epoch_updates_only_at_boundary():
-    """epoch 内で evaluator_version / reward は不変、境界でのみ昇格する。"""
+    """evaluator_version/reward are invariant within an epoch and promote only at boundaries."""
     records = []
     run_reflexion(
         **_base_kwargs(
-            episode=lambda ctx: make_result(True),  # 同一軌跡を毎回
+            episode=lambda ctx: make_result(True),  # Same trajectory every time.
             ground_truth=gt_from_success(),
-            evaluator=FLAT,                          # reward=0.5 一定
+            evaluator=FLAT,                          # Constant reward=0.5.
             convergence=[MaxEpisodes(6)],
             held_out=held_out_matching(0.0, 0.5, 1.0),
             epoch_len=3,
-            propose_evaluator=lambda outer, inc: HONEST,  # 毎境界 honest を提案
+            propose_evaluator=lambda outer, inc: HONEST,  # Propose honest at every boundary.
             on_episode=lambda rec, st: records.append(rec),
         )
     )
-    # epoch 0 (ep0-2): 初期 incumbent FLAT で固定。reward は 0.5 一定。
+    # epoch 0 (ep0-2): fixed to initial incumbent FLAT. reward is constant at 0.5.
     assert {r.evaluator_version for r in records[:3]} == {FLAT.version}
     assert [r.reward for r in records[:3]] == [0.5, 0.5, 0.5]
-    # 境界で HONEST が held-out で勝ち昇格 → epoch 1 (ep3-5) は HONEST で固定。
+    # HONEST wins on held-out at the boundary and promotes -> epoch 1 (ep3-5) is fixed to HONEST.
     assert {r.evaluator_version for r in records[3:6]} == {HONEST.version}
     assert [r.reward for r in records[3:6]] == [1.0, 1.0, 1.0]
-    # reward が epoch 内で動いていない (境界でのみ変化) ことが freeze の実証。
+    # This demonstrates the freeze: reward does not move within an epoch and changes only at boundaries.
 
 
 def test_no_evaluator_update_on_terminal_boundary():
-    """収束/打ち切りが epoch 境界と同時に成立したら、その境界では昇格を走らせない。"""
+    """Do not run promotion at a boundary that also satisfies convergence/termination."""
 
     def explode(outer, inc):
         raise AssertionError("propose_evaluator must not run on a terminal boundary")
@@ -182,19 +183,19 @@ def test_no_evaluator_update_on_terminal_boundary():
             episode=lambda ctx: make_result(True),
             ground_truth=gt_from_success(),
             evaluator=HONEST,
-            convergence=[MaxEpisodes(2)],   # episode==2 = epoch 境界 (epoch_len=2) と同時に発火
+            convergence=[MaxEpisodes(2)],   # episode==2 fires at the epoch boundary (epoch_len=2).
             held_out=held_out_matching(0.0, 0.5, 1.0),
             epoch_len=2,
             propose_evaluator=explode,
         )
     )
     assert result.stop.name == "max_episodes"
-    assert result.state.evaluator_version == HONEST.version  # 終端で書き換えない
+    assert result.state.evaluator_version == HONEST.version  # Do not rewrite at termination.
     assert result.epochs == 0
 
 
 def test_gaming_evaluator_rejected_at_boundary():
-    """境界で提案された緩い評価器は held-out 一致度が低く昇格できない。"""
+    """A lenient evaluator proposed at the boundary cannot promote because held-out agreement is low."""
     records = []
     run_reflexion(
         **_base_kwargs(
@@ -203,26 +204,26 @@ def test_gaming_evaluator_rejected_at_boundary():
             convergence=[MaxEpisodes(6)],
             held_out=held_out_matching(0.0, 0.3, 0.6),
             epoch_len=2,
-            propose_evaluator=lambda outer, inc: LENIENT,  # gaming 候補
+            propose_evaluator=lambda outer, inc: LENIENT,  # Gaming candidate.
             on_episode=lambda rec, st: records.append(rec),
         )
     )
-    # 全 episode で HONEST のまま (LENIENT は一度も採用されない)。
+    # HONEST remains for all episodes (LENIENT is never adopted).
     assert {r.evaluator_version for r in records} == {HONEST.version}
 
 
 # ==============================================================================
-# INV3: ground-truth 一次が制御を駆動。評価器スカラは reflect 専用
+# INV3: the ground-truth primary signal drives control; evaluator scalar is reflect-only
 # ==============================================================================
 
 
 def test_convergence_reads_ground_truth_not_evaluator_reward():
-    """緩い評価器が reward=1.0 を返しても、ground-truth 不達なら収束しない。"""
+    """Even if a lenient evaluator returns reward=1.0, it does not converge unless ground truth is met."""
     result = run_reflexion(
         **_base_kwargs(
-            episode=lambda ctx: make_result(False),  # ground-truth 失敗
+            episode=lambda ctx: make_result(False),  # Ground-truth failure.
             ground_truth=gt_from_success(hi=0.9, lo=0.2),
-            evaluator=LENIENT,                        # reward=1.0 (高いが無関係)
+            evaluator=LENIENT,                        # reward=1.0 (high but irrelevant).
             convergence=[RubricThreshold(0.8, sustain=1), MaxEpisodes(4)],
             held_out=held_out_matching(0.2, 0.8),
             epoch_len=2,
@@ -231,49 +232,49 @@ def test_convergence_reads_ground_truth_not_evaluator_reward():
     assert result.succeeded is False
     assert result.stop.name == "max_episodes"
     assert result.best_score == pytest.approx(0.2)
-    # reward は高いが制御に載っていない (reflect 専用)。
+    # reward is high but not on the control path (reflect-only).
     assert all(rec.reward == 1.0 for rec in result.state.episodes)
 
 
 def test_unbacked_episodes_do_not_count_toward_convergence():
-    """ground_truth_backed=False の episode は収束判定に算入されない。"""
+    """Episodes with ground_truth_backed=False do not count toward convergence."""
     result = run_reflexion(
         **_base_kwargs(
             episode=lambda ctx: make_result(True),
-            ground_truth=gt_from_success(hi=0.99, backed=False),  # 実信号なし
+            ground_truth=gt_from_success(hi=0.99, backed=False),  # No real signal.
             evaluator=HONEST,
             convergence=[RubricThreshold(0.8, sustain=1), MaxEpisodes(3)],
             held_out=held_out_matching(0.2, 0.8),
             epoch_len=2,
         )
     )
-    assert result.succeeded is False  # 高 aggregate でも backed=False なので未収束
+    assert result.succeeded is False  # Even with a high aggregate, backed=False prevents convergence.
     assert result.state.gt_aggregate_history == []
 
 
 def test_unbacked_episode_lesson_not_admitted():
-    """実信号の無い episode 由来の lesson は memory に入れない (次 context を汚さない)。"""
+    """Do not admit lessons from episodes without a real signal into memory (keep the next context clean)."""
     result = run_reflexion(
         **_base_kwargs(
             episode=lambda ctx: make_result(False, observation="real-step"),
-            ground_truth=gt_from_success(lo=0.2, backed=False),  # 実信号なし
-            reflect=true_reflect,  # grounded な lesson を返す
+            ground_truth=gt_from_success(lo=0.2, backed=False),  # No real signal.
+            reflect=true_reflect,  # Returns a grounded lesson.
             evaluator=HONEST,
             convergence=[MaxEpisodes(2)],
             held_out=held_out_matching(0.2, 0.8),
             epoch_len=2,
         )
     )
-    assert len(result.state.memory) == 0  # backed=False なので取り込まれない
+    assert len(result.state.memory) == 0  # backed=False means it is not admitted.
 
 
 # ==============================================================================
-# INV4b: memory 取込前検証 (false lesson 注入 / 自己申告 support を弾く)
+# INV4b: pre-admission memory validation (reject false lesson injection / self-reported support)
 # ==============================================================================
 
 
 def poison_reflect(history, signal, reward):
-    """実 step に紐づかない provenance + 詐称 support の注入 lesson。"""
+    """Injected lesson with provenance not tied to a real step plus falsified support."""
     return Lesson(text="POISON", episode=0, provenance="step-99-fabricated", support=99.0)
 
 
@@ -288,32 +289,32 @@ def test_poison_lesson_rejected_by_default_admission():
             epoch_len=2,
         )
     )
-    assert len(result.state.memory) == 0  # 注入 lesson は memory に入らない
+    assert len(result.state.memory) == 0  # Injected lesson is not admitted to memory.
     assert "POISON" not in result.state.memory.render()
 
 
 def test_poison_admission_is_load_bearing():
-    """反証: 取込前検証を accept_all に差し替えると注入 lesson が通ってしまう。"""
+    """Falsification: replacing pre-admission validation with accept_all lets the injected lesson through."""
     result = run_reflexion(
         **_base_kwargs(
             episode=lambda ctx: make_result(False),
             reflect=poison_reflect,
-            admit_lesson=accept_all,   # ガードを外す
+            admit_lesson=accept_all,   # Remove the guard.
             evaluator=HONEST,
             convergence=[MaxEpisodes(1)],
             held_out=held_out_matching(0.2, 0.8),
             epoch_len=2,
         )
     )
-    assert len(result.state.memory) == 1  # ガードを外すと poison が入る = 検証が効いていた
+    assert len(result.state.memory) == 1  # Removing the guard admits poison, showing validation was effective.
 
 
 def test_self_reported_support_is_overwritten():
-    """reflect が support を詐称しても driver が grounding から再計算して上書きする。"""
+    """Even if reflect falsifies support, the driver recomputes and overwrites it from grounding."""
     captured = {}
 
     def reflect_with_fake_support(history, signal, reward):
-        # 本物の provenance だが support を 99.0 と詐称。
+        # Real provenance, but support is falsely reported as 99.0.
         return Lesson(text="real lesson", episode=0,
                       provenance=step_signature(history[0]), support=99.0)
 
@@ -328,16 +329,16 @@ def test_self_reported_support_is_overwritten():
         )
     )
     (stored,) = result.state.memory.lessons()
-    assert stored.support == 1.0  # 自己申告 99.0 ではなく再計算値
+    assert stored.support == 1.0  # Recomputed value, not the self-reported 99.0.
 
 
 # ==============================================================================
-# INV5: 反省の肥大化を反復上限で抑える
+# INV5: bound reflection growth with an iteration limit
 # ==============================================================================
 
 
 def test_reflection_budget_stops_outer_loop():
-    """ReflectionBudget で取込 lesson が上限に達したら外側ループを打ち切る。"""
+    """ReflectionBudget stops the outer loop when admitted lessons reach the cap."""
     counter = {"n": 0}
 
     def unique_reflect(history, signal, reward):
@@ -360,10 +361,10 @@ def test_reflection_budget_stops_outer_loop():
 
 
 def test_admitted_lesson_stamped_with_actual_episode():
-    """reflect の placeholder episode=0 を driver が実 episode 番号で上書きする。"""
+    """The driver overwrites reflect's placeholder episode=0 with the actual episode number."""
 
     def reflect_each(history, signal, reward):
-        # hook は常に placeholder episode=0 を返す (正しい番号を知らない)。
+        # The hook always returns placeholder episode=0 (it does not know the correct number).
         return Lesson(text=f"lesson at {history[0].detail}", episode=0,
                       provenance=step_signature(history[0]), support=1.0)
 
@@ -383,7 +384,7 @@ def test_admitted_lesson_stamped_with_actual_episode():
             epoch_len=2,
         )
     )
-    # 3 episode 分の lesson がそれぞれ正しい episode 番号でスタンプされている。
+    # Lessons from all 3 episodes are each stamped with the correct episode number.
     episodes = sorted(l.episode for l in result.state.memory.lessons())
     assert episodes == [0, 1, 2]
 
@@ -407,11 +408,11 @@ def test_memory_size_bounded_under_many_reflections():
             memory=EpisodicMemory(cap=3),
         )
     )
-    assert len(result.state.memory) == 3  # cap で有界
+    assert len(result.state.memory) == 3  # Bounded by cap.
 
 
 # ==============================================================================
-# INV: reflect 例外は非致命
+# INV: reflect exceptions are non-fatal
 # ==============================================================================
 
 
@@ -429,12 +430,12 @@ def test_reflect_exception_is_non_fatal():
             epoch_len=2,
         )
     )
-    assert result.episodes == 2  # 例外で run が倒れない
+    assert result.episodes == 2  # The run does not fail because of the exception.
     assert all("reflect failed" in rec.detail for rec in result.state.episodes)
 
 
 # ==============================================================================
-# 成功判定はトリガ順に依存しない
+# Success judgment is independent of trigger order
 # ==============================================================================
 
 
@@ -446,7 +447,7 @@ def test_reflect_exception_is_non_fatal():
     ],
 )
 def test_success_is_order_insensitive(conditions):
-    """成功条件とハード上限が同一 guard で発火しても、成否は順序に依らない。"""
+    """Even if success and the hard cap fire on the same guard, success is order-independent."""
     result = run_reflexion(
         **_base_kwargs(
             episode=lambda ctx: make_result(True),
@@ -462,18 +463,18 @@ def test_success_is_order_insensitive(conditions):
 
 
 # ==============================================================================
-# 目玉: 学びが次 episode の ground-truth を改善する (Phase3 成功条件 a)
+# Main point: learning improves the next episode's ground truth (Phase3 success condition a)
 # ==============================================================================
 
 
 def succeed_if_lesson(ctx: ReflexionContext):
-    """memory_block に前試行の指針があれば成功する memory-sensitive episode。"""
+    """Memory-sensitive episode that succeeds when memory_block contains guidance from the prior attempt."""
     helped = "use-the-fix" in ctx.memory_block
     return make_result(helped, observation="fixed" if helped else "broken")
 
 
 def test_real_lesson_improves_next_episode_ground_truth():
-    """ep0 失敗 → grounded lesson 取込 → ep1 が memory 配線で成功 (eval で改善確認)。"""
+    """ep0 fails -> grounded lesson is admitted -> ep1 succeeds via memory wiring (improvement verified by eval)."""
     result = run_reflexion(
         **_base_kwargs(
             episode=succeed_if_lesson,
@@ -486,18 +487,18 @@ def test_real_lesson_improves_next_episode_ground_truth():
         )
     )
     history = result.state.gt_aggregate_history
-    assert history[0] == pytest.approx(0.2)  # ep0: memory 空で失敗
-    assert history[1] == pytest.approx(0.9)  # ep1: 配線された学びで成功
+    assert history[0] == pytest.approx(0.2)  # ep0: memory is empty, so it fails.
+    assert history[1] == pytest.approx(0.9)  # ep1: wired-in learning makes it succeed.
 
 
 def test_memory_unwired_control_shows_no_improvement():
-    """反証(帰属): 取込を reject_all で潰すと ep1 は改善しない (= 配線が原因と確定)。"""
+    """Falsification (attribution): reject_all blocks admission, so ep1 does not improve (= wiring is the cause)."""
     result = run_reflexion(
         **_base_kwargs(
             episode=succeed_if_lesson,
             ground_truth=gt_from_success(hi=0.9, lo=0.2),
             reflect=true_reflect,
-            admit_lesson=reject_all,   # 学びを memory に入れない
+            admit_lesson=reject_all,   # Do not admit learning into memory.
             evaluator=HONEST,
             convergence=[MaxEpisodes(2)],
             held_out=held_out_matching(0.2, 0.8),
@@ -506,11 +507,11 @@ def test_memory_unwired_control_shows_no_improvement():
     )
     history = result.state.gt_aggregate_history
     assert history[0] == pytest.approx(0.2)
-    assert history[1] == pytest.approx(0.2)  # 改善しない (memory 未配線)
+    assert history[1] == pytest.approx(0.2)  # No improvement (memory is not wired in).
 
 
 def test_paused_inner_episode_propagates_pause():
-    """内側 episode が人間ゲートで pause したら外側も pause を伝播する (Issue #15 契約)。"""
+    """If the inner episode pauses at a human gate, the outer loop propagates the pause (Issue #15 contract)."""
     paused = LoopResult(
         status="paused", stop=None, state=LoopState(), pending={"gate_key": "gate-0"}
     )
@@ -531,18 +532,18 @@ def test_paused_inner_episode_propagates_pause():
     assert result.status == "paused"
     assert result.paused is True
     assert result.pending == {"gate_key": "gate-0"}
-    # 未完了 episode は記録せず・進めない (resume で同じ episode を再実行できる)。
+    # Do not record or advance an incomplete episode (resume can rerun the same episode).
     assert result.state.episode == 0
     assert result.state.episodes == []
     assert "awaiting human decision" in result.reason
 
 
 def test_real_humangate_pause_propagates_through_reflexion():
-    """統合: 内側 episode が実 HumanGate(#21) で pause したら外側も pause を伝播する。
+    """Integration: if the inner episode pauses at a real HumanGate(#21), the outer loop propagates the pause.
 
-    #21 の lease/executing セマンティクスは PROCEED 経路の内側で完結し、未解決ゲートは
-    従来どおり status="paused" + pending を返す。外側はそれを score/reflect せず伝播する
-    (二信号駆動と lease exactly-once が episode 境界で両立することの実証)。
+    #21 lease/executing semantics complete inside the PROCEED path, and an unresolved gate returns
+    status="paused" + pending as before. The outer loop propagates that without score/reflect
+    (demonstrating that dual-signal control and lease exactly-once coexist at episode boundaries).
     """
     from loop_agent import (
         ActOutcome,
@@ -561,7 +562,7 @@ def test_real_humangate_pause_propagates_through_reflexion():
         return action == "deploy"
 
     def gather(_state):
-        return "deploy"  # 常に不可逆 action を提案
+        return "deploy"  # Always propose an irreversible action.
 
     def inner_act(_ctx):
         return ActOutcome(observation="deployed", tokens=1)
@@ -569,7 +570,7 @@ def test_real_humangate_pause_propagates_through_reflexion():
     def never(_o):
         return VerifyOutcome(goal_met=False)
 
-    # resolver 無し -> 未解決ゲートで pause する実 HumanGate。
+    # No resolver -> a real HumanGate pauses on the unresolved gate.
     gate = HumanGate(on=is_irreversible, store=store, run_id=run_id)
 
     def episode(ctx):
@@ -596,12 +597,12 @@ def test_real_humangate_pause_propagates_through_reflexion():
     )
     assert result.status == "paused"
     assert result.paused is True
-    assert result.pending is not None  # 内側ゲートの pending を伝播
-    assert result.state.episode == 0  # 未完了 episode は進めない
+    assert result.pending is not None  # Propagates pending from the inner gate.
+    assert result.state.episode == 0  # Does not advance an incomplete episode.
 
 
 def test_resume_rejects_mismatched_evaluator_version():
-    """外側 resume: 復元 evaluator_version と渡された評価器が食い違えば loud に弾く。"""
+    """Outer resume: loudly reject a mismatch between restored evaluator_version and the provided evaluator."""
     from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=4, epoch=2, evaluator_version="some-promoted-version")
@@ -619,7 +620,7 @@ def test_resume_rejects_mismatched_evaluator_version():
 
 
 def test_resume_rejects_mismatched_declared_keys():
-    """別の declared_keys で resume すると stale な集約で誤収束しうるので loud に弾く。"""
+    """Loudly reject resume with different declared_keys because stale aggregates could falsely converge."""
     from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(
@@ -631,7 +632,7 @@ def test_resume_rejects_mismatched_declared_keys():
             **_base_kwargs(
                 episode=lambda ctx: make_result(False),
                 evaluator=HONEST,
-                declared_keys=("primary",),  # seed と異なる軸
+                declared_keys=("primary",),  # Different axis from seed.
                 convergence=[MaxEpisodes(4)],
                 held_out=held_out_matching(0.2, 0.8),
                 epoch_len=2,
@@ -641,7 +642,7 @@ def test_resume_rejects_mismatched_declared_keys():
 
 
 def test_resume_accepts_matching_evaluator_version():
-    """復元 version と一致する評価器なら resume できる (継続する)。"""
+    """Resume can continue when the evaluator matches the restored version."""
     from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=2, epoch=1, evaluator_version=HONEST.version)
@@ -655,11 +656,11 @@ def test_resume_accepts_matching_evaluator_version():
             initial_state=seed,
         )
     )
-    assert result.state.episode == 4  # 復元 episode=2 から継続して 4 で停止
+    assert result.state.episode == 4  # Continues from restored episode=2 and stops at 4.
 
 
 def test_resume_does_not_mutate_seed_state():
-    """initial_state を破壊的に使わない (caller の snapshot は不変)。"""
+    """Do not use initial_state destructively (the caller's snapshot remains unchanged)."""
     from loop_agent.reflexion import ReflexionState
 
     seed = ReflexionState(episode=1, epoch=0, gt_aggregate_history=[0.2])
@@ -675,17 +676,17 @@ def test_resume_does_not_mutate_seed_state():
             initial_state=seed,
         )
     )
-    # 走行後も seed は最初のまま (進んだのは内部コピー)。
+    # seed remains as it was initially after the run (only the internal copy advanced).
     assert seed.episode == 1
     assert seed.gt_aggregate_history == [0.2]
     assert len(seed.memory) == seed_mem_len
-    # コピーは前進している。
+    # The copy has advanced.
     assert result.state.episode == 3
     assert result.state is not seed
 
 
 def test_production_path_never_runs_held_out_probes():
-    """dual-component: episode() は production task のみ受け取り probe を実行しない。"""
+    """dual-component: episode() receives only production tasks and never executes probes."""
     seen_tasks = []
 
     def spy_episode(ctx):

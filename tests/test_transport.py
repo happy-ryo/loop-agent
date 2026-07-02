@@ -1,7 +1,8 @@
-"""wake 配送 transport の検証 (Issue #23, report.md S5 Phase3)。
+"""Validation for wake delivery transport (Issue #23, report.md S5 Phase3).
 
-中核の成功条件は **「backend 不通でも pull fallback で配送継続」** (report.md S5 Phase3 (b))。
-push 一次 / pull fallback / at-most-once / role 別 cadence をそれぞれ実証する。
+The core success condition is **"delivery continues through pull fallback even when
+the backend is unreachable"** (report.md S5 Phase3 (b)).
+This verifies push primary, pull fallback, at-most-once, and per-role cadence.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from loop_agent.transport import (
 
 
 class ManualClock:
-    """明示的に進めたときだけ時間が動く決定的クロック (lease 失効の検証用)。"""
+    """Deterministic clock that only moves when advanced explicitly (for lease expiry tests)."""
 
     def __init__(self, start: float = 0.0) -> None:
         self.now = start
@@ -49,11 +50,11 @@ def _wake(i: int, recipient: str = "coordinator") -> Wake:
     )
 
 
-# -- push 一次 ---------------------------------------------------------------
+# -- push primary -----------------------------------------------------------
 
 
 def test_push_primary_delivers_and_marks_delivered():
-    """backend が健全なら push 一次で即配送し、queue 上は DELIVERED になる。"""
+    """When the backend is healthy, push primary delivers immediately and marks the queue DELIVERED."""
     pushed: list[Wake] = []
     backend = CallablePushBackend(lambda w: (pushed.append(w), True)[1])
     queue = InMemoryWakeQueue()
@@ -64,45 +65,45 @@ def test_push_primary_delivers_and_marks_delivered():
     assert route == "push"
     assert [w.id for w in pushed] == ["r1:loop_done:0"]
     assert queue.state_of("r1:loop_done:0") == DELIVERED
-    # push で配送済みなので pull は何も拾わない。
+    # Already delivered by push, so pull finds nothing.
     assert t.poll("coordinator") == []
 
 
-# -- pull fallback (中核の成功条件) ------------------------------------------
+# -- pull fallback (core success condition) ---------------------------------
 
 
 def test_pull_fallback_when_backend_down():
-    """backend 不通 (NullPushBackend) でも、pull poll で配送が継続する (中核の成功条件)。"""
+    """Even with an unreachable backend (NullPushBackend), pull polling keeps delivery moving."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
 
     routes = [t.deliver(_wake(i)) for i in range(3)]
-    # push は全部失敗 -> 全件 queue 滞留。
+    # All push attempts fail -> every wake remains queued.
     assert routes == ["queued", "queued", "queued"]
 
-    # 受信側は poll_and_handle で claim -> handle -> confirm。push が落ちていても届く。
+    # The receiver uses poll_and_handle to claim -> handle -> confirm. Delivery works even when push is down.
     seen: list[str] = []
     handled = t.poll_and_handle("coordinator", lambda w: seen.append(w.id))
     assert seen == ["r1:loop_done:0", "r1:loop_done:1", "r1:loop_done:2"]
     assert [w.id for w in handled] == seen
     assert all(queue.state_of(i) == DELIVERED for i in seen)
 
-    # 確定済みは lease を過ぎても再配達されない (at-most-once)。
+    # Confirmed wakes are not redelivered after the lease expires (at-most-once).
     clock.advance(100.0)
     assert t.poll_and_handle("coordinator", lambda w: seen.append("DUP")) == []
     assert "DUP" not in seen
 
 
 def test_pull_fallback_when_no_backend_configured():
-    """backend 未設定 (push 一次そのものが無い) でも pull で配送できる。"""
+    """Even with no backend configured (no push primary at all), pull can deliver."""
     t = Transport(InMemoryWakeQueue(), backend=None, time_fn=ManualClock())
     assert t.deliver(_wake(0)) == "queued"
     assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
 
 
 def test_backend_recovers_midstream():
-    """backend が途中で復旧: 復旧前は queue 滞留、復旧後は push 一次に切り替わる。"""
+    """Backend recovers midstream: before recovery wakes queue, after recovery delivery switches to push primary."""
     up = {"ok": False}
     backend = CallablePushBackend(lambda w: up["ok"])
     t = Transport(InMemoryWakeQueue(), backend, time_fn=ManualClock())
@@ -111,12 +112,12 @@ def test_backend_recovers_midstream():
     up["ok"] = True
     assert t.deliver(_wake(1)) == "push"  # backend up
 
-    # down 中に積んだぶんは pull で回収できる (配送は途切れない)。
+    # Wakes queued while down can be recovered by pull (delivery is uninterrupted).
     assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
 
 
 def test_push_raising_is_treated_as_failure_not_crash():
-    """push backend が例外を投げても Transport は落ちず、pull fallback に委ねる。"""
+    """If the push backend raises, Transport does not crash and delegates to pull fallback."""
     def boom(_w: Wake) -> bool:
         raise RuntimeError("backend exploded")
 
@@ -125,37 +126,37 @@ def test_push_raising_is_treated_as_failure_not_crash():
     assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
 
 
-# -- at-most-once / 三状態 claim-then-confirm ---------------------------------
+# -- at-most-once / three-state claim-then-confirm ---------------------------
 
 
 def test_duplicate_enqueue_is_idempotent():
-    """同一 id の二重 deliver は de-dup され、受信側に二重に届かない。"""
+    """Duplicate deliver calls with the same id are deduped and do not reach the receiver twice."""
     t = Transport(InMemoryWakeQueue(), NullPushBackend(), time_fn=ManualClock())
     t.deliver(_wake(0))
-    t.deliver(_wake(0))  # 同一 id 再 deliver
+    t.deliver(_wake(0))  # Redeliver the same id.
 
     delivered = t.poll("coordinator")
     assert len(delivered) == 1
 
 
 def test_poll_default_claims_without_confirming():
-    """poll の既定 (confirm=False) は claim のみ。確定しないので lease 失効で再配送される。"""
+    """The poll default (confirm=False) only claims. Without confirmation, lease expiry redelivers."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
     t.deliver(_wake(0))
 
-    claimed = t.poll("coordinator")  # 既定 = confirm しない
+    claimed = t.poll("coordinator")  # Default = do not confirm.
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
-    assert queue.state_of("r1:loop_done:0") == CLAIMED  # DELIVERED ではない
+    assert queue.state_of("r1:loop_done:0") == CLAIMED  # Not DELIVERED.
 
-    # confirm しないまま lease 失効 -> 再配送される (crash recovery)。
+    # Lease expires without confirmation -> redelivered (crash recovery).
     clock.advance(31.0)
     assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
 
 
 def test_poll_confirm_true_marks_delivered():
-    """confirm=True を明示した poll は返す前に即確定する (単純ケース)。"""
+    """A poll with explicit confirm=True confirms immediately before returning (simple case)."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
@@ -165,11 +166,11 @@ def test_poll_confirm_true_marks_delivered():
     assert [w.id for w in got] == ["r1:loop_done:0"]
     assert queue.state_of("r1:loop_done:0") == DELIVERED
     clock.advance(100.0)
-    assert t.poll("coordinator", confirm=True) == []  # 再配達されない
+    assert t.poll("coordinator", confirm=True) == []  # Not redelivered.
 
 
 def test_poll_and_handle_confirms_only_on_success():
-    """poll_and_handle は handler が成功した wake だけ confirm する。"""
+    """poll_and_handle confirms only the wakes whose handler succeeds."""
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=ManualClock())
     t.deliver(_wake(0))
@@ -180,7 +181,7 @@ def test_poll_and_handle_confirms_only_on_success():
 
 
 def test_poll_and_handle_redelivers_when_handler_crashes():
-    """handler が raise した wake は confirm されず、lease 失効後に再配送される (crash-safe)。"""
+    """Wakes whose handler raises are not confirmed and are redelivered after lease expiry (crash-safe)."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
@@ -189,13 +190,13 @@ def test_poll_and_handle_redelivers_when_handler_crashes():
     def boom(_w: Wake) -> None:
         raise RuntimeError("handler failed mid-processing")
 
-    # handler の例外は握り潰さず伝播する。
+    # Handler exceptions propagate instead of being swallowed.
     with pytest.raises(RuntimeError):
         t.poll_and_handle("coordinator", boom)
-    # 処理前に死んだ wake は未確定のまま (喪失していない)。
+    # The wake that died before processing remains unconfirmed (not lost).
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
-    # lease 失効後に再配送され、今度は成功 handler で確定できる。
+    # After lease expiry it is redelivered and can be confirmed by a successful handler.
     clock.advance(31.0)
     ok: list[str] = []
     handled = t.poll_and_handle("coordinator", lambda w: ok.append(w.id))
@@ -205,7 +206,7 @@ def test_poll_and_handle_redelivers_when_handler_crashes():
 
 
 def test_claim_then_confirm_requires_explicit_confirm():
-    """confirm=False の poll は claim だけ。confirm 前は再 poll で同じ wake を返さない。"""
+    """A poll with confirm=False only claims. Before confirmation, polling again does not return the same wake."""
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=ManualClock())
     t.deliver(_wake(0))
@@ -213,7 +214,7 @@ def test_claim_then_confirm_requires_explicit_confirm():
     claimed = t.poll("coordinator", confirm=False)
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
     assert queue.state_of("r1:loop_done:0") == CLAIMED
-    # lease 保持中は他の poll が同じ wake を奪わない。
+    # While the lease is held, another poll cannot take the same wake.
     assert t.poll("coordinator", confirm=False) == []
 
     n = t.confirm_wakes(claimed, owner="coordinator")
@@ -222,25 +223,25 @@ def test_claim_then_confirm_requires_explicit_confirm():
 
 
 def test_unconfirmed_claim_is_redelivered_after_lease_expiry():
-    """claim 後 confirm せず lease 失効すると、wake は再 eligible になり再配送される。"""
+    """If a claimed wake is not confirmed before lease expiry, it becomes eligible again and is redelivered."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
     t.deliver(_wake(0))
 
-    claimed = t.poll("coordinator", confirm=False)  # claim, then "crash" (confirm せず)
+    claimed = t.poll("coordinator", confirm=False)  # Claim, then "crash" (without confirmation).
     assert len(claimed) == 1
 
-    clock.advance(31.0)  # lease 失効
-    # 失効後の遅延 confirm は fencing で弾かれる (届いていないので DELIVERED 化しない)。
+    clock.advance(31.0)  # Lease expiry.
+    # A delayed confirm after expiry is rejected by fencing (it was not delivered, so it is not marked DELIVERED).
     assert t.confirm_wakes(claimed, owner="coordinator") == 0
-    # 再 poll で回収できる (at-least-once: idle-wake では喪失 > 重複)。
+    # It can be recovered by polling again (at-least-once: for idle wakes, loss is worse than duplication).
     redelivered = t.poll("coordinator")
     assert [w.id for w in redelivered] == ["r1:loop_done:0"]
 
 
 def test_owner_fencing_blocks_stale_confirm():
-    """lease 失効後に別 owner が再 claim したら、元 owner の confirm は弾かれる。"""
+    """If another owner reclaims after lease expiry, the original owner's confirm is rejected."""
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     t = Transport(queue, NullPushBackend(), lease=30.0, time_fn=clock)
@@ -249,23 +250,23 @@ def test_owner_fencing_blocks_stale_confirm():
     first = t.poll("coordinator", owner="worker-A", confirm=False)
     assert len(first) == 1
 
-    clock.advance(31.0)  # A の lease 失効
-    second = t.poll("coordinator", owner="worker-B", confirm=False)  # B が再 claim
+    clock.advance(31.0)  # A's lease expires.
+    second = t.poll("coordinator", owner="worker-B", confirm=False)  # B reclaims.
     assert len(second) == 1
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
-    # 遅れて来た A の confirm は弾かれ、B の confirm だけが通る (二重確定を防ぐ)。
+    # A's late confirm is rejected, and only B's confirm succeeds (prevents double confirmation).
     assert t.confirm_wakes(first, owner="worker-A") == 0
     assert t.confirm_wakes(second, owner="worker-B") == 1
     assert queue.state_of("r1:loop_done:0") == DELIVERED
 
 
 def test_redeliver_respects_inflight_claim():
-    """CLAIMED 中の wake を再 deliver しても、active claim を push で横取り確定しない。
+    """Redelivering a CLAIMED wake does not let push steal and confirm the active claim.
 
-    backend 復旧後の retry/resume が deliver を再呼びしても、受信側が confirm=False で
-    claim 中の wake は CLAIMED のまま残し、owner の lease 失効再配送保護を壊さない
-    (codex P2 回帰防止)。
+    Even if retry/resume after backend recovery calls deliver again, a wake that the receiver
+    has claimed with confirm=False remains CLAIMED and preserves the owner's lease-expiry
+    redelivery protection (codex P2 regression guard).
     """
     up = {"ok": False}
     backend = CallablePushBackend(lambda w: up["ok"])
@@ -274,53 +275,54 @@ def test_redeliver_respects_inflight_claim():
     t = Transport(queue, backend, lease=30.0, time_fn=clock)
 
     assert t.deliver(_wake(0)) == "queued"  # backend down -> queued
-    claimed = t.poll("coordinator", confirm=False)  # 受信側が claim (処理中)
+    claimed = t.poll("coordinator", confirm=False)  # Receiver claims it (processing).
     assert [w.id for w in claimed] == ["r1:loop_done:0"]
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
-    # backend 復旧後の再 deliver: active claim を尊重して横取りしない。
+    # Redeliver after backend recovery: respect the active claim and do not steal it.
     up["ok"] = True
     assert t.deliver(_wake(0)) == "queued"
-    assert queue.state_of("r1:loop_done:0") == CLAIMED  # まだ CLAIMED のまま
+    assert queue.state_of("r1:loop_done:0") == CLAIMED  # Still CLAIMED.
 
-    # owner が confirm 前にクラッシュ -> lease 失効で再配送される (保護が生きている)。
+    # Owner crashes before confirmation -> lease expiry redelivers it (protection still works).
     clock.advance(31.0)
     redelivered = t.poll("coordinator")
     assert [w.id for w in redelivered] == ["r1:loop_done:0"]
 
 
 def test_inflight_push_does_not_steal_active_claim():
-    """push の I/O 中に別 poller が claim したら、push は claim を奪わず wake を喪失させない。
+    """If another poller claims during push I/O, push does not steal the claim or lose the wake.
 
-    push が確定配送を返す直前に受信側が同じ wake を claim した状況を再現し、deliver の
-    mark_delivered が active CLAIMED を DELIVERED で横取りしないこと (= owner クラッシュ時も
-    lease 失効で再配送される) を実証する (codex P2 回帰防止)。
+    This recreates a receiver claiming the same wake just before push returns a confirmed
+    delivery, and verifies that deliver's mark_delivered does not steal an active CLAIMED
+    wake by marking it DELIVERED (= lease expiry still redelivers if the owner crashes)
+    (codex P2 regression guard).
     """
     clock = ManualClock()
     queue = InMemoryWakeQueue()
     box: dict = {}
 
     def racing_push(w: Wake) -> bool:
-        # push が "in flight" の間に受信側が同じ wake を claim する状況を再現。
+        # Recreate the receiver claiming the same wake while push is "in flight".
         box["claimed"] = box["transport"].poll("coordinator", owner="recv", confirm=False)
-        return True  # push 自体は成功を返す。
+        return True  # Push itself returns success.
 
     t = Transport(queue, CallablePushBackend(racing_push), lease=30.0, time_fn=clock)
     box["transport"] = t
 
     route = t.deliver(_wake(0))
-    assert route == "push"  # push は成功した。
-    # だが active claim は奪われていない (CLAIMED のまま = pull 側が配送の主体)。
+    assert route == "push"  # Push succeeded.
+    # But the active claim was not stolen (still CLAIMED = pull owns delivery).
     assert [w.id for w in box["claimed"]] == ["r1:loop_done:0"]
     assert queue.state_of("r1:loop_done:0") == CLAIMED
 
-    # poller が confirm 前にクラッシュしても、lease 失効で再配送される (喪失しない)。
+    # Even if the poller crashes before confirmation, lease expiry redelivers it (not lost).
     clock.advance(31.0)
     assert [w.id for w in t.poll("coordinator")] == ["r1:loop_done:0"]
 
 
 def test_delivered_wake_never_redelivered_even_on_redeliver_attempt():
-    """DELIVERED 済み wake を再 deliver しても push を重ねず、pull でも返らない。"""
+    """Redelivering an already DELIVERED wake does not push again and is not returned by pull."""
     pushes: list[str] = []
 
     def push_ok(w: Wake) -> bool:
@@ -329,16 +331,16 @@ def test_delivered_wake_never_redelivered_even_on_redeliver_attempt():
 
     t = Transport(InMemoryWakeQueue(), CallablePushBackend(push_ok), time_fn=ManualClock())
     assert t.deliver(_wake(0)) == "push"
-    assert t.deliver(_wake(0)) == "push"  # 再 deliver
-    assert pushes == ["r1:loop_done:0"]  # push は 1 回だけ
+    assert t.deliver(_wake(0)) == "push"  # Redeliver.
+    assert pushes == ["r1:loop_done:0"]  # Pushed exactly once.
     assert t.poll("coordinator") == []
 
 
-# -- 宛先振り分け ------------------------------------------------------------
+# -- recipient routing ------------------------------------------------------
 
 
 def test_poll_only_returns_own_recipient():
-    """poll は宛先一致の wake だけ claim する (他者宛は残す)。"""
+    """poll claims only wakes whose recipient matches (leaves wakes for others)."""
     t = Transport(InMemoryWakeQueue(), NullPushBackend(), time_fn=ManualClock())
     t.deliver(_wake(0, recipient="alice"))
     t.deliver(_wake(1, recipient="bob"))
@@ -348,7 +350,7 @@ def test_poll_only_returns_own_recipient():
 
 
 def test_poll_limit_bounds_batch():
-    """limit は 1 回の poll で引き取る件数を制限する (残りは次回 poll)。"""
+    """limit bounds how many wakes one poll takes (the rest are left for the next poll)."""
     t = Transport(InMemoryWakeQueue(), NullPushBackend(), time_fn=ManualClock())
     for i in range(5):
         t.deliver(_wake(i))
@@ -358,40 +360,41 @@ def test_poll_limit_bounds_batch():
     assert len(rest) == 3
 
 
-# -- role 別 cadence ---------------------------------------------------------
+# -- per-role cadence -------------------------------------------------------
 
 
 def test_cadence_values_are_asymmetric_by_role():
-    """dispatcher 3m / worker 短間隔 / secretary 0 (毎ターン) の非対称設計。"""
+    """Asymmetric design: dispatcher 3m / worker short interval / secretary 0 (every turn)."""
     assert cadence_for("dispatcher") == 180.0
     assert cadence_for("worker") == 60.0
     assert cadence_for("secretary") == 0.0
-    # 未知 role は保守的に既定へ落ちる。
+    # Unknown roles conservatively fall back to the default.
     assert cadence_for("unknown-role") == 60.0
 
 
 def test_due_to_poll_respects_cadence():
-    """due_to_poll は cadence 経過後に due。未 poll は常に due。"""
-    # 一度も poll していなければ常に due。
+    """due_to_poll is due after cadence elapses. Never-polled roles are always due."""
+    # If it has never polled, it is always due.
     assert due_to_poll("dispatcher", last_poll=None, now=0.0) is True
-    # cadence 未経過は due でない。
+    # Not due before cadence elapses.
     assert due_to_poll("dispatcher", last_poll=0.0, now=100.0) is False
-    # cadence 経過で due。
+    # Due once cadence elapses.
     assert due_to_poll("dispatcher", last_poll=0.0, now=180.0) is True
-    # secretary は cadence 0 -> 常に due (ターン冒頭で毎回 poll)。
+    # Secretary has cadence 0 -> always due (poll every turn start).
     assert due_to_poll("secretary", last_poll=0.0, now=0.0) is True
 
 
-# -- 並行 poll のスレッド安全 (二重 claim させない) -------------------------
+# -- concurrent poll thread safety (no double claim) ------------------------
 
 
 def test_concurrent_pollers_never_double_claim():
-    """同一 recipient を複数スレッドで並行 poll しても、各 wake は高々 1 スレッドが claim する。
+    """Even if multiple threads poll the same recipient concurrently, each wake is claimed by at most one thread.
 
-    InMemoryWakeQueue の check-and-set がロックで直列化され、並行 poller の
-    owner fencing / at-most-once claim が実際に成立することを実時計 + barrier で実証する。
+    This uses real time + a barrier to verify that InMemoryWakeQueue serializes
+    check-and-set with a lock and that owner fencing / at-most-once claims actually
+    hold for concurrent pollers.
     """
-    # 実時計を使い、lease を十分長くして claim が失効しないようにする (確定のみ検証)。
+    # Use real time and a long enough lease that claims do not expire (verify confirmation only).
     t = Transport(InMemoryWakeQueue(), NullPushBackend(), lease=3600.0, time_fn=time.monotonic)
     n_wakes = 200
     for i in range(n_wakes):
@@ -403,11 +406,11 @@ def test_concurrent_pollers_never_double_claim():
 
     def worker(idx: int) -> None:
         own = f"worker-{idx}"
-        barrier.wait()  # 全スレッドを同時にスタートさせ contention を最大化。
+        barrier.wait()  # Start all threads at once to maximize contention.
         while True:
             got = t.poll("coordinator", owner=own, limit=1)
             if not got:
-                # 他スレッドがまだ処理中で一時的に空でも、未確定が残るうちは再試行。
+                # Even if temporarily empty while other threads process, retry while unconfirmed wakes remain.
                 if not t.pending("coordinator"):
                     return
                 continue
@@ -422,22 +425,22 @@ def test_concurrent_pollers_never_double_claim():
         th.join(timeout=30)
 
     all_claimed = [wid for lst in claimed_by for wid in lst]
-    # 各 wake は厳密に 1 回だけ claim+confirm された (二重 claim 無し・取りこぼし無し)。
+    # Every wake was claimed+confirmed exactly once (no double claims, no misses).
     assert sorted(all_claimed) == sorted(f"r1:loop_done:{i}" for i in range(n_wakes))
     assert len(all_claimed) == len(set(all_claimed)) == n_wakes
 
 
-# -- 不正入力 ----------------------------------------------------------------
+# -- invalid input -----------------------------------------------------------
 
 
 def test_to_dict_canonical_fields_win_over_payload_collisions():
-    """payload に予約名 (id/kind/recipient/run_id) が紛れても正準フィールドが勝つ。"""
+    """Canonical fields win even if payload contains reserved names (id/kind/recipient/run_id)."""
     w = Wake(
         id="r1:loop_done:0",
         kind=WAKE_LOOP_DONE,
         recipient="coordinator",
         run_id="r1",
-        # 悪意/事故で de-dup/routing 鍵に衝突するキーを載せる。
+        # Maliciously or accidentally include keys that collide with de-dup/routing keys.
         payload={"id": "EVIL", "recipient": "attacker", "extra": "ok"},
     )
     d = w.to_dict()
@@ -445,7 +448,7 @@ def test_to_dict_canonical_fields_win_over_payload_collisions():
     assert d["recipient"] == "coordinator"
     assert d["kind"] == WAKE_LOOP_DONE
     assert d["run_id"] == "r1"
-    assert d["extra"] == "ok"  # 衝突しない payload キーは残る。
+    assert d["extra"] == "ok"  # Non-colliding payload keys remain.
 
 
 def test_enqueue_rejects_empty_id():

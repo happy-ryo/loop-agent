@@ -1,20 +1,24 @@
-"""work-discovery 入力選定 + multi-item scheduling (Issue #24 / #56).
+"""work-discovery input selection + multi-item scheduling (Issue #24 / #56).
 
-このパッケージは「次に何を反復するか」を決める二つの層を束ねる:
+This package brings together the two layers that decide "what to iterate next":
 
-- **入力選定** (内部実装 ``_triage``) -- 依存解決・優先度ランキング・人間ゲート
-  (propose-only) (report.md S3.5 / Issue #24)。候補 (:class:`Candidate`) 群から
-  「N 件 + 推奨 1 件」を計算し、採否を人間ゲートに載せる。
-- :mod:`~loop_agent.discovery.work_list` -- 採択済みの **複数 item を 1 本のループで
-  公平に回す** scheduling gather (:class:`WorkListGather`, Issue #56)。1 item が
-  ``MaxIterations`` を独占して他を starve させないための round-robin / per-item 上限を
-  正規化する。
+- **Input selection** (implemented internally by ``_triage``) -- dependency
+  resolution, priority ranking, and the human gate (propose-only) (report.md S3.5
+  / Issue #24). Computes "N items + 1 recommendation" from candidates
+  (:class:`Candidate`) and sends adoption decisions through the human gate.
+- :mod:`~loop_agent.discovery.work_list` -- a scheduling gather
+  (:class:`WorkListGather`, Issue #56) that **rotates multiple adopted items
+  fairly through a single loop**. It normalizes round-robin / per-item limits so
+  one item cannot monopolize ``MaxIterations`` and starve the others.
 
-旧 ``loop_agent.discovery`` 単一モジュールの公開名はすべてここから再エクスポートするので、
-``from loop_agent.discovery import triage`` / ``from loop_agent import triage`` 等の既存
-import は不変 (互換維持)。入力選定の実装は ``_triage`` (private) に置く -- 公開名 ``triage``
-(関数) が同名の submodule を shadow して ``import loop_agent.discovery.triage`` が関数に
-bind されてしまう事故 (#56 review) を避けるため。利用側は本 facade を使うこと。
+All public names from the former single ``loop_agent.discovery`` module are
+re-exported here, so existing imports such as ``from loop_agent.discovery import
+triage`` / ``from loop_agent import triage`` remain unchanged for compatibility.
+The input-selection implementation lives in the private ``_triage`` module to
+avoid an accident from the #56 review: the public ``triage`` name (a function)
+shadowing the submodule of the same name and causing ``import
+loop_agent.discovery.triage`` to bind to the function. Callers should use this
+facade.
 """
 
 from __future__ import annotations
@@ -42,7 +46,7 @@ from .work_list import (
 )
 
 __all__ = [
-    # 入力選定 (triage / 人間ゲート, Issue #24)
+    # Input selection (triage / human gate, Issue #24)
     "Candidate",
     "BlockedCandidate",
     "Triage",
@@ -52,7 +56,7 @@ __all__ = [
     "WorkDiscovery",
     "discover_next",
     "GATE_KEY_PREFIX",
-    # multi-item 公平 scheduling (Issue #56)
+    # Multi-item fair scheduling (Issue #56)
     "WorkItem",
     "WorkListGather",
     "WorkListProgress",

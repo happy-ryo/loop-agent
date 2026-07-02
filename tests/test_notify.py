@@ -1,14 +1,14 @@
-"""HumanGate 通知ハンドラ (Issue #39) の検証: webhook/Slack/email backend + redaction + 統合.
+"""Validate HumanGate notification handlers (Issue #39): webhook/Slack/email backends + redaction + integration.
 
-(a) redaction が payload (ネスト含む) の機密値をマスクし元を壊さない、
-(b) WebhookNotifier が monkeypatch urlopen へ正しい URL/headers/JSON body を POST する、
-(c) SlackNotifier が Slack incoming webhook 形 ({"text": ...}) を送る、
-(d) EmailNotifier が注入 smtp_factory で starttls/login/送信を行う、
-(e) ConsoleNotifier / MultiNotifier の出力・fan-out best-effort、
-(f) retry が opt-in で動き、失敗は例外送出 (呼び出し元が捕捉する契約) になる、
-(g) HumanGate 統合: 承認要求発火時に notifier.notify が呼ばれ、best-effort で loop を止めない、
-    resume 再訪では再通知しない、describe で payload メタを上書きできる、
-ことを実証する。
+(a) redaction masks sensitive values in payloads (including nested values) without mutating the original,
+(b) WebhookNotifier POSTs the correct URL/headers/JSON body to monkeypatched urlopen,
+(c) SlackNotifier sends the Slack incoming webhook shape ({"text": ...}),
+(d) EmailNotifier uses the injected smtp_factory to starttls/login/send,
+(e) ConsoleNotifier / MultiNotifier output and fan out on a best-effort basis,
+(f) retry works when opted in, and failures raise exceptions (the caller is expected to catch them),
+(g) HumanGate integration: notifier.notify is called when an approval request is triggered,
+    does not stop the loop because it is best-effort, does not notify again on resume,
+    and describe can override payload metadata.
 """
 
 from __future__ import annotations
@@ -38,11 +38,11 @@ from loop_agent.notify import _summarize_action
 from conftest import never_done
 
 
-# -- summary フォールバックは生の値を漏らさない (P1 回帰) ----------------------
+# -- summary fallback does not leak raw values (P1 regression) ----------------
 
 
 def test_summary_fallback_does_not_leak_mapping_values():
-    # 既知ラベルキーが無い mapping → キー名だけの構造要約。値 (secret) は出さない。
+    # A mapping without known label keys gets a structural summary of keys only; values (secrets) are not emitted.
     summary = _summarize_action({"token": "s3cr3t", "op": "delete"})
     assert "s3cr3t" not in summary
     assert "op" in summary and "token" in summary
@@ -53,7 +53,7 @@ def test_summary_uses_label_keys_and_type_fallback():
     assert _summarize_action("deploy") == "deploy"
 
     class Weird:
-        def __repr__(self):  # 機密を含みうる repr は使わない。
+        def __repr__(self):  # Do not use repr because it may contain secrets.
             return "Weird(secret=hunter2)"
 
     summary = _summarize_action(Weird())
@@ -61,7 +61,7 @@ def test_summary_uses_label_keys_and_type_fallback():
     assert "Weird" in summary
 
 
-# -- テスト用ヘルパ -----------------------------------------------------------
+# -- Test helpers ------------------------------------------------------------
 
 
 def make_request(**overrides):
@@ -79,7 +79,7 @@ def make_request(**overrides):
 
 
 class RecordingNotifier:
-    """notify された ApprovalRequest を記録するだけの test double。"""
+    """Test double that only records ApprovalRequests passed to notify."""
 
     def __init__(self):
         self.requests = []
@@ -89,7 +89,7 @@ class RecordingNotifier:
 
 
 class BoomNotifier:
-    """常に例外を投げる notifier (best-effort 経路の検証用)。"""
+    """Notifier that always raises an exception (for best-effort path checks)."""
 
     def __init__(self):
         self.calls = 0
@@ -128,7 +128,7 @@ def test_redact_does_not_mutate_input():
 def test_redact_custom_sensitive_parts():
     payload = {"token": "t", "ssn": "123"}
     out = redact_payload(payload, sensitive_parts=("ssn",))
-    # 既定 token は今回 sensitive 指定に無いので残り、ssn だけマスク。
+    # The default token remains because it is not in this sensitive override; only ssn is masked.
     assert out["token"] == "t"
     assert out["ssn"] == notify_mod.REDACTED
 
@@ -162,12 +162,12 @@ def test_webhook_posts_json_with_redaction(monkeypatch):
     assert captured["url"] == "https://example.com/hook"
     assert captured["method"] == "POST"
     assert captured["timeout"] == 3.0
-    # Content-Type は自動付与 (header キーは capitalize される)。
+    # Content-Type is added automatically (the header key is capitalized).
     assert captured["headers"].get("Content-type") == "application/json"
     body = json.loads(captured["body"].decode("utf-8"))
     assert body["summary"] == "deploy to prod"
     assert body["gate_key"] == "gate-1"
-    # redaction: action.token がマスクされている。
+    # redaction: action.token is masked.
     assert body["action"]["token"] == notify_mod.REDACTED
     assert body["action"]["kind"] == "deploy"
 
@@ -245,11 +245,11 @@ def test_slack_posts_text_payload(monkeypatch):
 
     assert captured["url"] == "https://hooks.slack.com/services/XXX"
     body = json.loads(captured["body"].decode("utf-8"))
-    # Slack incoming webhook 形: {"text": ...}。
+    # Slack incoming webhook shape: {"text": ...}.
     assert set(body.keys()) == {"text"}
     assert "deploy to prod" in body["text"]
     assert "gate-1" in body["text"]
-    # action JSON は redaction 後 (token マスク) で埋め込まれている。
+    # action JSON is embedded after redaction (token masked).
     assert notify_mod.REDACTED in body["text"]
     assert "s3cr3t" not in body["text"]
 
@@ -309,7 +309,7 @@ def test_email_builds_and_sends_message():
     assert msg["To"] == "a@example.com, b@example.com"
     assert "deploy to prod" in msg["Subject"]
     body = msg.get_content()
-    # redaction: token はマスクされ、生 secret は本文に出ない。
+    # redaction: token is masked, and the raw secret is not present in the body.
     assert notify_mod.REDACTED in body
     assert "s3cr3t" not in body
 
@@ -328,12 +328,12 @@ def test_email_quits_even_on_send_failure():
     )
     with pytest.raises(OSError):
         notifier.notify(make_request())
-    # finally で quit されている (接続リーク防止)。
+    # quit is called in finally (prevents connection leaks).
     assert _FakeSMTP.instances[0].quit_called is True
 
 
 def test_email_subject_uses_redacted_summary():
-    # custom redact が summary を scrub する設定では件名も redaction される (P2 回帰)。
+    # When a custom redact function scrubs summary, the subject is redacted too (P2 regression).
     _FakeSMTP.instances = []
 
     def scrub_summary(payload):
@@ -378,13 +378,13 @@ def test_multi_fans_out_and_survives_one_failure(recwarn):
     multi = MultiNotifier(notifiers=[good1, BoomNotifier(), good2])
     req = make_request()
     multi.notify(req)
-    # 中央が失敗しても両端へ届く。失敗は warning 化。
+    # Both surrounding notifiers receive the request even when the middle one fails; the failure becomes a warning.
     assert good1.requests == [req]
     assert good2.requests == [req]
     assert any(issubclass(w.category, RuntimeWarning) for w in recwarn.list)
 
 
-# -- (g) HumanGate 統合 ------------------------------------------------------
+# -- (g) HumanGate integration ----------------------------------------------
 
 
 def make_world(actions):
@@ -419,7 +419,7 @@ def test_gate_notifies_on_approval_request(tmp_path):
         gather=gather, gate=gate,
     )
     assert res.paused is True
-    # "deploy" の承認要求発火時に 1 度だけ通知される。
+    # Notifies exactly once when the "deploy" approval request is triggered.
     assert len(notifier.requests) == 1
     req = notifier.requests[0]
     assert req.run_id == RUN_ID
@@ -451,7 +451,7 @@ def test_gate_notify_failure_does_not_stop_loop(tmp_path, recwarn):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    # 通知が失敗しても承認要求は登録され、loop は通常通り pause する。
+    # Even if notification fails, the approval request is registered and the loop pauses normally.
     assert notifier.calls == 1
     assert res.paused is True
     assert res.pending["gate_key"] == "gate-1"
@@ -461,7 +461,7 @@ def test_gate_notify_failure_does_not_stop_loop(tmp_path, recwarn):
 
 def test_gate_does_not_renotify_on_resume(tmp_path):
     db_path = tmp_path / "s.db"
-    # run1: pause + 1 度通知。
+    # run1: pause + one notification.
     conn1 = connect(db_path)
     store1 = LoopStore(conn1)
     gather1, act1, _ = make_world(ACTIONS)
@@ -472,24 +472,24 @@ def test_gate_does_not_renotify_on_resume(tmp_path):
     assert len(n1.requests) == 1
     conn1.close()
 
-    # 人間が別接続で resolve。
+    # A human resolves it through a separate connection.
     conn2 = connect(db_path)
     store2 = LoopStore(conn2)
     store2.resolve_decision(RUN_ID, "gate-1", "approve")
 
-    # run2: resume。既存 decision を読むので再通知しない。
+    # run2: resume. It reads the existing decision, so it does not notify again.
     gather2, act2, executed2 = make_world(ACTIONS)
     n2 = RecordingNotifier()
     gate2 = HumanGate(on=is_deploy, store=store2, run_id=RUN_ID, notifier=n2)
     run_loop(act=act2, verify=never_done, conditions=[MaxIterations(3)],
              gather=gather2, gate=gate2)
     conn2.close()
-    assert n2.requests == []  # resume では再通知なし
+    assert n2.requests == []  # No repeated notification on resume.
     assert executed2 == ["work", "deploy", "work2"]
 
 
 def test_gate_does_not_notify_when_resolver_present(tmp_path):
-    # resolver 併用は同期 inline 解決で人間待ちにならないので通知しない (P2 回帰)。
+    # With a resolver, synchronous inline resolution avoids human waiting, so no notification is sent (P2 regression).
     from loop_agent import Decision
 
     conn = connect(tmp_path / "s.db")
@@ -504,7 +504,7 @@ def test_gate_does_not_notify_when_resolver_present(tmp_path):
         act=act, verify=never_done, conditions=[MaxIterations(3)],
         gather=gather, gate=gate,
     )
-    # resolver が "deploy" を inline approve するので最後まで進む。通知は発火しない。
+    # The resolver approves "deploy" inline, so the loop finishes. Notification is not triggered.
     assert res.status == "stopped"
     assert executed == ["work", "deploy", "work2"]
     assert notifier.requests == []
@@ -521,8 +521,8 @@ def test_register_decision_reports_created_flag(tmp_path):
 
 
 def test_gate_does_not_notify_when_register_loses_race(tmp_path, monkeypatch):
-    # get_decision で None を見た後、register_decision が created=False (敗者) を返す
-    # TOCTOU レースを模す: このとき通知を発火しないこと (P2 回帰)。
+    # Simulates a TOCTOU race where get_decision sees None and register_decision returns
+    # created=False (loser): notification must not be triggered in this case (P2 regression).
     conn = connect(tmp_path / "s.db")
     store = LoopStore(conn)
     notifier = RecordingNotifier()
@@ -543,8 +543,8 @@ def test_gate_does_not_notify_when_register_loses_race(tmp_path, monkeypatch):
     from loop_agent.state import LoopState
 
     review = gate.review("deploy", LoopState(iteration=1))
-    assert notifier.requests == []  # 敗者は再通知しない
-    assert review.disposition  # pause で返る (登録済み pending を読む)
+    assert notifier.requests == []  # The loser does not notify again.
+    assert review.disposition  # Returns with pause (reads the registered pending decision).
 
 
 def test_gate_describe_overrides_request_metadata(tmp_path):
@@ -584,7 +584,7 @@ def test_gate_describe_failure_is_best_effort(tmp_path, recwarn):
     )
     res = run_loop(act=act, verify=never_done, conditions=[MaxIterations(3)],
                    gather=gather, gate=gate)
-    # describe が落ちても通知経路で握られ loop は pause する。notify には届かない。
+    # Even if describe fails, the notification path handles it and the loop pauses. notify is not reached.
     assert res.paused is True
     assert notifier.requests == []
     assert any(issubclass(w.category, RuntimeWarning) for w in recwarn.list)

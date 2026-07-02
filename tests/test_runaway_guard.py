@@ -1,11 +1,11 @@
 """Runaway-guard proof: a never-converging loop ALWAYS halts at a hard cap.
 
 These tests are the sandbox evidence for report.md S5 Phase 1 success criteria
-(b) "未達でも上限で必ず停止" and (c) "AutoGPT 的暴走（無限ループ・コスト爆発）
-を再現しない". Every scenario drives the loop with a goal that is never met and
-an ``act`` that makes *no forward progress* -- it returns the identical
-observation every iteration, the operational signature of a repeating action /
-stuck agent.
+(b) "always stop at the cap even when the goal is unmet" and (c) "do not
+reproduce AutoGPT-style runaway behavior (infinite loops or cost explosions)".
+Every scenario drives the loop with a goal that is never met and an ``act`` that
+makes *no forward progress* -- it returns the identical observation every
+iteration, the operational signature of a repeating action / stuck agent.
 
 The guarantee proven here is deliberately precise:
 

@@ -1,13 +1,13 @@
-"""観測オーケストレーションのテスト（report.md S5 Phase 2 成功条件 (b)）。
+"""Tests for observation orchestration (report.md S5 Phase 2 success condition (b)).
 
-中核要件を押さえる:
-- 全終了理由（goal_met / max_iterations / token_budget / timeout）が loop_end
-  event に残ること、
-- メトリクス（反復番号・累積トークン・elapsed）が begin→step→end で追えること、
-- begin/step/end の順序と件数、
-- ループ本体が例外で抜けても error の loop_end が残ること、
-- 利用者の on_step と観測フックが合成されること、
-- OTel 無効時（otel=False）でも sink 観測がそのまま機能すること（degrade）。
+Cover the core requirements:
+- all termination reasons (goal_met / max_iterations / token_budget / timeout) remain in
+  the loop_end event,
+- metrics (iteration number, cumulative tokens, elapsed) are traceable from begin to step to end,
+- begin/step/end order and counts,
+- an error loop_end remains even when the loop body exits with an exception,
+- the user's on_step and the observation hook are composed,
+- sink observation continues to work unchanged when OTel is disabled (otel=False) (degrade).
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _only(sink, kind):
     return evs[0]
 
 
-# -- begin / step / end の骨格 ----------------------------------------------
+# -- begin / step / end skeleton --------------------------------------------
 
 
 def test_emits_begin_steps_end_in_order(tmp_path):
@@ -73,7 +73,7 @@ def test_begin_carries_condition_names():
 
 
 def test_zero_iteration_run_still_emits_begin_and_end():
-    # MaxIterations(0) は即時停止: step は無いが begin/end は必ず残る。
+    # MaxIterations(0) stops immediately: there are no steps, but begin/end always remain.
     sink = ListSink()
     result = run_observed_loop(
         act=acting(tokens=0),
@@ -87,7 +87,7 @@ def test_zero_iteration_run_still_emits_begin_and_end():
     assert _only(sink, LOOP_END).payload["status"] == "stopped"
 
 
-# -- 全終了理由が loop_end に残る -------------------------------------------
+# -- All termination reasons remain in loop_end -----------------------------
 
 
 def test_goal_met_reason_in_end_event():
@@ -165,7 +165,7 @@ def test_timeout_reason_in_end_event():
 def test_all_non_timeout_terminations_recorded(
     conditions, act, verify, expected_stop
 ):
-    # 1 つのパラメタ表で「全終了理由が end に残る」を網羅的に確認する。
+    # Use one parameter table to comprehensively verify that all termination reasons remain in end.
     sink = ListSink()
     result = run_observed_loop(
         act=act, verify=verify, conditions=conditions, sinks=[sink], otel=False
@@ -176,7 +176,7 @@ def test_all_non_timeout_terminations_recorded(
     assert end.payload["status"] == result.status
 
 
-# -- メトリクスが begin→step→end で追える ----------------------------------
+# -- Metrics are traceable from begin to step to end ------------------------
 
 
 def test_metrics_are_traceable_across_events():
@@ -189,14 +189,14 @@ def test_metrics_are_traceable_across_events():
         otel=False,
     )
     steps = sink.of_kind(LOOP_STEP)
-    # 反復番号は 0..3、累積トークンは単調増加で 10,20,30,40。
+    # Iteration numbers are 0..3, and cumulative tokens increase monotonically as 10, 20, 30, 40.
     assert [s.iteration for s in steps] == [0, 1, 2, 3]
     assert [s.payload["tokens_used"] for s in steps] == [10, 20, 30, 40]
     assert all(s.payload["tokens"] == 10 for s in steps)
-    # elapsed は非減少。
+    # elapsed is non-decreasing.
     elapsed = [s.elapsed for s in steps]
     assert elapsed == sorted(elapsed)
-    # end の集計はループ結果と一致し、最後の step の累積と整合する。
+    # The end aggregate matches the loop result and is consistent with the final step's cumulative value.
     end = _only(sink, LOOP_END)
     assert end.payload["iterations"] == result.iterations == 4
     assert end.payload["tokens_used"] == steps[-1].payload["tokens_used"] == 40
@@ -237,7 +237,7 @@ def test_non_serializable_observation_stored_as_repr():
     assert sink.of_kind(LOOP_STEP)[0].payload["observation"] == "Widget(z)"
 
 
-# -- 複数 sink / JSONL からの事後解析 --------------------------------------
+# -- Multiple sinks / post-hoc analysis from JSONL -------------------------
 
 
 def test_events_persist_to_jsonl_for_post_hoc_analysis(tmp_path):
@@ -250,7 +250,7 @@ def test_events_persist_to_jsonl_for_post_hoc_analysis(tmp_path):
         sinks=[JsonlEventSink(path), mem],
         otel=False,
     )
-    # 両 sink に同じイベント列が届く。
+    # Both sinks receive the same event sequence.
     on_disk = read_events(path)
     assert [r["kind"] for r in on_disk] == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
     assert [e.kind for e in mem.events] == [r["kind"] for r in on_disk]
@@ -258,7 +258,7 @@ def test_events_persist_to_jsonl_for_post_hoc_analysis(tmp_path):
     assert on_disk[-1]["tokens_used"] == 14
 
 
-# -- 利用者 on_step との合成 ------------------------------------------------
+# -- Composition with the user's on_step ------------------------------------
 
 
 def test_user_on_step_is_composed_with_observer():
@@ -273,8 +273,8 @@ def test_user_on_step_is_composed_with_observer():
         on_step=lambda record, state: seen.append(record.iteration),
         otel=False,
     )
-    assert seen == [0, 1, 2]  # 利用者フックも各反復で呼ばれる
-    assert len(sink.of_kind(LOOP_STEP)) == 3  # 観測フックも生きている
+    assert seen == [0, 1, 2]  # The user hook is also called on each iteration.
+    assert len(sink.of_kind(LOOP_STEP)) == 3  # The observation hook also remains active.
 
 
 def test_observer_emits_step_only_after_user_on_step_succeeds():
@@ -297,7 +297,7 @@ def test_observer_emits_step_only_after_user_on_step_succeeds():
     assert end.payload["status"] == "error"
 
 
-# -- 例外パス: error の loop_end ------------------------------------------
+# -- Exception path: error loop_end -----------------------------------------
 
 
 def test_exception_in_act_records_error_end_and_reraises():
@@ -314,7 +314,7 @@ def test_exception_in_act_records_error_end_and_reraises():
             sinks=[sink],
             otel=False,
         )
-    # begin は出ており、end は error として残り、例外は伝播する。
+    # begin has been emitted, end remains as error, and the exception propagates.
     assert sink.of_kind(LOOP_BEGIN)
     end = _only(sink, LOOP_END)
     assert end.payload["status"] == "error"
@@ -323,8 +323,8 @@ def test_exception_in_act_records_error_end_and_reraises():
 
 
 def test_error_end_keeps_metrics_of_completed_iterations():
-    # 2 反復成功した後に落ちると、error の loop_end は 0 ではなく確定済みの
-    # 累積メトリクス（iterations=2 / tokens_used=20）を残す。
+    # When the loop fails after two successful iterations, the error loop_end keeps the finalized
+    # cumulative metrics (iterations=2 / tokens_used=20) instead of 0.
     sink = ListSink()
     calls = {"n": 0}
 
@@ -347,12 +347,12 @@ def test_error_end_keeps_metrics_of_completed_iterations():
     assert end.payload["status"] == "error"
     assert end.payload["iterations"] == 2
     assert end.payload["tokens_used"] == 20
-    assert end.iteration == 2  # 共通フィールドも確定値
+    assert end.iteration == 2  # Common fields also use finalized values.
 
 
 def test_incomplete_path_emits_loop_end_with_last_known_metrics():
-    # context manager を例外なしで抜けたが record_result を呼び忘れたケース:
-    # span と event sink の終了観測を揃えるため incomplete の loop_end を残す。
+    # Case where the context manager exits without an exception, but record_result was forgotten:
+    # keep an incomplete loop_end so span and event sink completion observations stay aligned.
     sink = ListSink()
     observer = LoopObserver([sink], otel=False)
     with observer:
@@ -362,15 +362,15 @@ def test_incomplete_path_emits_loop_end_with_last_known_metrics():
             conditions=[MaxIterations(2)],
             on_step=observer.on_step,
         )
-        # わざと record_result を呼ばない
+        # Intentionally do not call record_result.
     end = _only(sink, LOOP_END)
     assert end.payload["status"] == "incomplete"
-    assert end.payload["iterations"] == 2  # 確定済みメトリクスを保持
+    assert end.payload["iterations"] == 2  # Keep finalized metrics.
     assert end.payload["tokens_used"] == 10
     assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
 
 
-# -- 手動配線（ProgressLog と同じ作法）-------------------------------------
+# -- Manual wiring (same pattern as ProgressLog) ----------------------------
 
 
 def test_manual_wiring_matches_run_observed_loop():
@@ -389,8 +389,8 @@ def test_manual_wiring_matches_run_observed_loop():
 
 
 def test_run_observed_loop_forwards_initial_state_for_resume():
-    # 観測入口でも initial_state を素通しして resume できる: 復元 seed から step/end の
-    # iteration・累積メトリクスが継続する (新規 run の begin は iteration 0 から)。
+    # The observation entrypoint also passes initial_state through for resume: step/end
+    # iteration and cumulative metrics continue from the restored seed (the new run's begin starts at iteration 0).
     sink = ListSink()
     seed = LoopState(iteration=2, tokens_used=20)
     result = run_observed_loop(
@@ -401,21 +401,21 @@ def test_run_observed_loop_forwards_initial_state_for_resume():
         otel=False,
         initial_state=seed,
     )
-    # seed の iteration 2 から継続 -> 2 step 回して cap 4 で停止。
+    # Continue from seed iteration 2 -> run 2 steps and stop at cap 4.
     assert result.iterations == 4
     assert result.tokens_used == 40
     assert _kinds(sink) == [LOOP_BEGIN, LOOP_STEP, LOOP_STEP, LOOP_END]
-    # step event の iteration は復元 state から継続 (2, 3)。
+    # Step event iterations continue from the restored state (2, 3).
     assert [e.iteration for e in sink.of_kind(LOOP_STEP)] == [2, 3]
     assert _only(sink, LOOP_END).payload["iterations"] == 4
     assert _only(sink, LOOP_END).payload["tokens_used"] == 40
-    # seed は mutate されない (run_loop が copy する)。
+    # seed is not mutated (run_loop copies it).
     assert seed.iteration == 2 and seed.tokens_used == 20
 
 
 def test_resumed_observed_loop_error_carries_seeded_metrics():
-    # resume 中に最初の新規 on_step より前 (act 等) で例外が出ても、error の loop_end は
-    # 復元 state の累積値を載せる (中断前に完了済みの反復ぶんを 0 に潰さない)。
+    # Even if an exception occurs during resume before the first new on_step (act, etc.), the error
+    # loop_end carries the restored state's cumulative values (does not flatten completed pre-interruption iterations to 0).
     sink = ListSink()
     seed = LoopState(iteration=3, tokens_used=30, elapsed=1.5)
 
@@ -433,9 +433,9 @@ def test_resumed_observed_loop_error_carries_seeded_metrics():
         )
     end = _only(sink, LOOP_END)
     assert end.payload["status"] == "error"
-    assert end.payload["iterations"] == 3  # 0 に潰れない
+    assert end.payload["iterations"] == 3  # Not flattened to 0.
     assert end.payload["tokens_used"] == 30
-    assert _kinds(sink) == [LOOP_BEGIN, LOOP_END]  # 新規 step は無い
+    assert _kinds(sink) == [LOOP_BEGIN, LOOP_END]  # There is no new step.
 
 
 def test_record_result_is_idempotent():
@@ -446,5 +446,5 @@ def test_record_result_is_idempotent():
         act=acting(tokens=0), verify=done_after(1), conditions=[MaxIterations(2)]
     )
     observer.record_result(result)
-    observer.record_result(result)  # 二度目は無視される
+    observer.record_result(result)  # The second call is ignored.
     assert len(sink.of_kind(LOOP_END)) == 1

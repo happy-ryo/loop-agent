@@ -1,4 +1,4 @@
-"""外側収束条件の単体テスト (Issue #22: 早期停止 / しきい値 / AnyOf 再利用)。"""
+"""Unit tests for outer convergence conditions (Issue #22: early stop / thresholds / AnyOf reuse)."""
 
 from __future__ import annotations
 
@@ -34,9 +34,9 @@ def test_max_episodes_fires_at_limit():
 
 def test_rubric_threshold_requires_sustain():
     cond = RubricThreshold(target=0.8, sustain=2)
-    # 単発スパイクでは発火しない (variance gaming 耐性)。
+    # A single spike does not trigger it (resistant to variance gaming).
     assert cond.check(_state(gt_aggregate_history=(0.9, 0.2))) is None
-    # 直近 2 連続で target 以上なら発火。
+    # It triggers when the latest 2 consecutive values are at or above target.
     assert cond.check(_state(gt_aggregate_history=(0.7, 0.9, 0.85))) is not None
 
 
@@ -56,13 +56,13 @@ def test_rubric_threshold_is_success_condition():
 
 def test_plateau_does_not_fire_on_slow_monotone_progress():
     cond = ScorePlateau(window=2, min_delta=0.005)
-    # ゆっくりでも単調改善している間は打ち切らない。
+    # Do not stop while improvement is monotonic, even if slow.
     assert cond.check(_state(gt_aggregate_history=(0.70, 0.71, 0.72))) is None
 
 
 def test_plateau_fires_on_sawtooth_with_no_net_best_gain():
     cond = ScorePlateau(window=2, min_delta=0.005)
-    # best-so-far が伸びない (sawtooth で正味ゲイン 0) なら打ち切る。
+    # Stop when best-so-far does not improve (zero net gain with a sawtooth pattern).
     assert cond.check(_state(gt_aggregate_history=(0.2, 0.9, 0.2, 0.9))) is not None
 
 
@@ -72,14 +72,14 @@ def test_plateau_quiet_until_window_filled():
 
 
 def test_plateau_zero_delta_fires_on_flat_history():
-    """min_delta=0 は「正味ゲインゼロ」で発火する (no-op にならない)。"""
+    """min_delta=0 triggers on zero net gain (it does not become a no-op)."""
     cond = ScorePlateau(window=2, min_delta=0.0)
     assert cond.check(_state(gt_aggregate_history=(0.5, 0.5, 0.5))) is not None
-    # わずかでも伸びていれば発火しない。
+    # It does not trigger if there is even a small improvement.
     assert cond.check(_state(gt_aggregate_history=(0.5, 0.6, 0.7))) is None
 
 
-# -- 予算条件 -------------------------------------------------------------------
+# -- Budget conditions ----------------------------------------------------------
 
 
 def test_reflection_budget_caps_lessons():
@@ -94,7 +94,7 @@ def test_evaluator_update_budget_caps_promotions():
     assert cond.check(_state(evaluator_updates=2)) is not None
 
 
-# -- AnyOf 再利用 (内側と同じ合成プロトコル) -----------------------------------
+# -- AnyOf reuse (same composition protocol as the inner loop) ------------------
 
 
 def test_anyof_composes_outer_conditions_over_outer_state():

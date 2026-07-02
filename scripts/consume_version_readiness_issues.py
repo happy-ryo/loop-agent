@@ -39,7 +39,7 @@ def check_117() -> list[str]:
     ops = read("docs/operations-roadmap.md")
     if "0.1.0 Beta" in readme or "0.1.0 Beta" in api:
         failures.append("Beta wording remains in README/API docs")
-    if "運用 follow-up" in api:
+    if "operations follow-up" in api:
         failures.append("API docs still call implemented operations helpers follow-up")
     for needle in ("summary", "dashboard", "spike", "circuit breaker", "throttling"):
         if needle not in readme and needle not in ops:
@@ -65,12 +65,12 @@ def check_119() -> list[str]:
     cli = read("docs/cli.md")
     persistence = read("docs/persistence-and-resume.md")
     failures: list[str] = []
-    if "## 互換性契約" not in cli:
+    if "## Compatibility Contract" not in cli:
         failures.append("CLI compatibility section missing")
-    for needle in ("終了コード", "best-effort", "read-only"):
+    for needle in ("exit codes", "best-effort", "read-only"):
         if needle not in cli:
             failures.append(f"CLI compatibility missing {needle}")
-    if "## state.db 互換性契約" not in persistence:
+    if "## state.db Compatibility Contract" not in persistence:
         failures.append("state.db compatibility section missing")
     for needle in ("patch release", "minor release", "major release", "PRAGMA user_version"):
         if needle not in persistence:

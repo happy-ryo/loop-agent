@@ -55,11 +55,11 @@ def test_cli_and_state_db_contract_sections_exist():
     persistence = _read("docs/persistence-and-resume.md")
     releasing = _read("docs/releasing.md")
 
-    assert "## 互換性契約" in cli
-    assert "終了コード" in cli
+    assert "## Compatibility Contract" in cli
+    assert "Exit Codes" in cli
     assert "human-readable" not in cli.lower()
     assert "best-effort" in cli
-    assert "## state.db 互換性契約" in persistence
+    assert "## state.db Compatibility Contract" in persistence
     assert "patch release" in persistence
     assert "minor release" in persistence
     assert "major release" in persistence
