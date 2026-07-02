@@ -1,41 +1,42 @@
-# Recipe: docstring / コメントの一括翻訳（動線 E）
+# Recipe: Batch Translation of Docstrings / Comments (Path E)
 
-N 個のソースファイルの日本語 docstring / コメントを英訳する（あるいは逆）ループです。**コードは一切変えない**のが制約。これは loop-agent の **Self-translation PoC**（loop-agent 自身のソースを loop-agent 自身で英訳した dogfood）を recipe 化したものです。
+This is a loop for translating Japanese docstrings / comments in N source files into English (or the reverse). The constraint is that **no code may be changed at all**. This recipe formalizes loop-agent's **Self-translation PoC**: a dogfooding run where loop-agent translated its own source code into English using loop-agent itself.
 
-## prose intent（Claude Code にそのまま渡す）
+## Prose Intent (Pass Directly to Claude Code)
 
-> このリポジトリには loop-agent（薄いループエンジン。`act` に `ClaudeCodeAct` が使える）が入っている。
-> **`src/loop_agent/` の docstring とコメントを英訳するループを組んで走らせて。** ただし:
-> - コード・公開 API・型・テスト名・**文字列リテラル**は一切変えない（コメントと docstring だけ）。
-> - gather: まだ日本語が残るファイルを 1 件ずつ（試行回数最小から = 公平 scheduling）。
-> - act: `ClaudeCodeAct(model="haiku", allowed_tools=["Read","Edit"])`。
-> - verify: 5 段の機械チェック全通過で done（下記）。
-> - conditions: `MaxIterations(20)` と `TokenBudget`(大きめ)。
+> This repository contains loop-agent, a thin loop engine whose `act` can use `ClaudeCodeAct`.
+> **Create and run a loop that translates docstrings and comments under `src/loop_agent/` into English.** However:
+> - Do not change code, public APIs, types, test names, or **string literals** at all; only comments and docstrings may change.
+> - gather: pick one file at a time where Japanese still remains, starting with the fewest attempts for fair scheduling.
+> - act: `ClaudeCodeAct(model="haiku", allowed_tools=["Read","Edit"])`.
+> - verify: done only after all five mechanical checks below pass.
+> - conditions: `MaxIterations(20)` and a large `TokenBudget`.
 
-## verify は 5 段の ground truth（コスト昇順）
+## Verify Uses Five Levels of Ground Truth (Ascending Cost)
 
-ファイルが **done** になるのは 5 つ全部通ったときだけ:
+A file becomes **done** only when all five checks pass:
 
-1. **`parses_ok`** — `ast.parse` が成功する（壊れた編集を最安で弾く）。
-2. **`japanese_cleared`** — *翻訳対象*（コメントと docstring）に日本語が残っていない。**非 docstring の文字列リテラルは対象外**（user 向けメッセージは日本語のままが正当なこともあるため。ここを弾くとゴールが到達不能になる）。コメントは `tokenize`、docstring は `ast` の docstring ノードで厳密にターゲティングする。
-3. **`code_unchanged`** — **コードと非 docstring 文字列リテラルが変わっていない**（制約「コード/API/型/テスト名/文字列リテラルを変えない」の機械的強制）。HEAD と作業ツリーを両方パースし、**docstring の値だけを `""` に潰して**（= 翻訳を許す）`ast.dump` を比較。docstring 以外の文字列リテラル（エラーメッセージ・CLI 出力等）は**値ごと比較対象に残す**ので、その改変も差分として検出される。一致しなければ、識別子・シグネチャ・制御フロー・import・デコレータ・非 docstring 文字列のいずれかが変わったということなので **reject**。`tests_pass` だけでは「テストが見ていない挙動の破壊」を見逃すので、この段が no-code-change 制約の番人になる。
-4. **`changed_files_scoped`** — `git diff --name-only` が許可された対象ファイル集合だけを返す。agent はテスト一時ディレクトリ対策や設定変更を「ついでに」入れがちなので、対象外の tracked file が変わった時点で reject する。`act` に「このファイルだけ」と指示しても、verify で機械的に縛らない限り保証にはならない。`n` 件翻訳の batch なら許可集合は `FILES`、1 ファイルずつ commit する運用なら `{f}` にする。
-5. **`tests_pass`** — そのモジュール自身の `pytest` が通る（subprocess で再 import するので、挙動を壊す編集を検出）。
+1. **`parses_ok`** - `ast.parse` succeeds, rejecting broken edits at the lowest cost.
+2. **`japanese_cleared`** - no Japanese remains in the *translation targets* (comments and docstrings). **Non-docstring string literals are out of scope** because user-facing messages may legitimately remain Japanese. Rejecting them would make the goal unreachable. Comments are targeted precisely with `tokenize`, and docstrings are targeted precisely with `ast` docstring nodes.
+3. **`code_unchanged`** - **code and non-docstring string literals have not changed**. This mechanically enforces the constraint "do not change code/API/types/test names/string literals." Parse both `HEAD` and the worktree, **replace only docstring values with `""`** (allowing translation), then compare `ast.dump`. String literals other than docstrings, such as error messages and CLI output, remain in the comparison with their values intact, so any changes to them are also detected as diffs. If the dumps differ, some identifier, signature, control flow, import, decorator, or non-docstring string has changed, so **reject**. `tests_pass` alone can miss "behavior changes not covered by tests," so this stage guards the no-code-change constraint.
+4. **`changed_files_scoped`** - `git diff --name-only` returns only the permitted target file set. Agents often make incidental changes for test temporary directories or settings, so reject as soon as any out-of-scope tracked file changes. Even if `act` is instructed "only this file," there is no guarantee unless `verify` enforces it mechanically. For an `n`-file translation batch, the permitted set is `FILES`; for a one-file-per-commit workflow, use `{f}`.
+5. **`tests_pass`** - the module's own `pytest` passes. Because this re-imports through a subprocess, it detects edits that break behavior.
 
 ```python
 import ast, tokenize, io, subprocess
 
 def code_signature(source):
-    """docstring の *値* だけを中立化した AST dump。docstring 以外の文字列リテラル
-    （エラーメッセージ・CLI 出力等）は値ごと残すので、その改変も差分として検出される。
-    docstring 翻訳だけは許し、コード構造・非 docstring 文字列の変更は弾く。"""
+    """AST dump with only docstring *values* neutralized. String literals other than
+    docstrings, such as error messages and CLI output, keep their values, so changes
+    to them are also detected as diffs. Only docstring translation is allowed; changes
+    to code structure or non-docstring strings are rejected."""
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             doc = node.body[0] if node.body else None
             if (isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant)
                     and isinstance(doc.value.value, str)):
-                doc.value.value = ""               # docstring の値だけ潰す
+                doc.value.value = ""               # neutralize only the docstring value
     return ast.dump(tree)
 
 def changed_files():
@@ -50,13 +51,13 @@ def verify(outcome):
         tree = ast.parse(src)                      # 1. parses_ok
     except SyntaxError:
         return VerifyOutcome(goal_met=False, detail=f"{f}: parse error")
-    if has_japanese_in_comments_or_docstrings(tree, src):   # 2. japanese_cleared（文字列リテラルは除外）
+    if has_japanese_in_comments_or_docstrings(tree, src):   # 2. japanese_cleared (excluding string literals)
         return VerifyOutcome(goal_met=False, detail=f"{f}: japanese remains")
-    head = subprocess.run(["git", "show", f"HEAD:{f}"],     # 3. code_unchanged（docstring 以外の差分を拒否）
+    head = subprocess.run(["git", "show", f"HEAD:{f}"],     # 3. code_unchanged (reject non-docstring diffs)
                           capture_output=True, text=True).stdout
     if code_signature(head) != code_signature(src):
         return VerifyOutcome(goal_met=False, detail=f"{f}: code or non-docstring string changed")
-    unexpected = changed_files() - set(FILES)       # 4. changed_files_scoped（対象外変更を拒否）
+    unexpected = changed_files() - set(FILES)       # 4. changed_files_scoped (reject out-of-scope changes)
     if unexpected:
         return VerifyOutcome(goal_met=False, detail=f"unexpected changed files: {sorted(unexpected)}")
     if subprocess.run(["pytest", test_for(f), "-q"]).returncode != 0:   # 5. tests_pass
@@ -65,11 +66,11 @@ def verify(outcome):
     return VerifyOutcome(goal_met=len(done) == len(FILES), detail=f"{f}: done")
 ```
 
-## act prompt は lean に保つ（コスト設計）
+## Keep the Act Prompt Lean (Cost Design)
 
-この recipe の制約は **verify で機械的に強制**し、`act` prompt へ毎回貼り付けない。反復ループでは prompt の肥大が iteration 数で掛け算されるため、`act` には「いま編集する 1 ファイル」と「そのファイルの翻訳対象」だけを渡す。
+This recipe's constraints are **mechanically enforced by verify**, so do not paste them into the `act` prompt every time. In an iterative loop, prompt bloat is multiplied by the number of iterations. Give `act` only "the one file to edit now" and "the translation target in that file."
 
-推奨する prompt の形:
+Recommended prompt shape:
 
 ```text
 Edit only: {file}
@@ -78,33 +79,34 @@ Do not change code or non-docstring string literals.
 Do not edit other files. Do not run tests. Return after editing.
 ```
 
-避ける anti-pattern:
+Anti-patterns to avoid:
 
-- verify の 5 段チェック本文を毎回 prompt に貼る。
-- 既完了ファイル一覧、全体の残りファイル一覧、テスト計画を毎回渡す。
-- `Do not inspect tests` と書きながら `adapter tests must pass` のような確認責務を `act` に渡す。
+- Pasting the full text of the five verify checks into every prompt.
+- Passing the list of already completed files, the full list of remaining files, or the test plan every time.
+- Writing `Do not inspect tests` while also giving `act` a verification responsibility such as `adapter tests must pass`.
 
-それらは `verify` の仕事である。`act` が余計な repo 探索・diff 確認・test 実行を始めると、ファイル単位ループの失敗隔離メリットよりも prompt/tool cost が勝つことがある。dogfood では、一括 1 iteration が 801,370 tokens だった一方、過剰な `act` prompt を持つファイル単位 loop は 7 iterations / 2,470,874 tokens まで増えた。ファイル単位 loop を選ぶなら、実行前に「1 iteration あたり agent に読ませる情報量」を review する。
+Those are `verify`'s responsibility. If `act` starts doing extra repository exploration, diff checks, or test runs, prompt/tool cost can outweigh the failure-isolation benefit of a file-by-file loop. In dogfooding, one batch iteration cost 801,370 tokens, while a file-by-file loop with an excessive `act` prompt grew to 7 iterations / 2,470,874 tokens. If you choose a file-by-file loop, review "how much information the agent reads per iteration" before running it.
 
-## PoC の実走結果（embeddability の実証）
+## Actual PoC Results (Proof of Embeddability)
 
-loop-agent 自身の 10 ファイル（合計 290 の日本語 hit）を `haiku` で英訳:
+loop-agent translated its own 10 files (290 total Japanese hits) into English with `haiku`:
 
-| | Run 1（no Reflexion） | Run 2（Reflexion） |
+| | Run 1 (no Reflexion) | Run 2 (Reflexion) |
 |---|---|---|
-| 結果 | 10/10（`goal_met`） | 10/10（`converged`） |
-| 内側反復 | 13 | 14（10 + 4） |
-| Wall clock | 約 33 分 | 約 32 分 |
-| token 計上 | 11.17M | 10.72M |
-| 2 回目の試行が要ったファイル | 3 | 4 |
-| 翻訳後の suite | 559 passed | 559 passed |
+| Result | 10/10 (`goal_met`) | 10/10 (`converged`) |
+| Inner iterations | 13 | 14 (10 + 4) |
+| Wall clock | About 33 minutes | About 32 minutes |
+| Token accounting | 11.17M | 10.72M |
+| Files needing a second attempt | 3 | 4 |
+| Suite after translation | 559 passed | 559 passed |
 
-**挙動不変の機械的証明**: 上の verify 第 3 段（`code_unchanged`）と第 4 段（`changed_files_scoped`）と同じ手法を 10 ファイル全部に適用 — `HEAD` と作業ツリーをパースし、docstring の値だけを `""` に潰して `ast.dump` を比較 → 全て一致。識別子・シグネチャ・制御フロー・import・デコレータ・非 docstring 文字列リテラルは何も変わっていない。これは verify が各ファイルで通すゲートでもあるので、挙動を壊す編集は done にならない。`559 passed` と併せ、翻訳は**証明付きで挙動保存**（PoC の 10 ファイルは非 docstring 文字列リテラルに日本語を含まず、「文字列リテラルを触らない」制約は実際に保たれた）。
+**Mechanical proof of unchanged behavior**: The same method as verify stages 3 (`code_unchanged`) and 4 (`changed_files_scoped`) above was applied to all 10 files: parse `HEAD` and the worktree, replace only docstring values with `""`, and compare `ast.dump` -> all matched. No identifiers, signatures, control flow, imports, decorators, or non-docstring string literals changed. This is also the gate that verify applies to each file, so behavior-breaking edits cannot become done. Together with `559 passed`, the translation was **behavior-preserving with proof**. The 10 PoC files contained no Japanese in non-docstring string literals, and the "do not touch string literals" constraint was in fact preserved.
 
-## 要点
+## Key Points
 
-- **対象外ファイル変更を verify で弾く**。実走では agent がテスト一時ディレクトリ対策として `.gitignore` / `pyproject.toml` を触ることがあった。`git diff --name-only` を許可集合と比較し、対象外の tracked file が変わったら done にしない。
-- **文字列リテラルを翻訳対象から外す**のが肝。コメント / docstring だけをターゲティングし、`print()` 等の文字列は触らない。これを誤ると「翻訳しきれない正当な日本語」でゴールが到達不能になります。
-- **token 計上**: `ClaudeCodeAct` を `Read`+`Edit` 付きで回すと内部マルチターンで `cache_read` が累積しますが、token 計上は `cache_read` を除外するよう修正済みなので `TokenBudget` は実コストに比例して効きます（Issue #55、以前は早発火していた）。長時間 run の確実な律速には `MaxIterations` 併用が堅実。詳細は [quickstart のトラブルシュート](../quickstart.md#5-トラブルシュートよくある詰まり)。
-- **Reflexion は要らないことが多い**: この翻訳タスクの初回失敗は *stochastic*（haiku が長いファイルで末尾コメントを 1 個落とす類）で、blind retry で resample すれば通ります。Run 1（no Reflexion）と Run 2（Reflexion）はほぼ同コストで同結果でした。Reflexion が勝つのは *systematic* な失敗のときだけ（→ [reflexion-when-to-use.md](../reflexion-when-to-use.md)）。
-- **公平 scheduling**: ファイル単位の round-robin（試行回数最小から）で、難物 1 ファイルが全反復を独占しないように。
+- **Reject out-of-scope file changes in verify**. In actual runs, the agent sometimes touched `.gitignore` / `pyproject.toml` as a mitigation for test temporary directories. Compare `git diff --name-only` with the permitted set, and do not mark the file done if any out-of-scope tracked file changed.
+- **The critical point is excluding string literals from translation targets**. Target only comments / docstrings; do not touch strings in `print()` and similar code. If this is wrong, the goal can become unreachable because of legitimate Japanese that should not be translated.
+- **Token accounting**: When `ClaudeCodeAct` runs with `Read`+`Edit`, `cache_read` accumulates across internal multi-turn work. Token accounting has been fixed to exclude `cache_read`, so `TokenBudget` now scales with real cost (Issue #55; previously it fired too early). For reliable rate limiting in long runs, also using `MaxIterations` is prudent. For details, see [quickstart troubleshooting](../quickstart.md#5-troubleshooting-common-failure-points).
+- **Reflexion is often unnecessary for stochastic misses**: Initial failures in this translation task were often *stochastic*, such as haiku dropping one trailing comment in a long file, and a blind retry could pass by resampling. Run 1 (no Reflexion) and Run 2 (Reflexion) had nearly the same cost and result.
+- **Use Reflexion or deterministic pre-processing for repeated structural failures**: If review or verify reports the same issue repeatedly, such as broken generated anchors, unstable link fragments, or the same file receiving the same rejected edit, treat it as systematic. Stop the inner loop with `NoProgress`, turn the failure into a lesson or deterministic normalizer, and resume from persisted state.
+- **Fair scheduling**: Use file-level round robin, starting with the fewest attempts, so one difficult file does not monopolize all iterations.

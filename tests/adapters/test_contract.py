@@ -1,11 +1,12 @@
-"""全 act アダプタ横断の共通契約テスト(Issue #52)。
+"""Common contract tests across all act adapters (Issue #52).
 
-:data:`tests.adapters.conftest.ADAPTER_SPECS` に登録された各アダプタ
-(:class:`ClaudeCodeAct` / :class:`CodexAct` / 将来追加分)に対して、``act`` シームの
-4 か条と :class:`ActResult` の形を 1 つの parametrize 群で検証する。アダプタ固有の
-output/token スキーマ(claude の stream-json / codex の JSONL イベント揺れ等)は
-``test_adapters_claude_code.py`` / ``test_adapters_codex.py`` に残し、ここでは
-**どのアダプタでも同一であるべき契約** だけを扱う。
+For each adapter registered in :data:`tests.adapters.conftest.ADAPTER_SPECS`
+(:class:`ClaudeCodeAct` / :class:`CodexAct` / future additions), validate the
+four-part ``act`` seam and the shape of :class:`ActResult` in one parametrized
+group. Adapter-specific output/token schemas (claude stream-json, codex JSONL
+event variations, etc.) stay in ``test_adapters_claude_code.py`` /
+``test_adapters_codex.py``; this file covers only the **contracts that should be
+identical for every adapter**.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from loop_agent import MaxIterations, TokenBudget, VerifyOutcome, run_loop
 from loop_agent.adapters import ActResult, ActResultBase
 
 
-# -- 結果の形(ActResult 契約) ---------------------------------------------
+# -- Result shape (ActResult contract) -------------------------------------
 
 
 def test_success_result_shape(adapter_spec, make_runner):
@@ -29,22 +30,24 @@ def test_success_result_shape(adapter_spec, make_runner):
 
     result = outcome.observation
     assert isinstance(result, adapter_spec.result_cls)
-    # 観測オブジェクトは共通契約に構造適合する(異種アダプタ合成のため)。
+    # The observation object structurally matches the common contract so
+    # heterogeneous adapters can be composed.
     assert isinstance(result, ActResult)
     assert isinstance(result, ActResultBase)
     assert result.failed is False
     assert result.text == adapter_spec.success_text
     assert result.returncode == 0
-    assert str(result) == adapter_spec.success_text  # __str__ は本文を返す
+    assert str(result) == adapter_spec.success_text  # __str__ returns the body.
     assert outcome.tokens == adapter_spec.success_tokens
     assert result.tokens == adapter_spec.success_tokens
-    # command は実行した引数列(tuple)で、末尾はプロンプトの位置引数。
+    # command is the executed argument sequence (tuple), ending with the prompt
+    # positional argument.
     assert isinstance(result.command, tuple)
     assert result.command[-2:] == ("--", "fix the bug")
 
 
 def test_result_has_all_eight_fields(adapter_spec):
-    # 8 フィールドを ActResultBase から継承し、再定義していないこと。
+    # The eight fields are inherited from ActResultBase and are not redefined.
     import dataclasses
 
     names = [f.name for f in dataclasses.fields(adapter_spec.result_cls)]
@@ -60,7 +63,7 @@ def test_result_has_all_eight_fields(adapter_spec):
     ]
 
 
-# -- failed セマンティクス(例外でなく failed で graceful) -------------------
+# -- failed semantics (graceful failed state, not exceptions) ---------------
 
 
 def test_nonzero_exit_is_failed(adapter_spec, make_runner):
@@ -76,7 +79,7 @@ def test_nonzero_exit_is_failed(adapter_spec, make_runner):
 def test_timeout_returns_failed_without_raising(adapter_spec, make_timeout_runner):
     act = adapter_spec.make_act(timeout=0.01, runner=make_timeout_runner(0.01))
 
-    outcome = act({"prompt": "long task"})  # 例外が漏れないこと自体が検証点
+    outcome = act({"prompt": "long task"})  # Verifies exceptions do not leak.
 
     assert outcome.tokens == 0
     result = outcome.observation
@@ -92,7 +95,8 @@ def test_missing_executable_is_graceful(adapter_spec):
 
 
 def test_timeout_does_not_kill_the_loop(adapter_spec, make_timeout_runner):
-    # timeout が続いても run_loop は MaxIterations で必ず止まる(境界 guard が効く)。
+    # Even repeated timeouts must stop at MaxIterations, proving the boundary
+    # guard works.
     act = adapter_spec.make_act(timeout=0.01, runner=make_timeout_runner(0.01))
 
     def verify(outcome):
@@ -109,25 +113,26 @@ def test_timeout_does_not_kill_the_loop(adapter_spec, make_timeout_runner):
     assert result.iterations == 3
 
 
-# -- token: 二重計上ガード(Issue #55 の bug class を構造的に catch) ----------
+# -- token: double-counting guard (structurally catches Issue #55 bug class) -
 
 
 def test_token_guard_no_double_count(adapter_spec):
-    # 部分集合キー(codex の cached/reasoning 等)を含む usage でも、そのアダプタの
-    # 意味論で正しい総量になる。二重計上していたら不一致で落ちる。
+    # Even usage with subset keys (codex cached/reasoning, etc.) produces the
+    # correct total under that adapter's semantics. Double counting fails this.
     assert adapter_spec.parse_tokens(adapter_spec.token_guard_stdout) == adapter_spec.token_guard_expected
 
 
 def test_token_guard_via_actoutcome(adapter_spec, make_runner):
-    # parse_tokens 単体だけでなく、__call__ -> ActOutcome.tokens の経路でも
-    # 二重計上しないことを固定する(driver が積む値の正しさ)。
+    # Lock down no double counting not only in parse_tokens alone, but also
+    # through the __call__ -> ActOutcome.tokens path (the value drivers use).
     runner = make_runner(stdout=adapter_spec.token_guard_stdout)
     outcome = adapter_spec.make_act(runner=runner)({"prompt": "x"})
     assert outcome.tokens == adapter_spec.token_guard_expected
 
 
 def test_tokens_accumulate_into_token_budget(adapter_spec):
-    # 1 反復 1200 tokens。予算 2000 なら 2 反復計上後に境界で止まる。
+    # One iteration costs 1200 tokens. With a 2000-token budget, the boundary
+    # stops after charging two iterations.
     mock = adapter_spec.mock_cls(responses=[{"text": "step", "tokens": 1200}])
 
     result = run_loop(
@@ -141,12 +146,13 @@ def test_tokens_accumulate_into_token_budget(adapter_spec):
     assert result.iterations == 2
 
 
-# -- auth: 環境継承 + env= 上書きマージ(CLI に委譲) -------------------------
+# -- auth: environment inheritance + env= override merge (delegated to CLI) -
 
 
 def test_env_inherits_and_overrides(adapter_spec, make_runner, monkeypatch):
-    # 子は os.environ を継承し(既存 CLI セッション / API キー経路)、env= で渡した
-    # 値を上書きマージする。subprocess に渡る env を runner 経由で覗いて固定する。
+    # The child inherits os.environ (existing CLI sessions / API key paths), then
+    # merges env= values as overrides. Inspect the env passed to subprocess via
+    # the runner to lock this down.
     monkeypatch.setenv("LOOP_AGENT_INHERITED", "from-parent")
     runner = make_runner(stdout=adapter_spec.success_stdout)
     act = adapter_spec.make_act(runner=runner, env={"LOOP_AGENT_MARKER": "injected"})
@@ -159,7 +165,7 @@ def test_env_inherits_and_overrides(adapter_spec, make_runner, monkeypatch):
     assert passed_env["LOOP_AGENT_MARKER"] == "injected"
 
 
-# -- stdin 安全性(対話入力読み込みによるハング防止) -------------------------
+# -- stdin safety (prevent hangs from reading interactive input) ------------
 
 
 def test_stdin_safety(adapter_spec, make_runner):
@@ -169,16 +175,18 @@ def test_stdin_safety(adapter_spec, make_runner):
     act({"prompt": "hi"})
 
     sent_command, kwargs = runner.calls[-1]
-    # プロンプトは "--" の後ろの位置引数に確定している(可変長オプションに飲まれない)。
+    # The prompt is fixed as the positional argument after "--" so variadic
+    # options cannot consume it.
     assert sent_command[-2:] == ["--", "hi"]
     if adapter_spec.expects_devnull:
         assert kwargs.get("stdin") == subprocess.DEVNULL
     else:
-        # stdin を明示しないアダプタは親環境を継承する(DEVNULL を強制しない)。
+        # Adapters that do not explicitly set stdin inherit the parent
+        # stdin/input stream instead of forcing DEVNULL.
         assert "stdin" not in kwargs
 
 
-# -- prompt placeholder の整形(全アダプタ共通の render_prompt) ---------------
+# -- prompt placeholder formatting (render_prompt shared by all adapters) ---
 
 
 def test_placeholder_reaches_the_command(adapter_spec, make_runner):
@@ -191,14 +199,14 @@ def test_placeholder_reaches_the_command(adapter_spec, make_runner):
     assert sent_command[-1] == "fix iter 7"
 
 
-# -- Mock 契約(subprocess 無しで同じ act 契約) -----------------------------
+# -- Mock contract (same act contract without subprocess) -------------------
 
 
 def test_mock_cycles_then_sticks_to_last(adapter_spec):
     mock = adapter_spec.mock_cls(responses=["first", {"text": "second", "tokens": 5}])
     a = mock({"prompt": "p1"})
     b = mock({"prompt": "p2"})
-    c = mock({"prompt": "p3"})  # 使い切ったら最後に張り付く
+    c = mock({"prompt": "p3"})  # Once exhausted, it sticks to the last value.
 
     assert a.observation.text == "first"
     assert b.observation.text == "second" and b.tokens == 5

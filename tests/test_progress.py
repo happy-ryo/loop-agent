@@ -1,6 +1,6 @@
 """Tests for the minimal external state: the append-only progress file.
 
-These cover report.md S5 Phase 1's "最小状態(progress ファイル)": every iteration
+These cover report.md S5 Phase 1's "minimal state (progress file)": every iteration
 leaves a durable record, the terminal verdict is recorded, and the file reads
 back faithfully -- including the awkward cases (non-serializable observations,
 a crash-truncated final line, Unicode) that a real run will eventually hit.
@@ -153,18 +153,19 @@ def test_non_serializable_observation_is_stored_as_repr(tmp_path):
 
 def test_unicode_detail_round_trips_as_utf8(tmp_path):
     path = tmp_path / "progress.jsonl"
+    detail = "Converged: naive cafe\u0301"
 
     def verify(_outcome):
-        return VerifyOutcome(goal_met=True, detail="収束しました")
+        return VerifyOutcome(goal_met=True, detail=detail)
 
     _run_with_progress(
         path, act=acting(tokens=0), verify=verify, conditions=[MaxIterations(5)]
     )
 
-    # Stored without ASCII escaping and decodes back to the original Japanese.
+    # Stored without ASCII escaping and decodes back to the original detail.
     raw = path.read_text(encoding="utf-8")
-    assert "収束しました" in raw
-    assert _steps(read_progress(path))[0]["detail"] == "収束しました"
+    assert detail in raw
+    assert _steps(read_progress(path))[0]["detail"] == detail
 
 
 def test_unicode_line_separators_do_not_split_a_record(tmp_path):

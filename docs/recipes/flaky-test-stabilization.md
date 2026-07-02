@@ -1,31 +1,31 @@
-# Recipe: flaky test の安定化（動線 E）
+# Recipe: Stabilizing Flaky Tests (Path E)
 
-CI で時々落ちるテスト群を、loop-agent + Claude Code で 1 件ずつ根本修正し、**再現性のある合格**で締めるループです。
+This loop fixes CI test failures that appear intermittently, one test at a time, using loop-agent + Claude Code, and finishes with a **reproducible passing result**.
 
-## prose intent（Claude Code にそのまま渡す）
+## Prose Intent (pass directly to Claude Code)
 
-> このリポジトリには loop-agent（`gather → act → verify → repeat` の薄いループエンジン。`act` に `loop_agent.adapters.ClaudeCodeAct` が使える）が入っている。
-> **CI で flaky なテストを安定化するループを組んで走らせて。**
-> - gather: 安定化対象の flaky test を 1 件ずつ選ぶ（試行回数最小から = 公平 scheduling）。
-> - act: `ClaudeCodeAct(model="sonnet", allowed_tools=["Read","Edit"])` で根本原因を読んで直す（テストの実行は verify が持つ）。
-> - verify: 修正後にその test を **10 回連続 pass** で done（1 回でも落ちたら未達）。
-> - conditions: `MaxIterations(20)` と `TokenBudget`(大きめ)。
-> - 不可逆操作: act には commit / push をさせない（編集のみ）。修正の commit は収束後に人間が確認して行う。
+> This repository includes loop-agent (a thin loop engine for `gather -> act -> verify -> repeat`; `loop_agent.adapters.ClaudeCodeAct` can be used for `act`).
+> **Build and run a loop that stabilizes flaky tests in CI.**
+> - gather: Choose flaky tests to stabilize one at a time (starting with the fewest attempts = fair scheduling).
+> - act: Use `ClaudeCodeAct(model="sonnet", allowed_tools=["Read","Edit"])` to read the code, find the root cause, and fix it (test execution belongs to verify).
+> - verify: After the fix, mark the test done only if it **passes 10 consecutive times** (if it fails even once, the goal has not been met).
+> - conditions: `MaxIterations(20)` and a large `TokenBudget`.
+> - Irreversible operations: Do not allow act to commit or push (edits only). After convergence, a human reviews the fix and commits it.
 
-## 組み上がる harness（おおよその姿）
+## Expected Harness Shape
 
 ```python
 from loop_agent import run_loop, MaxIterations, TokenBudget, VerifyOutcome, ActOutcome
 from loop_agent.adapters import ClaudeCodeAct
 import subprocess
 
-FLAKY = ["tests/test_a.py::test_x", "tests/test_b.py::test_y"]   # CI ログ等から抽出
+FLAKY = ["tests/test_a.py::test_x", "tests/test_b.py::test_y"]   # Extracted from CI logs, etc.
 done, attempts = set(), {t: 0 for t in FLAKY}
 current = {"test": None}
 
 def gather(state):
     rem = [t for t in FLAKY if t not in done]
-    t = min(rem, key=lambda t: (attempts[t], FLAKY.index(t)))    # 公平 scheduling
+    t = min(rem, key=lambda t: (attempts[t], FLAKY.index(t)))    # Fair scheduling
     current["test"] = t
     attempts[t] += 1
     return {"prompt": f"Find and fix the root cause of the flaky test `{t}`. "
@@ -41,24 +41,24 @@ def run_n_times(test, n=10):
 
 def verify(outcome):
     t = current["test"]
-    stable = (not outcome.observation.failed) and run_n_times(t, n=10)   # ground truth
+    stable = (not outcome.observation.failed) and run_n_times(t, n=10)   # Ground truth
     if stable:
         done.add(t)
     all_done = len(done) == len(FLAKY)
     return VerifyOutcome(goal_met=all_done, detail=f"{t}: {'stable' if stable else 'still flaky'}")
 
 result = run_loop(
-    act=ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"], timeout=600),   # 編集のみ
-    gather=gather, verify=verify,                                                      # 再現確認は verify が担う
+    act=ClaudeCodeAct(model="sonnet", allowed_tools=["Read", "Edit"], timeout=600),   # Edits only
+    gather=gather, verify=verify,                                                      # Reproducibility checks belong to verify
     conditions=[MaxIterations(20), TokenBudget(20_000_000)],
 )
 print(result.status, result.reason, sorted(done))
 ```
 
-## 要点
+## Key Points
 
-- **verify は「N 回連続 pass」**。flaky は単発 pass では消えたか判別できないので、連続合格を ground truth にします。N は大きいほど確証が上がる（コストとトレードオフ）。
-- **retry / sleep でのごまかしを禁じる**プロンプトにする。act にマスキングを許すと verify は通ってしまうが flaky は残ります。verify が「再現性」を測っているので、根本修正以外は通りにくい設計です。
-- **公平 scheduling 必須**。1 件の難物が `MaxIterations` を食い尽くさないよう、試行回数最小から選びます。
-- **Reflexion は効くか?** flaky の失敗が *systematic*（例: 全テストが同じ「時刻依存の競合」パターン）なら、lesson（「時刻は freeze しろ」）が次 test に効くので Reflexion 向き。各 flaky が無関係な独立要因なら blind retry とほぼ差は出ません。判断は [reflexion-when-to-use.md](../reflexion-when-to-use.md)。
-- **commit / push はループ外に隔離する**。修正のファイル編集は git で戻せる。**再現確認（テストの実行）は `verify` が持ち、`act` には commit / push できる権限（無制限 `Bash` 等）を渡さない**（`HumanGate` は `act` の subprocess が内部で打つ `git commit` を見られないため、ツール権限で断つのが確実）。不可逆な commit / push は収束後に人間が行う。どうしても act 内で shell が要るなら test コマンドに絞り、commit 系は与えない。commit を本当にゲートしたいなら commit を**ループの離散 action**にする — [docs/safety.md の限定人間ゲート節](../safety.md)。
+- **verify means "N consecutive passes"**. A single pass is not enough to determine whether a flaky test has been eliminated, so consecutive passes are the ground truth. Larger N increases confidence (with a cost tradeoff).
+- **Forbid masking with retries or sleeps** in the prompt. If act is allowed to mask the issue, verify may pass while the flakiness remains. Because verify measures reproducibility, this design makes anything other than a root-cause fix hard to pass.
+- **Fair scheduling is required**. Choose the test with the fewest attempts first so one difficult test does not consume all of `MaxIterations`.
+- **Does Reflexion help?** If flaky failures are *systematic* (for example, all tests share the same "time-dependent race" pattern), a lesson such as "freeze time" can help on the next test, so this is a good fit for Reflexion. If each flaky test has an unrelated independent cause, it will behave almost the same as blind retry. Use [reflexion-when-to-use.md](../reflexion-when-to-use.md) to decide.
+- **Keep commit / push outside the loop**. File edits from the fix can be reverted with git. **Reproducibility checks (test execution) belong to `verify`; do not give `act` permissions that would allow commit / push, such as unrestricted `Bash`** (`HumanGate` cannot see a `git commit` issued internally by the `act` subprocess, so removing that tool permission is the reliable boundary). Irreversible commit / push operations are performed by a human after convergence. If shell access is absolutely needed inside act, restrict it to the test command and do not provide commit-related capabilities. If you truly want to gate commits, make commit a **discrete loop action**; see [the limited human gate section in docs/safety.md](../safety.md).

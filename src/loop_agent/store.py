@@ -1,31 +1,36 @@
-"""ループ状態の SoT: loop 用最小 SQLite スキーマ + transaction 永続化 (Issue #11).
+"""Loop state SoT: minimal SQLite schema + transaction persistence (Issue #11).
 
-PoC の :mod:`loop_agent.progress` は各反復を JSON Lines に追記する「最小状態」
-だった (report.md S5 Phase 1)。本モジュールはそれを Phase 2 の **state.db SoT**
-へ引き上げる (report.md S3.4 / S4.6 / S5 Phase 2): ループ 1 走分の進捗を SQLite に
-*atomic* に永続化し、プロセスをまたいで状態が残る単一の正本にする。
+The PoC :mod:`loop_agent.progress` provided "minimal state" by appending each
+iteration to JSON Lines (report.md S5 Phase 1). This module promotes that to
+the Phase 2 **state.db SoT** (report.md S3.4 / S4.6 / S5 Phase 2): it persists
+one loop run's progress to SQLite *atomically* and makes it the single source of
+truth that survives across processes.
 
-設計の境界 (最重要・report.md S6 「state.db の抽出度」):
+Design boundaries (most important, report.md S6 "state.db extraction depth"):
 
-- **org 本体に密結合させない**。claude-org-ja の ``tools/state_db`` を adapt 元に
-  したが、本スキーマは ``run / step / event / stop_reason`` の 4 テーブルだけの
-  *自己完結* した最小スキーマで、org 側の projects / workstreams / worker_dirs や
-  snapshotter / dashboard 連携には一切依存しない。``connect`` だけで生成・利用できる。
-- **transaction を唯一の atomic 境界にする** (report.md R4)。:class:`LoopStore`
-  は StateWriter 風の明示的 ``transaction()`` を持ち、各 step の「step 行 +
-  集計 + journal event」を 1 トランザクションに束ねる。途中でクラッシュ (= commit
-  前にプロセス終了) すれば step は丸ごと無かったことになり、半端な行は残らない。
-- **resume の正本** (Issue #14)。:meth:`LoopStore.load_or_init` は run 行を確保し、
-  既存 run なら永続化済み step から :class:`LoopState` を復元して返す。これを
-  ``run_loop(initial_state=...)`` (または :attr:`DBProgressLog.state`) に渡すと、
-  中断したループを状態欠落なく途中から継続できる (resume)。observation は JSON で
-  保存されるため復元時に JSON round-trip を経る (型忠実度の限界は ``load_or_init`` /
-  ``run_loop`` の docstring 参照)。
+- **Do not tightly couple to the org core**. This was adapted from
+  claude-org-ja's ``tools/state_db``, but this schema is a self-contained
+  minimal schema with only the four ``run / step / event / stop_reason`` tables.
+  It does not depend on org-side projects / workstreams / worker_dirs or
+  snapshotter / dashboard integrations. ``connect`` is enough to create and use it.
+- **Make transaction the only atomic boundary** (report.md R4). :class:`LoopStore`
+  provides an explicit StateWriter-style ``transaction()`` and groups each step's
+  "step row + aggregates + journal event" into one transaction. If the process
+  crashes midway (= exits before commit), the whole step never happened and no
+  partial rows remain.
+- **Authoritative resume state** (Issue #14). :meth:`LoopStore.load_or_init`
+  ensures the run row exists and, for an existing run, restores and returns a
+  :class:`LoopState` from persisted steps. Passing this to
+  ``run_loop(initial_state=...)`` (or :attr:`DBProgressLog.state`) resumes an
+  interrupted loop without losing state. Observations are stored as JSON, so
+  restoration goes through a JSON round-trip (see the ``load_or_init`` /
+  ``run_loop`` docstrings for type-fidelity limits).
 
-JSONL の :class:`~loop_agent.progress.ProgressLog` は撤去せず *併存* させる
-(README 参照)。依存ゼロで読める PoC アーティファクトとしての価値が残るため。
-:class:`DBProgressLog` は ``ProgressLog`` と同じ ``on_step`` / ``record_result``
-シグネチャを実装する drop-in なので、観測フックの差し替えだけで SoT を DB に移せる。
+The JSONL :class:`~loop_agent.progress.ProgressLog` remains available alongside
+this (see README) because it is still valuable as a dependency-free, readable
+PoC artifact. :class:`DBProgressLog` implements the same ``on_step`` /
+``record_result`` signatures as ``ProgressLog``, so changing only the observation
+hook can move the SoT to the DB.
 """
 
 from __future__ import annotations
@@ -42,41 +47,51 @@ from .errors import ConfigError, StateError
 from .progress import _to_jsonable
 from .state import LoopState, StepRecord
 
-if TYPE_CHECKING:  # 実行時の import cycle を避ける (型注釈のためだけに必要)
+if TYPE_CHECKING:  # Avoid runtime import cycles; only needed for annotations.
     from .loop import LoopResult
 
-# スキーマのバージョン。テーブルを増やす拡張ではなく後方非互換の変更時に上げる。
-# 専用テーブルを置かず PRAGMA user_version に持たせ「最小 4 テーブル」を守る。
-# v2 (Issue #21, Phase3): pending_decision に in-progress リース
-# (executing 状態 + lease_owner / lease_expires_at) を追加。既存 DB は
-# :func:`_migrate_schema` が schema を実検査して非破壊に移行する (version は情報用)。
+# Schema version. Bump for backward-incompatible changes, not for table additions.
+# Store it in PRAGMA user_version without a dedicated table to preserve the
+# "minimal four tables" shape.
+# v2 (Issue #21, Phase3): add in-progress leases to pending_decision
+# (executing state + lease_owner / lease_expires_at). Existing DBs are migrated
+# non-destructively by :func:`_migrate_schema` after inspecting the actual schema
+# (the version is informational).
 SCHEMA_VERSION = 2
 
-# loop 用最小スキーマ。org 本体非依存・自己完結。``IF NOT EXISTS`` で冪等。
+# Minimal loop schema. Independent of the org core and self-contained.
+# ``IF NOT EXISTS`` makes it idempotent.
 #
-# - run             : 1 走 1 行。最終ステータスと集計 (反復数 / トークン / 経過) の正本。
-# - step            : 完了した各反復 1 行。UNIQUE(run_id, iteration) で再実行に冪等
-#                     (resume #14 の土台)。observation は JSON 文字列で保存。
-# - event           : append-only の journal (report.md R7 観測)。loop_begin /
-#                     loop_step / loop_end / loop_gate を記録し、全終了理由・人間ゲート
-#                     の発火/決定を事後解析できるようにする。
-# - stop_reason     : run と 1:1。発火した停止条件 (name) と理由、または goal 達成。
-# - pending_decision: 限定人間ゲート (Issue #15, report.md S4.5 / R6) の決定レジスタ。
-#                     不可逆操作で発火した 1 件 1 行。UNIQUE(run_id, gate_key) で冪等。
-#                     pending -> resolved(approve|edit|reject|respond) -> executed を
-#                     永続化し、pause/resume をまたいで決定を保持する。claude-org の
-#                     pending_decisions(state machine) を role 読み替えで reuse:
-#                     「secretary が worker の判断要求を register し user 応答で resolve」
-#                     を「loop が不可逆 action を register し human が resolve」に対応付け、
-#                     直接応答ゆえ中間状態 escalated は resolved に畳む。さらに executed を
-#                     足し、approve/edit で実行した不可逆 action の at-most-once を担保する
-#                     (replay resume = fresh state で iteration 0 から再生する経路で実行済み
-#                     ゲートを skip して再発火を防ぐ。#14 の initial_state resume は中断
-#                     iteration から継続するので実行済みゲートを再訪しない)。
-#                     Phase3 (#21): resolved -> executing -> executed の多段化と
-#                     lease_owner / lease_expires_at で複数プロセス同時 resume を協調する
-#                     (in-progress リース。:meth:`LoopStore.acquire_lease` /
-#                     :meth:`~LoopStore.complete_execution`)。
+# - run             : One row per run. Authoritative final status and aggregates
+#                     (iterations / tokens / elapsed).
+# - step            : One row per completed iteration. UNIQUE(run_id, iteration)
+#                     makes re-execution idempotent (the basis for resume #14).
+#                     observation is stored as a JSON string.
+# - event           : Append-only journal (report.md R7 observation). Records
+#                     loop_begin / loop_step / loop_end / loop_gate so all stop
+#                     reasons and human-gate triggers/decisions can be analyzed later.
+# - stop_reason     : 1:1 with run. The triggered stop condition (name) and
+#                     reason, or goal achievement.
+# - pending_decision: Decision registry for limited human gates (Issue #15,
+#                     report.md S4.5 / R6). One row per trigger on an irreversible
+#                     operation. UNIQUE(run_id, gate_key) makes it idempotent.
+#                     It persists pending -> resolved(approve|edit|reject|respond)
+#                     -> executed and keeps decisions across pause/resume. It reuses
+#                     claude-org's pending_decisions state machine with roles remapped:
+#                     "secretary registers a worker's judgment request and resolves it
+#                     from the user response" maps to "loop registers an irreversible
+#                     action and a human resolves it". Because the response is direct,
+#                     the intermediate escalated state is collapsed into resolved.
+#                     executed is added to guarantee at-most-once execution for
+#                     irreversible approve/edit actions (replay resume = the path that
+#                     replays from iteration 0 with fresh state skips executed gates and
+#                     prevents retriggers. #14 initial_state resume continues from the
+#                     interrupted iteration, so it does not revisit executed gates).
+#                     Phase3 (#21): split resolved -> executing -> executed into
+#                     multiple stages and coordinate concurrent multi-process resume
+#                     with lease_owner / lease_expires_at (in-progress lease;
+#                     :meth:`LoopStore.acquire_lease` /
+#                     :meth:`~LoopStore.complete_execution`).
 _SCHEMA_CORE = """
 CREATE TABLE IF NOT EXISTS run (
   run_id       TEXT PRIMARY KEY,
@@ -125,17 +140,19 @@ CREATE TABLE IF NOT EXISTS stop_reason (
 );
 """
 
-# pending_decision の DDL は単体で持ち、:func:`_migrate_schema` のテーブル再構築でも
-# 同一定義を再利用する (列定義のドリフト防止)。``CREATE TABLE`` 名だけ差し替えれば
-# 移行用の一時テーブルを作れるよう、テーブル名は 1 箇所だけに現れる形にしてある
-# (FK は run を参照し、CHECK / UNIQUE は列名のみで自テーブル名を含まない)。
+# Keep the pending_decision DDL standalone so :func:`_migrate_schema` can reuse the
+# same definition when rebuilding the table (prevents column-definition drift).
+# The table name appears only once, so replacing the ``CREATE TABLE`` name is enough
+# to create a temporary migration table (FK references run, and CHECK / UNIQUE use
+# only column names without mentioning the table itself).
 #
-# status の多段 (Phase3 #21): pending -> resolved -> executing -> executed。
-# executing は approve/edit の不可逆 action を *いま実行中* のプロセスがリースを保持して
-# いる状態で、lease_owner (保持者トークン) と lease_expires_at (epoch 秒, REAL) を持つ。
-# 同一ゲートを並行 resume しても resolved->executing に成功するのは 1 者だけ (single
-# winner)。敗者は executing を見て executed まで pause する (順序整合)。勝者クラッシュ時は
-# lease_expires_at の失効で別プロセスがリースを取り直せる (= step 欠落を防ぐ)。
+# Multi-stage status (Phase3 #21): pending -> resolved -> executing -> executed.
+# executing means the process currently running the irreversible approve/edit action
+# holds a lease, with lease_owner (holder token) and lease_expires_at (epoch seconds,
+# REAL). Even if the same gate is resumed concurrently, only one process can succeed
+# at resolved->executing (single winner). Losers see executing and pause until
+# executed (ordering consistency). If the winner crashes, lease_expires_at expiry lets
+# another process reacquire the lease (= prevents missing steps).
 _PENDING_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS pending_decision (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,9 +169,9 @@ CREATE TABLE IF NOT EXISTS pending_decision (
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   resolved_at      TEXT,
   executed_at      TEXT,
-  -- pending 以外 (resolved/executing/executed) は必ず decision を持つ (整合不変条件)。
+  -- Non-pending rows (resolved/executing/executed) must have a decision.
   CHECK (status = 'pending' OR decision IS NOT NULL),
-  -- executing は必ずリース保持者を持つ (失効判定の前提)。
+  -- executing rows must have a lease holder (required for expiry checks).
   CHECK (status <> 'executing' OR lease_owner IS NOT NULL),
   UNIQUE (run_id, gate_key)
 );
@@ -164,71 +181,78 @@ _PENDING_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_pending_run ON pending_decision(run_id);\n"
 )
 
-# 完全なスキーマ = コア 4 テーブル + pending_decision + その index。``connect`` /
-# :class:`LoopStore` はこれを executescript で冪等適用する。
+# Full schema = core four tables + pending_decision + its index. ``connect`` /
+# :class:`LoopStore` apply this idempotently with executescript.
 SCHEMA = _SCHEMA_CORE + _PENDING_TABLE_DDL + _PENDING_INDEX_DDL
 
-# event.kind の値。読み手が文字列リテラルを直書きせず filter できるよう定数化。
+# event.kind values. Constants let readers filter without hard-coded string literals.
 EVENT_BEGIN = "loop_begin"
 EVENT_STEP = "loop_step"
 EVENT_END = "loop_end"
-# 人間ゲートの発火 (pending) / 決定 (resolved) を journal に残す (report.md R6/R7)。
+# Record human-gate triggers (pending) / decisions (resolved) in the journal
+# (report.md R6/R7).
 EVENT_GATE = "loop_gate"
 
-# 限定人間ゲートで人間が下せる 4 種の決定 (LangGraph interrupt パリティ:
-# report.md S4.5 / S2.6)。approve=そのまま実行 / edit=修正して実行 /
-# reject=実行せず却下を記録 / respond=実行せず応答を返す。
+# The four decisions a human can make for a limited human gate (LangGraph interrupt
+# parity: report.md S4.5 / S2.6). approve=run as-is / edit=modify and run /
+# reject=do not run and record rejection / respond=do not run and return a response.
 DECISION_KINDS = ("approve", "edit", "reject", "respond")
 
-# in-progress リース (Issue #21) の取得結果 (:meth:`LoopStore.acquire_lease` の outcome)。
-# - ACQUIRED: このプロセスがリースを取得した (= 不可逆 action を実行してよい)。
-# - WAIT    : 別プロセスが有効なリースで実行中。executed まで待て (敗者は pause する)。
-# - EXECUTED: 既に実行完了済み。skip してよい (二重実行しない)。
+# Acquisition outcomes for in-progress leases (Issue #21; outcome from
+# :meth:`LoopStore.acquire_lease`).
+# - ACQUIRED: This process acquired the lease (= it may run the irreversible action).
+# - WAIT    : Another process is running under a valid lease. Wait until executed
+#             (losers pause).
+# - EXECUTED: Already executed. Safe to skip (do not run twice).
 LEASE_ACQUIRED = "acquired"
 LEASE_WAIT = "wait"
 LEASE_EXECUTED = "executed"
 
-# リース既定 TTL (秒)。不可逆 action 1 回の実行に十分長い値にする (短すぎると勝者の
-# 実行中にリースが失効し別プロセスが奪取して二重実行になりうる)。HumanGate /
-# run_gated_loop で上書き可能。
+# Default lease TTL (seconds). Keep it long enough for one irreversible action; if it
+# is too short, the lease can expire while the winner is still running and another
+# process can take it, causing double execution. HumanGate / run_gated_loop can
+# override this.
 DEFAULT_LEASE_TTL = 30.0
 
 DbSource = Union[str, "os.PathLike[str]", sqlite3.Connection]
 
 
 def connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
-    """loop 用 state DB を開き (無ければ作り)、スキーマを適用して返す。
+    """Open the loop state DB, creating it if needed, apply the schema, and return it.
 
-    ``path`` には通常のファイルパスか ``":memory:"`` を渡す。詳細は
-    :func:`_init_connection` 参照 (スキーマ適用 + PRAGMA + row_factory)。
+    ``path`` may be a regular file path or ``":memory:"``. See
+    :func:`_init_connection` for details (schema application + PRAGMA + row_factory).
     """
     return _init_connection(sqlite3.connect(str(path)))
 
 
 def _init_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
-    """接続にスキーマと PRAGMA を適用して返す (冪等)。
+    """Apply schema and PRAGMAs to a connection and return it (idempotent).
 
-    :func:`connect` と :class:`LoopStore` の両方から呼ばれる。後者は素の
-    ``sqlite3.connect()`` で開いた借用接続を渡されても動くよう **防御的に** これを
-    呼ぶ (org の StateWriter と同じ方針)。``IF NOT EXISTS`` のスキーマと冪等な PRAGMA
-    なので、初期化済みの接続に再適用しても安全。
+    Called by both :func:`connect` and :class:`LoopStore`. The latter calls this
+    **defensively** so it still works when given a borrowed connection opened by
+    plain ``sqlite3.connect()`` (same policy as org's StateWriter). The schema uses
+    ``IF NOT EXISTS`` and the PRAGMAs are idempotent, so reapplying this to an
+    initialized connection is safe.
 
-    - ``isolation_level = None`` (autocommit): トランザクションは
-      :meth:`LoopStore.transaction` の明示的な ``BEGIN`` / ``COMMIT`` で完全制御する
-      (sqlite3 既定の暗黙トランザクションに依存しない StateWriter 風の制御)。
-    - ``row_factory = sqlite3.Row``: 読み出しを列名アクセスにする。
-    - ``foreign_keys = ON``: ``run`` 削除時に子行を CASCADE するため必須。
-    - ``busy_timeout``: 並行アクセス時のロック待ち。
-    - ``journal_mode = WAL``: writer と reader が衝突しにくくなる (file DB のみ有効。
-      ``:memory:`` では無視される)。
+    - ``isolation_level = None`` (autocommit): transactions are fully controlled
+      by explicit ``BEGIN`` / ``COMMIT`` in :meth:`LoopStore.transaction`
+      (StateWriter-style control that does not rely on sqlite3's default implicit
+      transactions).
+    - ``row_factory = sqlite3.Row``: allow reads by column name.
+    - ``foreign_keys = ON``: required to CASCADE child rows when deleting ``run``.
+    - ``busy_timeout``: wait for locks during concurrent access.
+    - ``journal_mode = WAL``: reduces writer/reader conflicts (file DBs only;
+      ignored for ``:memory:``).
     """
     conn.isolation_level = None
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
-    # fresh DB は新スキーマで作られる。既存 DB は古いテーブルが残るので、リース列と
-    # executing status を非破壊に追加する移行を実スキーマ検査で冪等に行う。FK の toggle が
-    # 絡むため foreign_keys を立てる *前* に実施する。
+    # Fresh DBs are created with the new schema. Existing DBs keep old tables, so
+    # idempotently migrate by inspecting the actual schema and adding lease columns
+    # plus executing status non-destructively. Do this *before* enabling foreign_keys
+    # because the migration toggles FKs.
     conn.executescript(SCHEMA)
     _migrate_schema(conn)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -237,25 +261,28 @@ def _init_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """既存 DB の ``pending_decision`` を v2 (リース) スキーマへ非破壊に移行する (冪等)。
+    """Migrate existing ``pending_decision`` tables to the v2 lease schema safely.
 
-    v1 で作られた ``pending_decision`` は ``executing`` を許さない status CHECK で、
-    ``lease_owner`` / ``lease_expires_at`` 列を持たない。SQLite は ``ALTER TABLE`` で
-    CHECK を変更できないため、新定義のテーブルを作って行をコピーし差し替える
-    (SQLite 公式の table 再構築手順)。``connect`` 毎に呼ばれるので、実テーブル定義を
-    検査して **既に新スキーマなら何もしない** (fresh DB / 移行済み DB では no-op)。
+    A ``pending_decision`` created by v1 has a status CHECK that does not allow
+    ``executing`` and lacks ``lease_owner`` / ``lease_expires_at`` columns. SQLite
+    cannot change CHECK constraints with ``ALTER TABLE``, so create a table with the
+    new definition, copy rows, and swap it in (SQLite's official table-rebuild
+    procedure). Because this runs on every ``connect``, it inspects the actual table
+    definition and **does nothing if the new schema is already present** (no-op for
+    fresh or already migrated DBs).
 
-    再構築は ``foreign_keys`` を一時的に OFF にし、単一トランザクションで原子的に行う
-    (途中失敗で半端なテーブルを残さない)。``pending_decision`` を参照する子テーブルは
-    無いので、参照側の張り直しは不要。
+    The rebuild temporarily disables ``foreign_keys`` and runs atomically in a
+    single transaction (so partial tables are not left on failure). No child table
+    references ``pending_decision``, so references do not need to be rewired.
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='pending_decision'"
     ).fetchone()
     if row is None or row["sql"] is None:
-        return  # まだテーブルが無い (理論上 executescript 後は来ない)。
+        return  # Table does not exist yet (theoretically unreachable after executescript).
     table_sql = row["sql"]
-    # 新スキーマの目印 (executing status と lease 列) が両方あれば移行済み。
+    # If both markers of the new schema (executing status and lease column) exist,
+    # migration is already complete.
     if "'executing'" in table_sql and "lease_owner" in table_sql:
         return
     mig_ddl = _PENDING_TABLE_DDL.replace(
@@ -265,16 +292,18 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = OFF")
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # 万一前回の中断で一時テーブルが残っていても再構築をやり直せるよう先に落とす
-        # (CREATE は IF NOT EXISTS でないので、残存すると connect が恒久的に失敗するため)。
-        # DROP/CREATE/INSERT/DROP/RENAME は全てこの単一トランザクション内で atomic に確定する
-        # (SQLite の DDL はトランザクショナル)。途中クラッシュは次回 open で丸ごと rollback され、
-        # 旧 pending_decision がそのまま残るので再試行できる (中間状態でデータ欠落しない)。
+        # Drop a leftover temp table first so a rebuild can retry after a previous
+        # interruption (CREATE is not IF NOT EXISTS, so a leftover would make connect
+        # fail permanently). DROP/CREATE/INSERT/DROP/RENAME all commit atomically
+        # inside this single transaction (SQLite DDL is transactional). A mid-flight
+        # crash rolls the whole thing back on the next open, leaving the old
+        # pending_decision intact for retry (no data loss in an intermediate state).
         conn.execute("DROP TABLE IF EXISTS pending_decision_mig")
-        # executescript は暗黙 COMMIT で手動トランザクションを壊すため execute を使う
-        # (mig_ddl / index はいずれも単一ステートメント)。
+        # Use execute because executescript would break the manual transaction with
+        # an implicit COMMIT (mig_ddl / index are each single statements).
         conn.execute(mig_ddl)
-        # 旧テーブルの全列を明示コピー (新規のリース 2 列は default NULL のまま)。
+        # Explicitly copy every old-table column (the two new lease columns keep the
+        # default NULL).
         conn.execute(
             "INSERT INTO pending_decision_mig "
             "(id, run_id, gate_key, status, decision, action, payload, "
@@ -295,16 +324,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
 
 def _finite_safe(value: Any) -> Any:
-    """``_to_jsonable`` 済みの構造から非有限 float (NaN/Infinity) を ``repr`` に落とす。
+    """Convert non-finite floats (NaN/Infinity) in ``_to_jsonable`` output to ``repr``.
 
-    非有限 float は JSON の *型* としては有効だが、``json.dumps`` の既定 (allow_nan=True)
-    では ``NaN`` / ``Infinity`` といった **JSON として不正なトークン** を吐く。これは
-    SQLite の ``json_valid()`` を 0 にし、``step.observation`` / ``event.payload`` の
-    CHECK 制約に弾かれて (IntegrityError) その step の永続化ごと巻き戻してしまう
-    (「1 つの変な observation が永続化全体を壊さない」という契約に反する)。``json.dumps``
-    が見る前に ``repr`` 文字列 ('nan' / 'inf' / '-inf') へ置換して strictly-valid JSON
-    だけを保存する。入力は ``_to_jsonable`` 後 (None/bool/int/float/str/list/dict のみ)
-    を想定して再帰する。
+    Non-finite floats are valid as a JSON *type*, but the default ``json.dumps``
+    behavior (allow_nan=True) emits **invalid JSON tokens** such as ``NaN`` /
+    ``Infinity``. That makes SQLite ``json_valid()`` return 0, trips the
+    ``step.observation`` / ``event.payload`` CHECK constraints (IntegrityError), and
+    rolls back persistence for the whole step (violating the contract that one odd
+    observation should not break all persistence). Replace them with ``repr`` strings
+    ('nan' / 'inf' / '-inf') before ``json.dumps`` sees them, so only strictly valid
+    JSON is saved. Recurses assuming input has already passed through ``_to_jsonable``
+    (only None/bool/int/float/str/list/dict).
     """
     if isinstance(value, float) and not math.isfinite(value):
         return repr(value)
@@ -316,12 +346,12 @@ def _finite_safe(value: Any) -> Any:
 
 
 def _encode_observation(observation: Any) -> str:
-    """observation を *strictly-valid* な JSON 文字列に符号化する。
+    """Encode an observation as a *strictly valid* JSON string.
 
-    :func:`loop_agent.progress._to_jsonable` で JSON 非ネイティブ値を ``repr`` に
-    落とし、:func:`_finite_safe` で非有限 float も ``repr`` 化してから ``json.dumps``
-    する (``allow_nan=False`` で取りこぼしを防ぐ)。1 つの変な observation が永続化
-    全体を壊さない (json_valid CHECK 違反を起こさない)。
+    :func:`loop_agent.progress._to_jsonable` converts non-JSON-native values to
+    ``repr``, then :func:`_finite_safe` also converts non-finite floats to ``repr``
+    before ``json.dumps`` (``allow_nan=False`` prevents misses). One odd observation
+    should not break all persistence (no json_valid CHECK violation).
     """
     return json.dumps(
         _finite_safe(_to_jsonable(observation)),
@@ -332,14 +362,16 @@ def _encode_observation(observation: Any) -> str:
 
 
 def _require_json_native(value: Any, what: str) -> str:
-    """``value`` を JSON 符号化して返すが、**round-trip lossless** でなければ弾く。
+    """JSON-encode ``value`` but reject it unless the round trip is lossless.
 
-    :func:`_encode_observation` は observation の best-effort 永続化のため非 JSON
-    ネイティブ値 (任意オブジェクト / tuple / NaN 等) を ``repr`` 等へ潰すが、人間ゲートの
-    **実行される / 同一性比較される** 値 (gated action・edit の置換 action) でそれを許すと、
-    ``(1, 2)`` が ``[1, 2]`` に化けて別 action と誤一致したり、オブジェクトが ``'<x>'`` 文字列
-    として実行される事故になる。符号化→復号して元と一致しない (= 欠損する) 値は、その場で
-    ``ConfigError`` で loud に弾く (safety-sensitive な値は fidelity を厳格化する)。
+    :func:`_encode_observation` collapses non-JSON-native values (arbitrary objects /
+    tuples / NaN, etc.) to ``repr`` or similar for best-effort observation
+    persistence. Allowing that for values that human gates **execute / compare for
+    identity** (gated action and edit replacement action) can make ``(1, 2)`` become
+    ``[1, 2]`` and falsely match a different action, or execute an object as a
+    ``'<x>'`` string. Values that do not match after encode->decode (= lose
+    fidelity) are rejected loudly with ``ConfigError`` on the spot (safety-sensitive
+    values require stricter fidelity).
     """
     encoded = _encode_observation(value)
     if json.loads(encoded) != value:
@@ -352,40 +384,42 @@ def _require_json_native(value: Any, what: str) -> str:
 
 
 class LoopStore:
-    """接続に束ねた loop 状態の writer/reader。StateWriter 風の明示的 transaction。
+    """Connection-bound loop-state writer/reader with StateWriter-style transactions.
 
-    ``conn`` は :func:`connect` が返した接続でも、素の ``sqlite3.connect()`` で開いた
-    借用接続でもよい。後者でも動くよう、生成時に :func:`_init_connection` を防御的に
-    呼んでスキーマ + PRAGMA + row_factory を (冪等に) 適用する (org の StateWriter と
-    同じ方針)。すべての書き込みは :meth:`transaction` 配下で atomic に行う。
+    ``conn`` may be a connection returned by :func:`connect` or a borrowed
+    connection opened with plain ``sqlite3.connect()``. To support the latter, the
+    constructor defensively calls :func:`_init_connection` and idempotently applies
+    the schema + PRAGMAs + row_factory (same policy as org's StateWriter). All writes
+    happen atomically under :meth:`transaction`.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
         _init_connection(conn)
 
-    # -- transaction 制御 ----------------------------------------------------
+    # -- transaction control ------------------------------------------------
 
     @contextmanager
     def transaction(self) -> Iterator["LoopStore"]:
-        """``BEGIN IMMEDIATE`` -> yield -> ``COMMIT`` (例外時 ``ROLLBACK`` して再送出)。
+        """``BEGIN IMMEDIATE`` -> yield -> ``COMMIT`` (``ROLLBACK`` and re-raise on error).
 
-        既に外側のトランザクション内なら新たに ``BEGIN`` せずそれに *参加* する
-        (sqlite はネストした ``BEGIN`` を ``OperationalError`` にするため)。これにより
-        :meth:`record_step` 等を呼び出し側の ``transaction()`` でさらに束ねて、複数 step
-        を 1 つの atomic 単位にできる。参加した内側ブロックは commit/rollback せず、
-        最終的な確定/巻き戻しは最外の ``transaction()`` に委ねる。
+        If already inside an outer transaction, *join* it instead of issuing a new
+        ``BEGIN`` (sqlite raises ``OperationalError`` for nested ``BEGIN``). This
+        allows callers to further group :meth:`record_step` and similar calls inside
+        their own ``transaction()`` so multiple steps form one atomic unit. Joined
+        inner blocks do not commit/rollback; final commit/rollback is delegated to
+        the outermost ``transaction()``.
 
-        ``BEGIN IMMEDIATE`` で *最初から書き込みロック* を取る。:meth:`load_or_init`
-        は SELECT してから INSERT する write-after-read のため、既定の DEFERRED
-        ``BEGIN`` だと WAL 下で read→write 昇格時に ``SQLITE_BUSY_SNAPSHOT``
-        (``database is locked``) を起こしうる。これは ``busy_timeout`` で待っても解消
-        できず即エラーになる (cross-process resume #14 で顕在化)。本クラスの
-        ``transaction()`` は全て書き込み目的なので、IMMEDIATE で昇格を回避し
-        ``busy_timeout`` のロック待ちが実際に効くようにする。
+        ``BEGIN IMMEDIATE`` takes the write lock *from the start*. :meth:`load_or_init`
+        does write-after-read by selecting and then inserting, so the default DEFERRED
+        ``BEGIN`` can hit ``SQLITE_BUSY_SNAPSHOT`` (``database is locked``) when
+        promoting read->write under WAL. ``busy_timeout`` cannot wait this out; it
+        fails immediately (surfaced by cross-process resume #14). Every
+        ``transaction()`` in this class is for writes, so IMMEDIATE avoids promotion
+        and makes ``busy_timeout`` lock waiting actually apply.
         """
         if self.conn.in_transaction:
-            # 外側トランザクションに参加。確定/巻き戻しは最外に委ねる。
+            # Join the outer transaction. Commit/rollback is left to the outermost one.
             yield self
             return
         self.conn.execute("BEGIN IMMEDIATE")
@@ -397,14 +431,15 @@ class LoopStore:
         else:
             self.conn.commit()
 
-    # -- 内部ヘルパ ----------------------------------------------------------
+    # -- internal helpers ---------------------------------------------------
 
     def _append_event(
         self, run_id: str, kind: str, payload: Optional[dict[str, Any]] = None
     ) -> None:
-        """journal に 1 event を追記する (append-only)。"""
-        # observation と同じく非有限 float を repr 化し、event.payload の json_valid
-        # CHECK 違反を防ぐ (現状の payload は有限値のみだが防御的に揃える)。
+        """Append one event to the journal (append-only)."""
+        # As with observations, convert non-finite floats to repr to avoid
+        # event.payload json_valid CHECK violations (current payloads are finite, but
+        # keep this defensive behavior consistent).
         payload_json = json.dumps(
             _finite_safe(_to_jsonable(payload or {})),
             ensure_ascii=False,
@@ -418,7 +453,7 @@ class LoopStore:
         )
 
     def _bump_run(self, run_id: str, state: LoopState) -> None:
-        """run 行の集計を現在の :class:`LoopState` に合わせて更新する。"""
+        """Update the run row aggregates to match the current :class:`LoopState`."""
         self.conn.execute(
             "UPDATE run SET iterations = ?, tokens_used = ?, elapsed = ?, "
             "goal_met = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
@@ -432,26 +467,27 @@ class LoopStore:
             ),
         )
 
-    # -- run ライフサイクル --------------------------------------------------
+    # -- run lifecycle ------------------------------------------------------
 
     def load_or_init(self, run_id: str) -> LoopState:
-        """``run_id`` の run 行を確保し、その時点の :class:`LoopState` を返す。
+        """Ensure the run row for ``run_id`` exists and return the current state.
 
-        - 新規 ``run_id``: ``run`` 行を ``status='running'`` で作成し ``loop_begin``
-          event を 1 件記録。空の :class:`LoopState` (全カウンタ 0) を返す。
-        - 既存 ``run_id``: 永続化済みの ``step`` 行から :class:`LoopState` を *復元* して
-          返す (history・iteration・tokens_used・elapsed・goal_met)。これを
-          ``run_loop(initial_state=...)`` に渡すと中断地点から **resume** できる (#14)。
+        - New ``run_id``: create a ``run`` row with ``status='running'``, record one
+          ``loop_begin`` event, and return an empty :class:`LoopState` (all counters 0).
+        - Existing ``run_id``: *restore* and return :class:`LoopState` from persisted
+          ``step`` rows (history, iteration, tokens_used, elapsed, goal_met). Passing
+          this to ``run_loop(initial_state=...)`` can **resume** from the interruption
+          point (#14).
 
-        作成/復元は 1 トランザクションで atomic に行う。
+        Creation/restoration is atomic in one transaction.
 
-        復元される ``history`` の ``observation`` は保存時の JSON を round-trip した値
-        である (:func:`loop_agent.progress._to_jsonable` が tuple->list / 非 JSON
-        ネイティブ型 ->repr 文字列 / dict キー ->str に coerce する)。よって
-        observation を直接 *キー* にする state ベース条件 (特に
-        :class:`~loop_agent.conditions.NoProgress` の既定 key) は、JSON 安定な
-        observation 型で使うか、JSON 安定な signature へ射影する ``key`` を渡すこと
-        (詳細は :func:`loop_agent.loop.run_loop` の ``initial_state`` 参照)。
+        The restored ``history`` ``observation`` values are JSON round-tripped from
+        their saved form (:func:`loop_agent.progress._to_jsonable` coerces tuple->list,
+        non-JSON-native type -> repr string, and dict key -> str). Therefore,
+        state-based conditions that use observations directly as *keys* (especially
+        the default key for :class:`~loop_agent.conditions.NoProgress`) should use
+        JSON-stable observation types or pass a ``key`` that projects to a JSON-stable
+        signature (see ``initial_state`` in :func:`loop_agent.loop.run_loop` for details).
         """
         if not run_id:
             raise ConfigError("load_or_init: run_id must be a non-empty string")
@@ -469,10 +505,11 @@ class LoopStore:
             return self._reconstruct_state(run_id)
 
     def _reconstruct_state(self, run_id: str) -> LoopState:
-        """永続化済み ``step`` 行から :class:`LoopState` を組み立てる (resume の復元)。
+        """Build :class:`LoopState` from persisted ``step`` rows (resume restoration).
 
-        iteration / tokens_used / elapsed / goal_met は run 行の集計を正本にし、
-        ``history`` は step 行を反復順に :class:`StepRecord` へ復元する。
+        iteration / tokens_used / elapsed / goal_met use the run-row aggregates as
+        authoritative; ``history`` is restored from step rows in iteration order as
+        :class:`StepRecord` instances.
         """
         run = self.conn.execute(
             "SELECT iterations, tokens_used, elapsed, goal_met FROM run "
@@ -505,23 +542,26 @@ class LoopStore:
             history=history,
         )
 
-    # -- per-step 永続化 -----------------------------------------------------
+    # -- per-step persistence -----------------------------------------------
 
     def record_step(
         self, run_id: str, record: StepRecord, state: LoopState
     ) -> None:
-        """完了した 1 反復を atomic に永続化する (run_loop の ``StepHook`` 互換)。
+        """Persist one completed iteration atomically (compatible with run_loop ``StepHook``).
 
-        1 トランザクションで「step 行の upsert + run 集計の更新 + ``loop_step``
-        event の追記」を束ねる。``UNIQUE(run_id, iteration)`` 衝突時は ``DO UPDATE``
-        で上書きするので、同一反復の再実行 (resume #14) に冪等。
+        One transaction groups "step-row upsert + run aggregate update + ``loop_step``
+        event append". ``UNIQUE(run_id, iteration)`` conflicts are overwritten with
+        ``DO UPDATE``, making re-execution of the same iteration idempotent
+        (resume #14).
 
-        ``loop_step`` event は **新規 insert か、再永続化で内容が変わったときだけ**
-        追記する。同一反復をまったく同じ内容で再永続化する純粋な replay (resume) では
-        step 行も event も実質変わらないので event を重ねない。一方、同一反復を*別の
-        結果*で書き直した場合は、その新しい内容を持つ event を 1 件追記する。これにより
-        append-only な journal は「同一内容の replay でノイズを増やさず」「最新 event が
-        step SoT と矛盾しない (最後の event = 現在の step 行)」の両方を満たす。
+        A ``loop_step`` event is appended **only for a new insert or when
+        re-persistence changes the content**. A pure replay (resume) that persists the
+        exact same content for the same iteration does not materially change the step
+        row or event, so it does not add another event. If the same iteration is
+        rewritten with a *different result*, one event with the new content is
+        appended. This lets the append-only journal both "avoid noise on identical
+        replays" and "keep the latest event consistent with the step SoT (last event =
+        current step row)".
         """
         obs_json = _encode_observation(record.observation)
         goal_int = int(bool(record.goal_met))
@@ -531,7 +571,7 @@ class LoopStore:
                 "observation FROM step WHERE run_id = ? AND iteration = ?",
                 (run_id, record.iteration),
             ).fetchone()
-            # 新規、または既存と内容が 1 つでも異なるなら event を追記する。
+            # Append an event for a new row, or when any content differs from existing.
             changed = existing is None or (
                 existing["tokens"] != record.tokens
                 or existing["tokens_used"] != state.tokens_used
@@ -579,17 +619,18 @@ class LoopStore:
                 )
 
     def record_result(self, run_id: str, result: "LoopResult") -> None:
-        """ループ終了時の最終ステータスを atomic に確定する。
+        """Atomically finalize the loop status at loop end.
 
-        1 トランザクションで「``stop_reason`` 行の upsert + run 行の終了状態更新
-        (status / ended_at と最終集計) + ``loop_end`` event の追記」を束ねる。
-        ``stop_reason`` は run と 1:1 で、再実行に冪等 (``DO UPDATE``)。
+        One transaction groups "``stop_reason`` row upsert + run-row end-state update
+        (status / ended_at and final aggregates) + ``loop_end`` event append".
+        ``stop_reason`` is 1:1 with run and idempotent on re-execution (``DO UPDATE``).
 
-        ``status == "paused"`` (人間ゲートでの中断) は **終端ではない**: run は
-        ``running`` のまま残し、``stop_reason`` も書かない (resume で続行できる)。
-        集計だけ更新し、pause を ``loop_gate`` event として journal に残す。これにより
-        ``DBProgressLog.record_result`` を pause した結果にそのまま渡してもよい
-        (CHECK 制約違反でクラッシュさせない)。
+        ``status == "paused"`` (interrupted by a human gate) is **not terminal**: the
+        run remains ``running`` and ``stop_reason`` is not written (resume can
+        continue). Only aggregates are updated, and the pause is recorded in the
+        journal as a ``loop_gate`` event. This allows paused results to be passed
+        directly to ``DBProgressLog.record_result`` (without crashing on CHECK
+        constraint violations).
         """
         if result.status == "paused":
             gate_key = (
@@ -643,19 +684,19 @@ class LoopStore:
                 },
             )
 
-    # -- 読み出し ------------------------------------------------------------
+    # -- reads --------------------------------------------------------------
 
     def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
-        """run 行を dict で返す (無ければ ``None``)。"""
+        """Return the run row as a dict, or ``None`` if it does not exist."""
         row = self.conn.execute(
             "SELECT * FROM run WHERE run_id = ?", (run_id,)
         ).fetchone()
         return dict(row) if row is not None else None
 
     def read_steps(self, run_id: str) -> list[dict[str, Any]]:
-        """``run_id`` の step 行を反復順に dict のリストで返す。
+        """Return ``run_id`` step rows as a list of dicts in iteration order.
 
-        ``observation`` は保存時の JSON から復号して返す。
+        ``observation`` is decoded from the stored JSON.
         """
         rows = self.conn.execute(
             "SELECT * FROM step WHERE run_id = ? ORDER BY iteration", (run_id,)
@@ -671,9 +712,9 @@ class LoopStore:
         return steps
 
     def read_events(self, run_id: str) -> list[dict[str, Any]]:
-        """``run_id`` の event を発生順 (id 昇順) に dict のリストで返す。
+        """Return ``run_id`` events as a list of dicts in occurrence order (ascending id).
 
-        ``payload`` は JSON から復号して返す。
+        ``payload`` is decoded from JSON.
         """
         rows = self.conn.execute(
             "SELECT * FROM event WHERE run_id = ? ORDER BY id", (run_id,)
@@ -686,17 +727,17 @@ class LoopStore:
         return events
 
     def get_stop_reason(self, run_id: str) -> Optional[dict[str, Any]]:
-        """stop_reason 行を dict で返す (未終了なら ``None``)。"""
+        """Return the stop_reason row as a dict, or ``None`` if not finished."""
         row = self.conn.execute(
             "SELECT * FROM stop_reason WHERE run_id = ?", (run_id,)
         ).fetchone()
         return dict(row) if row is not None else None
 
-    # -- 限定人間ゲート (pending_decision) -----------------------------------
+    # -- limited human gate (pending_decision) ------------------------------
 
     @staticmethod
     def _decode_decision(row: sqlite3.Row) -> dict[str, Any]:
-        """pending_decision 行を dict に復号する (action / payload を JSON から戻す)。"""
+        """Decode a pending_decision row to a dict (restore action / payload from JSON)."""
         d = dict(row)
         d["action"] = json.loads(d["action"]) if d["action"] is not None else None
         d["payload"] = json.loads(d["payload"]) if d["payload"] is not None else None
@@ -705,21 +746,24 @@ class LoopStore:
     def request_decision(
         self, run_id: str, gate_key: str, action: Any
     ) -> dict[str, Any]:
-        """不可逆 action の人間ゲートを ``pending`` で登録する (冪等)。
+        """Register a human gate for an irreversible action as ``pending`` (idempotent).
 
-        org の ``pending_decisions.append`` に対応 (role 読み替え)。同一
-        ``(run_id, gate_key)`` に既存行があれば **上書きせず** そのまま返す。これにより
-        pause 後の resume で同じ action を再評価しても、既に下した決定 (resolved) や
-        登録済みの pending を壊さない (= 人間に二重に問わない)。新規登録時のみ
-        ``loop_gate`` event を 1 件追記する。
+        Corresponds to org's ``pending_decisions.append`` (with roles remapped). If a
+        row already exists for the same ``(run_id, gate_key)``, return it **without
+        overwriting**. This keeps a post-pause resume that reevaluates the same action
+        from destroying an already made decision (resolved) or registered pending
+        request (= do not ask the human twice). A ``loop_gate`` event is appended only
+        for a new registration.
 
-        ``action`` は **JSON ネイティブ (round-trip lossless)** を要求する。gated action は
-        resume 時に同一性比較 (誤適用防止) の基準になり、欠損符号化を許すと別 action と
-        誤一致しうるため (:func:`_require_json_native` 参照)。
+        ``action`` must be **JSON-native (round-trip lossless)**. The gated action is
+        used as the identity-comparison basis during resume (to prevent misapplication),
+        and lossy encoding could falsely match a different action (see
+        :func:`_require_json_native`).
 
-        **この呼び出しが新規 INSERT したか** を知りたい場合 (= 並行登録レースで「先に
-        登録した 1 者」だけが副作用 — 通知等 — を起こしたいとき) は
-        :meth:`register_decision` を使うこと。本メソッドは権威ある現在行のみ返す。
+        Use :meth:`register_decision` if callers need to know **whether this call
+        inserted a new row** (= in concurrent registration races, only the first
+        registrant should cause side effects such as notifications). This method only
+        returns the authoritative current row.
         """
         row, _created = self.register_decision(run_id, gate_key, action)
         return row
@@ -727,15 +771,17 @@ class LoopStore:
     def register_decision(
         self, run_id: str, gate_key: str, action: Any
     ) -> tuple[dict[str, Any], bool]:
-        """:meth:`request_decision` と同じ登録を行い ``(現在行, 新規 INSERT したか)`` を返す。
+        """Register like :meth:`request_decision` and return ``(current row, created)``.
 
-        ``created`` は **この呼び出しが pending を INSERT したとき** のみ ``True``。既存行
-        (別プロセスが先に登録済み or 自分の前 run で登録済み) を読んだときは ``False`` で、
-        その行をそのまま返す。これにより、``get_decision`` で ``None`` を見た後の TOCTOU
-        レースで敗者が ``request_decision`` から相手の行を受け取ったケースでも、
-        ``created=False`` を見て **承認通知を二重に発火しない** ように呼び出し側が判定できる
-        (:meth:`loop_agent.gate.HumanGate._notify_new_request` の発火条件)。INSERT は
-        transaction 内の single-winner なので、並行登録でも ``created=True`` は厳密に 1 者。
+        ``created`` is ``True`` only when **this call inserted the pending row**.
+        Reading an existing row (registered earlier by another process or a previous
+        run by this process) returns ``False`` and the row unchanged. This lets callers
+        avoid **triggering approval notifications twice** when a loser in a TOCTOU race
+        sees ``None`` from ``get_decision`` but then receives the winner's row from
+        ``request_decision`` and observes ``created=False`` (the trigger condition for
+        :meth:`loop_agent.gate.HumanGate._notify_new_request`). INSERT is a
+        single-winner operation inside the transaction, so exactly one concurrent
+        registrant can observe ``created=True``.
         """
         if not gate_key:
             raise ConfigError("request_decision: gate_key must be a non-empty string")
@@ -770,20 +816,22 @@ class LoopStore:
         decision: str,
         payload: Any = None,
     ) -> dict[str, Any]:
-        """``pending`` の決定を人間の選択で ``resolved`` に確定する。
+        """Resolve a ``pending`` decision to ``resolved`` with the human's choice.
 
-        org の ``pending_decisions.resolve`` に対応。``decision`` は
-        :data:`DECISION_KINDS` の 4 種。``payload`` は ``edit`` の置換 action や
-        ``respond`` の応答メッセージを載せる (JSON 符号化)。``pending`` 行のみ遷移可能で、
-        既に ``resolved`` 済みなら ``StateError`` (terminal: 一度下した決定は再決定しない)。
-        確定時に ``loop_gate`` event を 1 件追記する。
+        Corresponds to org's ``pending_decisions.resolve``. ``decision`` is one of
+        the four :data:`DECISION_KINDS`. ``payload`` carries the replacement action
+        for ``edit`` or the response message for ``respond`` (JSON-encoded). Only
+        ``pending`` rows can transition; already ``resolved`` rows raise
+        ``StateError`` (terminal: a decision made once is not decided again). One
+        ``loop_gate`` event is appended on resolution.
 
-        ``edit`` の ``payload`` は **JSON ネイティブ (round-trip lossless)** を要求する。
-        この payload は resume 時に store から復元されて *実行される action* になるため、
-        非 JSON ネイティブ値 (任意オブジェクト / tuple / NaN 等) を許すと repr 文字列へ
-        潰れて *別の action を実行* する事故になる。記録時点で round-trip 検査し、欠損する
-        なら loud に弾く (observation は best-effort な journal なので潰すが、実行される
-        edit は厳格にする方針)。
+        ``edit`` ``payload`` must be **JSON-native (round-trip lossless)**. This
+        payload is restored from the store during resume and becomes the *action to
+        execute*, so allowing non-JSON-native values (arbitrary objects / tuples / NaN,
+        etc.) could collapse them to repr strings and accidentally *execute a different
+        action*. Check round-trip fidelity at record time and reject loudly on loss
+        (observations are a best-effort journal and may be collapsed, but executable
+        edits are intentionally strict).
         """
         if decision not in DECISION_KINDS:
             raise ConfigError(
@@ -792,10 +840,12 @@ class LoopStore:
         if payload is None:
             payload_json = None
         elif decision == "edit":
-            # edit の置換 action は resume で復元され *実行される* ので JSON ネイティブ厳守。
+            # edit replacement actions are restored on resume and *executed*, so they
+            # must remain JSON-native.
             payload_json = _require_json_native(payload, "edit payload")
         else:
-            # respond 等のメッセージは best-effort (実行されないので従来どおり符号化)。
+            # Messages such as respond are best-effort (not executed, so keep legacy
+            # encoding behavior).
             payload_json = _encode_observation(payload)
         with self.transaction():
             existing = self.conn.execute(
@@ -828,32 +878,36 @@ class LoopStore:
             return self._decode_decision(row)
 
     def claim_execution(self, run_id: str, gate_key: str) -> bool:
-        """approve/edit の不可逆 action の実行権を **single-winner** で主張する。
+        """Claim execution rights for an irreversible approve/edit action.
 
-        ``resolved`` -> ``executed`` への遷移を ``status = 'resolved'`` を条件にした
-        条件付き UPDATE で行い、**この呼び出しが遷移させられたときだけ** ``True`` を返す。
-        既に ``executed`` (= 別プロセス / 別 resume が先に実行を主張済み) なら ``False``
-        を返す — 敗者は実行してはならない (呼び出し側は skip する)。``pending`` (未解決) /
-        不在 / 非実行系の決定 (``reject`` / ``respond``) は ``StateError`` (これらは
-        action を実行しないので executed へ遷移させない)。
+        Transition ``resolved`` -> ``executed`` with a conditional UPDATE constrained
+        by ``status = 'resolved'`` and return ``True`` **only if this call performed
+        the transition**. If already ``executed`` (= another process / resume already
+        claimed execution first), return ``False``; the loser must not execute (caller
+        skips). ``pending`` (unresolved) / missing / non-executing decisions
+        (``reject`` / ``respond``) raise ``StateError`` because they do not execute an
+        action and should not transition to executed.
 
-        replay resume (fresh state で iteration 0 から再生する経路) では実行済みゲートを
-        再訪するため、実行に踏み切る *前* に実行権を主張する (at-most-once: 途中失敗時も
-        再実行しない方が不可逆操作には安全)。``transaction()`` = ``BEGIN IMMEDIATE`` で
-        writer を直列化するので、同一ゲートを並行 resume しても resolved->executed の
-        遷移に成功するのは 1 者だけ (= 不可逆 action の exactly-once 実行を担保)。
+        Replay resume (the path that replays from iteration 0 with fresh state)
+        revisits executed gates, so execution rights are claimed *before* actually
+        executing (at-most-once: for irreversible operations, not retrying after a
+        mid-flight failure is safer). ``transaction()`` = ``BEGIN IMMEDIATE``
+        serializes writers, so even if the same gate is resumed concurrently, only one
+        process succeeds at resolved->executed (= guarantees exactly-once execution of
+        the irreversible action).
 
-        これは ``act`` を **同期的に・即時** 実行する単一プロセス向けの at-most-once
-        プリミティブで、resolved->executed を 1 手で確定する (executing を経ない)。
-        複数プロセスが同一 run_id を *同時に* resume する協調 (in-progress リース・
-        敗者の完了待ち・勝者クラッシュ時の取り直し) が要る場合は
-        :meth:`acquire_lease` + :meth:`complete_execution` の多段プロトコルを使う
-        (Issue #21)。1 つの gate_key はどちらか一方のプロトコルで一貫して扱うこと。
+        This is an at-most-once primitive for a single process that executes ``act``
+        **synchronously and immediately**, finalizing resolved->executed in one step
+        (without executing). If coordinating *concurrent* resume of the same run_id
+        across multiple processes is required (in-progress leases, losers waiting for
+        completion, and takeover after winner crash), use the multi-stage protocol
+        :meth:`acquire_lease` + :meth:`complete_execution` (Issue #21). A given
+        gate_key must be handled consistently by one protocol or the other.
         """
         with self.transaction():
-            # 実行を伴うのは approve/edit のみ。reject/respond は「実行しない」決定なので
-            # executed へ遷移させない (誤って遷移させると後続 resume が却下/応答の記録を
-            # skip して gate 状態・監査証跡を壊す)。
+            # Only approve/edit involve execution. reject/respond are "do not execute"
+            # decisions and must not transition to executed (doing so would make later
+            # resume skip the rejection/response record and corrupt gate state/audit trail).
             cur = self.conn.execute(
                 "UPDATE pending_decision SET status = 'executed', "
                 "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
@@ -862,12 +916,13 @@ class LoopStore:
                 (run_id, gate_key),
             )
             if cur.rowcount == 1:
-                # この呼び出しが resolved->executed を勝ち取った (実行してよい)。
+                # This call won resolved->executed (execution is allowed).
                 self._append_event(
                     run_id, EVENT_GATE, {"gate_key": gate_key, "status": "executed"}
                 )
                 return True
-            # 0 行: 既に executed / 未解決 / 不在 / 非実行系(reject/respond) のいずれか。
+            # 0 rows: already executed / unresolved / missing / non-executing
+            # (reject/respond).
             row = self.conn.execute(
                 "SELECT status, decision FROM pending_decision "
                 "WHERE run_id = ? AND gate_key = ?",
@@ -878,16 +933,16 @@ class LoopStore:
                     f"no decision for gate_key {gate_key!r} (run {run_id!r})"
                 )
             if row["status"] == "executed":
-                return False  # 敗者: 別の resume が先に実行済み。
+                return False  # Loser: another resume already executed first.
             if row["status"] == "pending":
                 raise StateError(f"cannot mark unresolved gate {gate_key!r} executed")
-            # status == 'resolved' だが decision が reject/respond (= 実行しない決定)。
+            # status == 'resolved' but decision is reject/respond (= do-not-execute).
             raise StateError(
                 f"gate {gate_key!r} decision {row['decision']!r} is not executable "
                 "(only approve/edit run an action)"
             )
 
-    # -- in-progress リース (Issue #21: 複数プロセス同時 resume の協調) -------
+    # -- in-progress leases (Issue #21: concurrent multi-process resume coordination) --
 
     def acquire_lease(
         self,
@@ -898,36 +953,46 @@ class LoopStore:
         now: Optional[float] = None,
         ttl: float = DEFAULT_LEASE_TTL,
     ) -> dict[str, Any]:
-        """approve/edit の不可逆 action 実行リースを **single-winner** で取得する。
+        """Acquire an execution lease for an irreversible approve/edit action.
 
-        :meth:`claim_execution` が resolved->executed を 1 手で確定するのに対し、本メソッドは
-        ``resolved -> executing -> (act 実行) -> executed`` の多段協調の前段で、``executing``
-        へ遷移してリース (``lease_owner`` / ``lease_expires_at = now + ttl``) を張る。戻り値は
+        While :meth:`claim_execution` finalizes resolved->executed in one step, this
+        method is the first stage of multi-step coordination:
+        ``resolved -> executing -> (act execution) -> executed``. It transitions to
+        ``executing`` and sets a lease (``lease_owner`` /
+        ``lease_expires_at = now + ttl``). The return value is
         ``{"outcome": ..., "owner": ..., "expires_at": ..., "took_over": bool}``:
 
-        - :data:`LEASE_ACQUIRED`: リースを取得した。呼び出し側は ``act`` を実行し、完了後に
-          :meth:`complete_execution` で ``executed`` を確定する。``took_over=True`` は
-          失効した他者リースを引き継いだ取得 (勝者クラッシュからの復旧)。
-        - :data:`LEASE_WAIT`: 別プロセスが **有効な** リースで実行中。呼び出し側は実行せず
-          ``executed`` まで待つ (敗者は pause)。これにより「勝者の不可逆 action 完了前に
-          敗者が後続 iteration を走らせる」順序ずれを防ぐ。
-        - :data:`LEASE_EXECUTED`: 既に実行完了済み。skip してよい (二重実行しない)。
+        - :data:`LEASE_ACQUIRED`: lease acquired. The caller should execute ``act``
+          and then finalize ``executed`` with :meth:`complete_execution`.
+          ``took_over=True`` means an expired lease from another process was taken
+          over (recovery after winner crash).
+        - :data:`LEASE_WAIT`: another process is running under a **valid** lease. The
+          caller does not execute and waits until ``executed`` (losers pause). This
+          prevents the ordering bug where a loser runs later iterations before the
+          winner finishes the irreversible action.
+        - :data:`LEASE_EXECUTED`: already executed. Safe to skip (do not run twice).
 
-        遷移条件:
+        Transition conditions:
 
-        - ``pending`` (未解決) / 不在 / 非実行系 (reject/respond) は ``StateError``
-          (これらは action を実行しないのでリースを張らない)。
-        - ``resolved``: ``executing`` へ遷移しリースを張る -> ACQUIRED。
-        - ``executing`` かつ自分が保持者: 再入とみなしリースを延長 -> ACQUIRED。
-        - ``executing`` かつ他者が有効保持 (``lease_expires_at > now``): WAIT。
-        - ``executing`` かつ失効 (``lease_expires_at <= now``): 保持者がクラッシュしたとみなし
-          リースを取り直す -> ACQUIRED (``took_over=True``)。失効取り直しは ``act`` を再実行
-          するので **at-least-once** になる (重複が許されない副作用は ``ttl`` を実行所要より
-          十分長くして失効取り直しを避けること。完全な exactly-once は副作用側の冪等鍵が要る)。
-        - ``executed``: EXECUTED。
+        - ``pending`` (unresolved) / missing / non-executing decisions
+          (reject/respond) raise ``StateError`` (they do not execute an action, so no
+          lease is set).
+        - ``resolved``: transition to ``executing`` and set the lease -> ACQUIRED.
+        - ``executing`` and this owner holds it: treat as reentrant and extend the
+          lease -> ACQUIRED.
+        - ``executing`` and another owner holds a valid lease
+          (``lease_expires_at > now``): WAIT.
+        - ``executing`` and expired (``lease_expires_at <= now``): assume the holder
+          crashed and reacquire the lease -> ACQUIRED (``took_over=True``). Reacquiring
+          after expiry reruns ``act``, so this is **at-least-once** (for side effects
+          that cannot tolerate duplicates, set ``ttl`` long enough to avoid takeover
+          during execution. True exactly-once also requires an idempotency key on the
+          side-effect side).
+        - ``executed``: EXECUTED.
 
-        ``transaction()`` = ``BEGIN IMMEDIATE`` が writer を直列化するので、同一ゲートを
-        並行 resume しても ``resolved->executing`` に成功するのは 1 者だけ (single winner)。
+        ``transaction()`` = ``BEGIN IMMEDIATE`` serializes writers, so even if the
+        same gate is resumed concurrently, only one process succeeds at
+        ``resolved->executing`` (single winner).
         """
         if not owner:
             raise ConfigError("acquire_lease: owner must be a non-empty string")
@@ -967,14 +1032,14 @@ class LoopStore:
                 exp = row["lease_expires_at"]
                 lease_valid = exp is not None and exp > now
                 if lease_valid and holder != owner:
-                    # 他者が有効なリースで実行中: 待て (敗者)。
+                    # Another owner is running under a valid lease: wait (loser).
                     return {
                         "outcome": LEASE_WAIT,
                         "owner": holder,
                         "expires_at": exp,
                         "took_over": False,
                     }
-                # 自分の再入 (holder == owner) か失効リースの取り直し。
+                # Reentry by this owner (holder == owner), or takeover of an expired lease.
                 took_over = holder != owner
                 self.conn.execute(
                     "UPDATE pending_decision SET lease_owner = ?, "
@@ -998,7 +1063,7 @@ class LoopStore:
                     "expires_at": expires,
                     "took_over": took_over,
                 }
-            # status == 'resolved': 初回のリース取得。
+            # status == 'resolved': first lease acquisition.
             self.conn.execute(
                 "UPDATE pending_decision SET status = 'executing', lease_owner = ?, "
                 "lease_expires_at = ? "
@@ -1023,17 +1088,20 @@ class LoopStore:
             }
 
     def complete_execution(self, run_id: str, gate_key: str, owner: str) -> bool:
-        """リース保持者が ``executing -> executed`` を確定する (``act`` 完了後に呼ぶ)。
+        """Let the lease holder finalize ``executing -> executed`` after ``act`` completes.
 
-        ``status = 'executing' AND lease_owner = owner`` を条件にした UPDATE で、**自分が
-        まだリースを保持しているときだけ** ``executed`` へ遷移させ ``True`` を返す。0 行
-        (= 既に ``executed`` / リースが失効して他者に取り直された) なら ``False`` を返す:
-        その場合 ``act`` の副作用は重複実行だった可能性がある (失効取り直しの at-least-once)。
+        An UPDATE constrained by ``status = 'executing' AND lease_owner = owner``
+        transitions to ``executed`` and returns ``True`` **only if this process still
+        holds the lease**. If 0 rows are updated (= already ``executed`` / the lease
+        expired and another owner reacquired it), return ``False``: in that case the
+        side effect of ``act`` may have been duplicated (at-least-once takeover after
+        expiry).
 
-        ``executed`` は終端で、リース列 (``lease_owner`` / ``lease_expires_at``) はクリアする
-        (以後 :meth:`acquire_lease` は EXECUTED を返す)。step 行を永続化した *後* に呼ぶことで
-        「``executed`` なら step 行は必ず存在する」を満たし、勝者クラッシュ時の step 欠落を
-        防ぐ (driver は :attr:`loop_agent.loop.GateReview.on_complete` でこの順序を保証する)。
+        ``executed`` is terminal and clears the lease columns (``lease_owner`` /
+        ``lease_expires_at``), so future :meth:`acquire_lease` calls return EXECUTED.
+        Calling this *after* persisting the step row satisfies "if ``executed``, the
+        step row always exists" and prevents missing steps after winner crash (the
+        driver guarantees this order with :attr:`loop_agent.loop.GateReview.on_complete`).
         """
         if not owner:
             raise ConfigError("complete_execution: owner must be a non-empty string")
@@ -1056,7 +1124,7 @@ class LoopStore:
             return False
 
     def get_decision(self, run_id: str, gate_key: str) -> Optional[dict[str, Any]]:
-        """``(run_id, gate_key)`` の決定行を dict で返す (無ければ ``None``)。"""
+        """Return the decision row for ``(run_id, gate_key)`` as a dict, or ``None``."""
         row = self.conn.execute(
             "SELECT * FROM pending_decision WHERE run_id = ? AND gate_key = ?",
             (run_id, gate_key),
@@ -1064,7 +1132,7 @@ class LoopStore:
         return self._decode_decision(row) if row is not None else None
 
     def list_pending_decisions(self, run_id: str) -> list[dict[str, Any]]:
-        """``run_id`` の未解決 (``pending``) 決定を登録順に返す。"""
+        """Return unresolved (``pending``) decisions for ``run_id`` in registration order."""
         rows = self.conn.execute(
             "SELECT * FROM pending_decision WHERE run_id = ? AND status = 'pending' "
             "ORDER BY id",
@@ -1074,22 +1142,25 @@ class LoopStore:
 
 
 class DBProgressLog:
-    """DB-backed の進捗記録。:class:`~loop_agent.progress.ProgressLog` の drop-in。
+    """DB-backed progress log; a drop-in for :class:`~loop_agent.progress.ProgressLog`.
 
-    ``on_step`` / ``record_result`` のシグネチャを ``ProgressLog`` と揃えてあるので、
-    ``run_loop(..., on_step=db.on_step)`` のまま観測先を JSONL から state.db SoT へ
-    差し替えられる (``on_step`` の差し替えに呼び出し側の変更は要らない。``initial_state``
-    は追加 optional 引数なので既存の配線も壊さない)。
+    ``on_step`` / ``record_result`` match ``ProgressLog`` signatures, so
+    ``run_loop(..., on_step=db.on_step)`` can switch the observation target from JSONL
+    to the state.db SoT (replacing ``on_step`` does not require caller changes).
+    ``initial_state`` is an additional optional argument, so existing wiring remains
+    compatible.
 
-    ``db`` にはファイルパス (内部で :func:`connect` し、所有権を持って :meth:`close`
-    で閉じる) か、既存の ``sqlite3.Connection`` (借用。close では閉じない) を渡せる。
-    生成時に ``load_or_init(run_id)`` を呼んで run 行と ``loop_begin`` を確保する。
+    ``db`` may be a file path (internally opened with :func:`connect`, owned here, and
+    closed by :meth:`close`) or an existing ``sqlite3.Connection`` (borrowed; not
+    closed here). Construction calls ``load_or_init(run_id)`` to ensure the run row
+    and ``loop_begin`` exist.
 
-    その復元結果は :attr:`state` に保持する。これが **resume の入口** (Issue #14):
-    新規 run なら空の :class:`LoopState`、既存 run なら永続化済み step から復元した
-    途中状態になる。``run_loop(..., initial_state=db.state, on_step=db.on_step)`` と
-    配線すれば、中断したループを状態欠落なく途中から継続できる (新規 run では
-    ``state`` が空なので fresh start と同義 = 同じ配線でよい)。
+    The restored result is stored in :attr:`state`. This is the **resume entry point**
+    (Issue #14): a new run gets an empty :class:`LoopState`, while an existing run
+    gets the intermediate state restored from persisted steps. Wiring
+    ``run_loop(..., initial_state=db.state, on_step=db.on_step)`` continues an
+    interrupted loop without losing state (for new runs, ``state`` is empty, so this
+    is equivalent to a fresh start and the same wiring is fine).
     """
 
     def __init__(self, db: DbSource, run_id: str) -> None:
@@ -1101,19 +1172,19 @@ class DBProgressLog:
             self._owns_conn = True
         self.run_id = run_id
         self.store = LoopStore(self.conn)
-        # 復元した (新規なら空の) LoopState を resume の seed として保持する。
+        # Keep the restored (or empty for a new run) LoopState as the resume seed.
         self.state = self.store.load_or_init(run_id)
 
     def on_step(self, record: StepRecord, state: LoopState) -> None:
-        """完了した 1 反復を永続化する。run_loop の ``StepHook`` 互換。"""
+        """Persist one completed iteration. Compatible with run_loop ``StepHook``."""
         self.store.record_step(self.run_id, record, state)
 
     def record_result(self, result: "LoopResult") -> None:
-        """ループ終了時の最終ステータスを確定する。"""
+        """Finalize the loop status at loop end."""
         self.store.record_result(self.run_id, result)
 
     def close(self) -> None:
-        """自分で開いた接続のみ閉じる (借用接続は呼び出し側の責務)。"""
+        """Close only connections opened here (borrowed connections are caller-owned)."""
         if self._owns_conn:
             self.conn.close()
 

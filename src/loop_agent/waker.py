@@ -1,24 +1,35 @@
-"""ループ wake と transport 配送の配線 (report.md S5 Phase3, Issue #23)。
+"""Wiring for loop wakes and transport delivery (report.md S5 Phase3, Issue #23).
 
-:mod:`loop_agent.transport` は配送機構 (push 一次 / pull fallback / at-most-once) を
-提供するが、**ループのどの瞬間がどの wake になるか** はループ側の関心である。本モジュールは
-その対応付け (loop 完了 / 次反復 / 判断要求 -> :class:`~loop_agent.transport.Wake`) を担い、
-:class:`~loop_agent.observe.LoopObserver` / :class:`~loop_agent.store.DBProgressLog` と同じ
-作法 (``record_result`` 観測フック) に乗る drop-in として配線できるようにする。
+:mod:`loop_agent.transport` provides the delivery mechanism (push first / pull
+fallback with receiver-side de-duplication), but **which loop moment maps to
+which wake** is a loop concern. This module handles that mapping (loop
+completion / next iteration / decision request ->
+:class:`~loop_agent.transport.Wake`) and can be wired as a drop-in using the
+same convention as :class:`~loop_agent.observe.LoopObserver` /
+:class:`~loop_agent.store.DBProgressLog` (the ``record_result`` observation
+hook).
 
-配送する 3 wake (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」):
+The three wakes to deliver (report.md S5 Phase3, "deliver wakes for loop
+completion/next iteration/decision request"):
 
-- **完了** (:data:`~loop_agent.transport.WAKE_LOOP_DONE`): ``run_loop`` が終端した
-  (``goal_met`` / ``stopped``)。受信側 (coordinator / 窓口) に終了と理由を届ける。
-- **判断要求** (:data:`~loop_agent.transport.WAKE_DECISION_REQUEST`): 人間ゲートで
-  ``paused`` した。不可逆 action の判断を人間に要求する wake (gate_key を載せる)。
-- **次反復** (:data:`~loop_agent.transport.WAKE_NEXT_ITERATION`): 完了 -> 次反復の接続を
-  起こす wake。完了後に次候補へ進む合図 (人間ゲート維持の前提で、提案として配送)。
+- **Completion** (:data:`~loop_agent.transport.WAKE_LOOP_DONE`): ``run_loop``
+  terminated (``goal_met`` / ``stopped``). Delivers completion and the reason to
+  the recipient (coordinator / front desk).
+- **Decision request** (:data:`~loop_agent.transport.WAKE_DECISION_REQUEST`):
+  paused at a human gate. A wake requesting human judgment for an irreversible
+  action (with gate_key included).
+- **Next iteration** (:data:`~loop_agent.transport.WAKE_NEXT_ITERATION`): a wake
+  that connects completion -> next iteration. It signals moving to the next
+  candidate after completion (delivered as a proposal, assuming the human gate
+  remains in place).
 
-wake id は **決定的** に組む (``f"{run_id}:{kind}:{iteration}"``)。これにより resume での
-再配送指示や push/pull の継ぎ目で同じ wake を二度 deliver しても、queue の二重 enqueue 冪等性
-(:meth:`~loop_agent.transport.InMemoryWakeQueue.enqueue`) で de-dup され、受信側に二重に
-届かない (at-most-once の土台)。
+Wake ids are built **deterministically** (``f"{run_id}:{kind}:{iteration}"``).
+This lets queue enqueue idempotency
+(:meth:`~loop_agent.transport.InMemoryWakeQueue.enqueue`) de-dup the same wake if
+a resume redelivery instruction tries to enqueue it again. The stable id also
+gives recipients a de-duplication key for rare push/pull boundary duplicates;
+receivers should handle wake ids idempotently rather than relying on guaranteed
+single delivery.
 """
 
 from __future__ import annotations
@@ -33,15 +44,16 @@ from .transport import (
     Wake,
 )
 
-if TYPE_CHECKING:  # 実行時 import cycle を避ける (型注釈のためだけ)。
+if TYPE_CHECKING:  # Avoid a runtime import cycle (only needed for type annotations).
     from .loop import LoopResult
 
 
 def wake_id_for(run_id: str, kind: str, iteration: int) -> str:
-    """決定的な wake id を組む (``"{run_id}:{kind}:{iteration}"``)。
+    """Build a deterministic wake id (``"{run_id}:{kind}:{iteration}"``).
 
-    同一 (run_id, kind, iteration) には常に同じ id を割り当て、再配送/二重 deliver を
-    queue 側で de-dup させる (at-most-once)。
+    Always assigns the same id to the same (run_id, kind, iteration), allowing
+    the queue side to suppress duplicate enqueue attempts and receivers to
+    de-dup rare push/pull boundary duplicates by wake id.
     """
     return f"{run_id}:{kind}:{iteration}"
 
@@ -53,15 +65,19 @@ def wakes_for_result(
     recipient: str,
     next_recipient: Optional[str] = None,
 ) -> list[Wake]:
-    """``LoopResult`` を配送すべき :class:`Wake` 群へ写す (純粋関数・副作用なし)。
+    """Map a ``LoopResult`` to the :class:`Wake` objects to deliver (pure, no side effects).
 
-    - ``paused`` (人間ゲート中断): **判断要求** wake 1 件 (gate_key 同梱)。次反復 wake は
-      出さない (人間判断待ちで先へ進まない)。
-    - それ以外 (``goal_met`` / ``stopped``): **完了** wake 1 件 (status / 理由 / 集計を同梱)。
-      ``next_recipient`` が指定されれば **次反復** wake も 1 件足す (完了 -> 次反復の接続。
-      人間ゲート維持の前提で「次候補の提案」として配送する)。
+    - ``paused`` (interrupted at a human gate): one **decision request** wake
+      (including gate_key). Does not emit a next-iteration wake (it does not
+      advance while waiting for human judgment).
+    - Otherwise (``goal_met`` / ``stopped``): one **completion** wake (including
+      status / reason / aggregates). If ``next_recipient`` is specified, also
+      adds one **next iteration** wake (completion -> next iteration connection,
+      delivered as a "next candidate proposal" assuming the human gate remains in
+      place).
 
-    純粋関数なので、配送 (:class:`Transport.deliver`) と分離してテスト/合成しやすい。
+    Because this is a pure function, it is easy to test/compose separately from
+    delivery (:class:`Transport.deliver`).
     """
     it = result.iterations
     if result.paused:
@@ -107,20 +123,25 @@ def wakes_for_result(
 
 
 class LoopWaker:
-    """ループの wake を :class:`Transport` 経由で配送する drop-in 配線。
+    """Drop-in wiring that delivers loop wakes through :class:`Transport`.
 
     :class:`~loop_agent.observe.LoopObserver` / :class:`~loop_agent.store.DBProgressLog`
-    と同じ ``record_result`` フック形を実装するので、観測の配線にそのまま並べられる::
+    implement the same ``record_result`` hook shape, so this can be placed
+    alongside observation wiring as-is::
 
         waker = LoopWaker(transport, run_id="r1", recipient="coordinator")
         result = run_loop(act=..., verify=..., conditions=...)
-        waker.record_result(result)   # 完了/判断要求 wake を配送
+        waker.record_result(result)   # Deliver completion/decision request wakes
 
-    ``next_recipient`` を渡すと、完了時に「次反復」wake も配送する (完了 -> 次反復の接続を
-    人間ゲート維持の前提で起こす)。配送は :class:`Transport.deliver` に委ねるので、push が
-    通れば即配送、backend 不通でも queue に残り受信側の pull poll で配送が継続する。
+    Passing ``next_recipient`` also delivers a "next iteration" wake at
+    completion (creating the completion -> next iteration connection under the
+    assumption that the human gate remains in place). Delivery is delegated to
+    :class:`Transport.deliver`, so it is delivered immediately if push succeeds;
+    if the backend is unavailable, it remains in the queue and delivery continues
+    through recipient-side pull polling.
 
-    返り値は wake id -> 配送経路 (``"push"`` | ``"queued"``) の dict で、テスト/監視に使える。
+    The return value is a dict of wake id -> delivery route (``"push"`` |
+    ``"queued"``), useful for tests/monitoring.
     """
 
     def __init__(
@@ -137,7 +158,7 @@ class LoopWaker:
         self._next_recipient = next_recipient
 
     def record_result(self, result: "LoopResult") -> dict[str, str]:
-        """``LoopResult`` から wake を組み立てて配送する。observer の ``record_result`` 互換。"""
+        """Build and deliver wakes from a ``LoopResult``. Compatible with observer ``record_result``."""
         routes: dict[str, str] = {}
         for wake in wakes_for_result(
             result,
@@ -151,10 +172,12 @@ class LoopWaker:
     def deliver_wake(
         self, kind: str, *, iteration: int, recipient: Optional[str] = None, **payload: Any
     ) -> str:
-        """任意の wake を 1 件直接配送する低レベル口 (決定的 id を自動付与)。
+        """Low-level entry point to directly deliver one arbitrary wake (auto-assigns a deterministic id).
 
-        ``record_result`` の対応に収まらないアドホックな wake (例: ループ外からの割り込み
-        通知) を、同じ決定的 id 規則 + at-most-once 配送に乗せたいとき用。
+        Use this when an ad hoc wake that does not fit the ``record_result``
+        mapping (for example, an interruption notification from outside the
+        loop) should use the same deterministic id rule for enqueue suppression
+        and receiver-side de-duplication.
         """
         rcpt = recipient if recipient is not None else self._recipient
         wake = Wake(

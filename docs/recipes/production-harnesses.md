@@ -16,6 +16,16 @@ loop-agent init-harness --template codex  --output ./harness-codex
 Each template writes `harness.py` and `README.md`. The generated files are not a
 policy engine: edit the prompt, the verifier, the caps, and any gate predicate
 for your domain. Existing files are preserved unless `--force` is passed.
+The Claude and Codex templates also include `DBProgressLog`, a JSONL event log,
+a post-act review stub, and `NoProgress` keyed by the recorded failure detail.
+Keep those defaults for unattended runs unless the task is explicitly disposable.
+
+They do not include Reflexion by default. Reflexion is an outer improvement loop:
+it turns repeated failures into lessons for later episodes. That is useful only
+after the inner loop has clear observations, review feedback, and ground-truth
+verification. If you add it before those basics are sharp, the system can store
+lessons about noise from an unfinished prompt or verifier instead of learning the
+real task rule.
 
 ## 1. Single Verified Edit Loop
 
@@ -95,6 +105,7 @@ Pick the first matching shape:
 2. Many independent items: **Multi-Item Work Queue**.
 3. External state mutation inside the loop: **Gated Irreversible Action Flow**.
 
-Everything else in this directory is supporting material. Add Reflexion,
-transport, dashboards, or notifier integrations only after one of these shapes is
-working and the production need is concrete.
+Everything else in this directory is supporting material. Add Reflexion when the
+same review or verifier failure repeats and a reusable lesson can improve the
+next episode. Add transport, dashboards, or notifier integrations only after one
+of these shapes is working and the production need is concrete.

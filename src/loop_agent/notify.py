@@ -1,26 +1,33 @@
-"""HumanGate 通知ハンドラ: 承認要求を人間へ届ける pluggable Notifier (Issue #39).
+"""HumanGate notification handlers: pluggable Notifiers for approval requests (Issue #39).
 
-:class:`~loop_agent.gate.HumanGate` が不可逆 action に **新しい承認要求 (pending) を
-登録した瞬間** に、外部チャネル (webhook / Slack / email) へ best-effort で通知する経路を
-与える。既存の HumanGate API は不変で、``notifier`` は optional。未指定なら従来通り
-何も通知しない (no-op = pause して人間の out-of-band 解決を待つだけ)。
+Provides a best-effort path for notifying external channels (webhook / Slack / email)
+at the exact moment :class:`~loop_agent.gate.HumanGate` registers a **new approval
+request (pending)** for an irreversible action. The existing HumanGate API is
+unchanged, and ``notifier`` is optional. If omitted, nothing is notified as before
+(no-op = pause and wait for an out-of-band human decision).
 
-設計原則 (report.md の「loop コアを止めない」を通知層へ延伸):
+Design principles (extending report.md's "do not stop the loop core" rule into
+the notification layer):
 
-- **best-effort**。通知の送信失敗は :class:`HumanGate` を一切止めない。失敗は
-  ``warnings.warn`` (RuntimeWarning) で可視化し、サイレントには握り潰さない
-  (:mod:`loop_agent.events` の sink fan-out と同じ規律)。通知の有無に関わらず承認要求
-  自体は store に永続化済みなので、通知が落ちても人間が決定を下せば loop は進む。
-- **stdlib のみ**。webhook は :mod:`urllib.request`、email は :mod:`smtplib`。optional
-  dependency を増やさない。Slack は Slack incoming webhook (= webhook の specialization)。
-- **redaction を既定 ON**。承認 payload には action がそのまま載るため、機密値
-  (token / password / secret 等) が外部チャネルへ漏れないよう、送信前に
-  :func:`redact_payload` で既定マスクする (各 Notifier の ``redact`` で差し替え可)。
-- **retry は opt-in**。既定は単発送信 (``retries=0``)。retry を有効化しても sleep で
-  loop を長くブロックしないよう、間隔は明示注入する (``retry_interval`` / ``sleep``)。
+- **best-effort**. Notification delivery failures never stop :class:`HumanGate`.
+  Failures are surfaced with ``warnings.warn`` (RuntimeWarning) instead of being
+  swallowed silently (the same discipline as sink fan-out in :mod:`loop_agent.events`).
+  The approval request itself is already persisted to the store regardless of
+  notification delivery, so the loop can proceed if a human makes a decision even
+  after notification delivery fails.
+- **stdlib only**. Webhooks use :mod:`urllib.request`, and email uses :mod:`smtplib`.
+  No optional dependencies are added. Slack is a Slack incoming webhook (= a webhook
+  specialization).
+- **redaction ON by default**. Because the approval payload includes the raw action,
+  sensitive values (token / password / secret, etc.) are masked by default with
+  :func:`redact_payload` before sending so they do not leak to external channels
+  (replaceable via each Notifier's ``redact`` argument).
+- **retry is opt-in**. The default is a single send attempt (``retries=0``). Even when
+  retry is enabled, the interval is injected explicitly (``retry_interval`` / ``sleep``)
+  so sleep does not block the loop for a long time.
 
-payload schema は :class:`ApprovalRequest` (action 種別 / 要約 / 期限 / 生成時刻) で、
-:meth:`ApprovalRequest.to_dict` が JSON シリアライズ可能な dict を返す。
+The payload schema is :class:`ApprovalRequest` (action kind / summary / deadline /
+creation time), and :meth:`ApprovalRequest.to_dict` returns a JSON-serializable dict.
 """
 
 from __future__ import annotations
@@ -47,9 +54,10 @@ from urllib.request import Request, urlopen
 
 from .errors import ConfigError
 
-# redaction の対象キー判定: payload の (ネストを含む) dict キー名にこれらの部分文字列が
-# 含まれていれば値をマスクする。大文字小文字は無視する。実運用では action の構造に
-# 合わせて拡張すること (各 Notifier の ``redact`` を差し替えれば policy を丸ごと交換可)。
+# Redaction target key detection: mask values when these substrings appear in payload
+# dict keys (including nested keys). Matching is case-insensitive. In production,
+# extend this to fit the action structure (or replace the entire policy via each
+# Notifier's ``redact`` argument).
 DEFAULT_SENSITIVE_KEY_PARTS: tuple[str, ...] = (
     "password",
     "passwd",
@@ -66,32 +74,37 @@ DEFAULT_SENSITIVE_KEY_PARTS: tuple[str, ...] = (
     "cookie",
 )
 
-# マスク後の置換文字列。値の存在は示しつつ中身は伏せる。
+# Replacement string after masking. It indicates that a value exists while hiding it.
 REDACTED = "***REDACTED***"
 
-# payload を受け取り redaction 済みコピーを返す callable。デフォルトは
-# :func:`redact_payload`。``None`` 相当の無加工を使うなら ``lambda p: dict(p)`` を渡す。
+# Callable that receives a payload and returns a redacted copy. The default is
+# :func:`redact_payload`. To use a no-op equivalent to ``None``, pass
+# ``lambda p: dict(p)``.
 Redaction = Callable[[Mapping[str, Any]], dict[str, Any]]
 
-# 承認要求から追加メタ情報 (summary / action_kind / deadline) を導く callable。
-# action を受け取り、:class:`ApprovalRequest` の上書きフィールドを dict で返す。
+# Callable that derives additional metadata (summary / action_kind / deadline) for an
+# approval request. It receives an action and returns override fields for
+# :class:`ApprovalRequest` as a dict.
 ApprovalDescriber = Callable[[Any], Mapping[str, Any]]
 
 
 def _summarize_action(action: Any, *, limit: int = 200) -> str:
-    """action から既定の人間可読 1 行要約を作る (describe 未指定時のフォールバック)。
+    """Build the default human-readable one-line action summary (fallback without describe).
 
-    **要約に生の値を埋め込まない** (機密漏洩防止)。要約はそのまま通知の見出し
-    (webhook JSON の ``summary`` / Slack text / email 件名) に載り、key ベースの
-    :func:`redact_payload` ではマスクされないため、値を入れると機密が素通りしうる
-    (action 本体は ``ApprovalRequest.action`` に full payload として残り、そちらは redaction
-    される)。よって:
+    **Do not embed raw values in the summary** (to prevent secret leaks). The summary is
+    used directly as the notification heading (webhook JSON ``summary`` / Slack text /
+    email subject), and key-based :func:`redact_payload` does not mask it, so values in
+    the summary could pass through unredacted (the action body remains as the full
+    payload in ``ApprovalRequest.action`` and is redacted there). Therefore:
 
-    - ``str`` の action はそのまま (action 識別子。値そのものが見出し)。
-    - ``Mapping`` は人間可読ラベル用の既知キー (``summary``/``description``/``kind``/
-      ``type``) の **str 値のみ** 拾う。無ければ **キー名だけ** を並べた構造要約にする
-      (値は出さない)。リッチな要約が要るなら ``describe`` で明示的に組むこと。
-    - それ以外 (任意オブジェクト) は ``repr`` が機密を含みうるので **型名だけ**。
+    - ``str`` actions are used as-is (an action identifier; the value itself is the
+      heading).
+    - ``Mapping`` actions only use **str values** from known human-readable label keys
+      (``summary``/``description``/``kind``/``type``). If none exist, build a structural
+      summary from **key names only** (without values). Build richer summaries explicitly
+      with ``describe``.
+    - Everything else (arbitrary objects) uses **only the type name**, because ``repr``
+      may contain secrets.
     """
     if isinstance(action, str):
         text = action
@@ -113,22 +126,26 @@ def _summarize_action(action: Any, *, limit: int = 200) -> str:
 
 @dataclass(frozen=True)
 class ApprovalRequest:
-    """人間に承認を求める 1 件の不可逆 action の payload schema。
+    """Payload schema for one irreversible action that requires human approval.
 
-    :class:`~loop_agent.gate.HumanGate` が pending 登録時に構築し、:class:`Notifier`
-    に渡す。``action`` は gate が JSON ネイティブを保証した提案 action そのもの
-    (正本)。``summary`` / ``action_kind`` / ``deadline`` は通知の見出し・分類・期限
-    のための任意メタで、``describe`` callback で導出・上書きできる。
+    Built by :class:`~loop_agent.gate.HumanGate` when it registers a pending request and
+    passed to :class:`Notifier`. ``action`` is the proposed action itself, guaranteed by
+    the gate to be JSON-native (the source of truth). ``summary`` / ``action_kind`` /
+    ``deadline`` are optional metadata for notification headings, classification, and
+    deadlines, and can be derived or overridden by the ``describe`` callback.
 
     Attributes:
-        run_id: 対象 run の ID。
-        gate_key: この承認要求のゲートキー (``"gate-<iteration>"`` 等)。run 内で一意。
-        action: 提案された不可逆 action (JSON ネイティブ)。**機密が混じりうる**ので
-            通知前に redaction される (:func:`redact_payload`)。
-        summary: 人間可読の 1 行要約 (通知の見出し)。
-        action_kind: action の分類 (例 ``"deploy"`` / ``"delete"``)。任意。
-        deadline: 決定が必要な期限 (epoch 秒)。任意。
-        created_at: 承認要求が発火した時刻 (epoch 秒)。任意。
+        run_id: ID of the target run.
+        gate_key: Gate key for this approval request (such as ``"gate-<iteration>"``).
+            Unique within a run.
+        action: Proposed irreversible action (JSON-native). It **may contain secrets**,
+            so it is redacted before notification (:func:`redact_payload`).
+        summary: Human-readable one-line summary (notification heading).
+        action_kind: Action classification (for example ``"deploy"`` / ``"delete"``).
+            Optional.
+        deadline: Deadline by which a decision is required (epoch seconds). Optional.
+        created_at: Time when the approval request was triggered (epoch seconds).
+            Optional.
     """
 
     run_id: str
@@ -140,9 +157,10 @@ class ApprovalRequest:
     created_at: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON シリアライズ可能な dict に変換する (redaction 前の生 payload)。
+        """Convert to a JSON-serializable dict (raw payload before redaction).
 
-        各 Notifier はこれを :func:`redact_payload` 等に通してから送信する。
+        Each Notifier passes this through :func:`redact_payload` or equivalent before
+        sending.
         """
         return {
             "run_id": self.run_id,
@@ -161,13 +179,14 @@ def redact_payload(
     sensitive_parts: Sequence[str] = DEFAULT_SENSITIVE_KEY_PARTS,
     mask: str = REDACTED,
 ) -> dict[str, Any]:
-    """payload (ネスト dict/list を含む) を再帰的に走査し機密値をマスクした **コピー** を返す。
+    """Return a **copy** of payload (including nested dict/list values) with secrets masked.
 
-    キー名 (小文字化) に ``sensitive_parts`` のいずれかが部分一致する dict 値を ``mask`` に
-    置換する。元の payload は変更しない (deep copy ベース)。これは万能ではない (機密が
-    キー名で判別できない自由文に埋まっている場合は防げない) ので、docstring の通り action の
-    構造に応じて ``sensitive_parts`` を拡張するか、Notifier の ``redact`` を専用 policy に
-    差し替えること。
+    Dict values whose key name (lowercased) contains any item in ``sensitive_parts`` are
+    replaced with ``mask``. The original payload is not modified (deep-copy based). This
+    is not universal (it cannot catch secrets embedded in free text that cannot be
+    identified by key name), so extend ``sensitive_parts`` for the action structure or
+    replace the Notifier's ``redact`` with a dedicated policy as described in the
+    docstring.
     """
     lowered = tuple(part.lower() for part in sensitive_parts)
 
@@ -187,7 +206,7 @@ def redact_payload(
             return [_walk(v) for v in value]
         return value
 
-    # トップレベルはコピーを保証するため明示的に dict 化する。
+    # Explicitly convert the top level to dict to guarantee a copy.
     return {
         str(k): _walk(v, redact_here=_is_sensitive(str(k)))
         for k, v in copy.deepcopy(dict(payload)).items()
@@ -196,11 +215,12 @@ def redact_payload(
 
 @runtime_checkable
 class Notifier(Protocol):
-    """承認要求を外部チャネルへ届ける best-effort 通知 backend。
+    """Best-effort notification backend that sends approval requests to external channels.
 
-    ``notify`` は **副作用のみ** (戻り値なし)。送信失敗時は例外を送出してよい
-    (呼び出し元の :class:`~loop_agent.gate.HumanGate` が捕捉して warning 化し loop を
-    止めない)。冪等性は保証しない (resume の TOCTOU で稀に二重通知しうる)。
+    ``notify`` has **side effects only** (no return value). It may raise on delivery
+    failure (the caller, :class:`~loop_agent.gate.HumanGate`, catches that, converts it
+    to a warning, and does not stop the loop). Idempotency is not guaranteed (resume
+    TOCTOU may rarely cause duplicate notifications).
     """
 
     def notify(self, request: ApprovalRequest) -> None: ...
@@ -213,9 +233,9 @@ def _send_with_retry(
     retry_interval: float,
     sleep: Callable[[float], None],
 ) -> None:
-    """``send`` を最大 ``retries + 1`` 回試行し、最後の例外を再送出する小ヘルパ。
+    """Small helper that tries ``send`` up to ``retries + 1`` times and reraises the last exception.
 
-    ``retry_interval > 0`` のときのみ試行間に ``sleep`` する (既定 0 = ブロックしない)。
+    Sleeps between attempts only when ``retry_interval > 0`` (default 0 = no blocking).
     """
     attempts = retries + 1
     last_exc: Optional[BaseException] = None
@@ -223,27 +243,30 @@ def _send_with_retry(
         try:
             send()
             return
-        except Exception as exc:  # noqa: BLE001 - 最終的に再送出する
+        except Exception as exc:  # noqa: BLE001 - reraised after the final attempt
             last_exc = exc
             if i + 1 < attempts and retry_interval > 0:
                 sleep(retry_interval)
-    assert last_exc is not None  # attempts >= 1 なので必ず設定済み
+    assert last_exc is not None  # attempts >= 1, so this is always set
     raise last_exc
 
 
 class WebhookNotifier:
-    """JSON payload を任意の HTTP webhook へ POST する Notifier (stdlib urllib)。
+    """Notifier that POSTs a JSON payload to an arbitrary HTTP webhook (stdlib urllib).
 
     Args:
-        url: 送信先 URL。
-        method: HTTP メソッド (既定 ``"POST"``)。
-        headers: 追加ヘッダ。``Content-Type: application/json`` は自動付与
-            (明示指定があればそちらを優先)。
-        timeout: 1 回の送信 timeout 秒 (既定 5.0)。loop を長く待たせない短めの既定。
-        redact: 送信前に payload を加工する callable (既定 :func:`redact_payload`)。
-        retries: 失敗時の追加試行回数 (既定 0 = 単発)。
-        retry_interval: 試行間 sleep 秒 (既定 0.0 = sleep しない)。
-        sleep: 試行間 sleep の注入口 (テスト用、既定 :func:`time.sleep`)。
+        url: Destination URL.
+        method: HTTP method (default ``"POST"``).
+        headers: Additional headers. ``Content-Type: application/json`` is added
+            automatically (explicit values take precedence).
+        timeout: Timeout in seconds for one send attempt (default 5.0). The default is
+            intentionally short so the loop does not wait for long.
+        redact: Callable that transforms the payload before sending (default
+            :func:`redact_payload`).
+        retries: Additional attempts after failure (default 0 = one attempt only).
+        retry_interval: Sleep seconds between attempts (default 0.0 = do not sleep).
+        sleep: Injection point for sleep between attempts (for tests, default
+            :func:`time.sleep`).
     """
 
     def __init__(
@@ -270,7 +293,7 @@ class WebhookNotifier:
         self.sleep = sleep
 
     def _build_body(self, request: ApprovalRequest) -> bytes:
-        """redaction 済み payload を JSON バイト列にする (Slack 等の specialization で override)。"""
+        """Convert the redacted payload to JSON bytes (overridden by Slack and similar specializations)."""
         payload = self.redact(request.to_dict())
         return json.dumps(payload).encode("utf-8")
 
@@ -282,7 +305,7 @@ class WebhookNotifier:
         )
 
         def _send() -> None:
-            # urlopen の戻り (context manager) は即 close する。本文は不要。
+            # Close the value returned by urlopen (context manager) immediately. Body is unused.
             with urlopen(http_request, timeout=self.timeout):
                 pass
 
@@ -295,10 +318,11 @@ class WebhookNotifier:
 
 
 def _format_slack_text(payload: Mapping[str, Any]) -> str:
-    """redaction 済み payload を Slack incoming webhook の ``text`` 本文に整形する。
+    """Format a redacted payload as the ``text`` body for a Slack incoming webhook.
 
-    見出し (summary) + メタ (kind / deadline / gate / run) + action 本体 (JSON) を
-    人間可読に並べる。本文は全て redaction 後なので機密はマスク済み。
+    Presents the heading (summary) + metadata (kind / deadline / gate / run) + action
+    body (JSON) in a human-readable layout. The full body is already redacted, so
+    secrets are masked.
     """
     lines = [f":warning: *Approval required* - {payload.get('summary', '(no summary)')}"]
     kind = payload.get("action_kind")
@@ -315,17 +339,20 @@ def _format_slack_text(payload: Mapping[str, Any]) -> str:
 
 
 class SlackNotifier(WebhookNotifier):
-    """Slack incoming webhook 用 Notifier (:class:`WebhookNotifier` の specialization)。
+    """Notifier for Slack incoming webhooks (:class:`WebhookNotifier` specialization).
 
-    Slack incoming webhook は ``{"text": ...}`` 形を期待するので、body builder を
-    override して redaction 済み payload を Slack message text に整形する
-    (:func:`_format_slack_text`)。POST 機構 / timeout / retry / redaction は親と共通。
+    Slack incoming webhooks expect a ``{"text": ...}`` shape, so this overrides the
+    body builder and formats the redacted payload as Slack message text
+    (:func:`_format_slack_text`). The POST mechanism / timeout / retry / redaction are
+    shared with the parent class.
 
     Args:
-        webhook_url: Slack incoming webhook URL。
-        text_formatter: payload (redaction 済み) -> Slack ``text`` の整形 callable
-            (既定 :func:`_format_slack_text`)。``blocks`` 等のリッチ表現に差し替え可。
-        その他 (``timeout`` / ``redact`` / ``retries`` ...) は :class:`WebhookNotifier` と同じ。
+        webhook_url: Slack incoming webhook URL.
+        text_formatter: Callable that formats payload (redacted) -> Slack ``text``
+            (default :func:`_format_slack_text`). Can be replaced with richer formats
+            such as ``blocks``.
+        Other arguments (``timeout`` / ``redact`` / ``retries`` ...) are the same as
+            :class:`WebhookNotifier`.
     """
 
     def __init__(
@@ -358,7 +385,7 @@ class SlackNotifier(WebhookNotifier):
 
 
 def _format_email_body(payload: Mapping[str, Any]) -> str:
-    """redaction 済み payload を email 本文 (plain text) に整形する。"""
+    """Format a redacted payload as an email body (plain text)."""
     lines = [
         f"Approval required: {payload.get('summary', '(no summary)')}",
         "",
@@ -378,23 +405,24 @@ def _format_email_body(payload: Mapping[str, Any]) -> str:
 
 
 class EmailNotifier:
-    """承認要求を SMTP で email 送信する Notifier (stdlib smtplib)。
+    """Notifier that sends approval requests by email over SMTP (stdlib smtplib).
 
     Args:
-        host: SMTP サーバホスト。
-        sender: 差出人アドレス。
-        recipients: 宛先アドレス列 (1 件以上)。
-        port: SMTP ポート (既定 25)。
-        subject_prefix: 件名の接頭辞 (既定 ``"[loop-agent] Approval required"``)。
-            件名は ``"<prefix>: <summary>"``。
-        username/password: 指定時 ``SMTP.login`` する。
-        use_tls: ``True`` で接続後 ``starttls()`` する (既定 False)。
-        timeout: SMTP 接続 timeout 秒 (既定 10.0)。
-        redact: 送信前 payload 加工 (既定 :func:`redact_payload`)。
-        body_formatter: payload (redaction 済み) -> 本文 plain text の整形 callable。
-        smtp_factory: ``SMTP(host, port, timeout=...)`` を返す factory (テストで差し替え)。
-            既定 :class:`smtplib.SMTP`。
-        retries/retry_interval/sleep: :class:`WebhookNotifier` と同じ best-effort retry。
+        host: SMTP server host.
+        sender: Sender address.
+        recipients: Recipient address sequence (at least one item).
+        port: SMTP port (default 25).
+        subject_prefix: Subject prefix (default ``"[loop-agent] Approval required"``).
+            The subject is ``"<prefix>: <summary>"``.
+        username/password: When specified, call ``SMTP.login``.
+        use_tls: When ``True``, call ``starttls()`` after connecting (default False).
+        timeout: SMTP connection timeout in seconds (default 10.0).
+        redact: Payload transformation before sending (default :func:`redact_payload`).
+        body_formatter: Callable that formats payload (redacted) -> plain-text body.
+        smtp_factory: Factory that returns ``SMTP(host, port, timeout=...)``
+            (replaceable in tests). Defaults to :class:`smtplib.SMTP`.
+        retries/retry_interval/sleep: Same best-effort retry behavior as
+            :class:`WebhookNotifier`.
     """
 
     def __init__(
@@ -442,8 +470,9 @@ class EmailNotifier:
         message = EmailMessage()
         message["From"] = self.sender
         message["To"] = ", ".join(self.recipients)
-        # 件名も body と同じく **redaction 後** の summary を使う。custom redact が
-        # summary を scrub する設定で、件名 (SMTP ヘッダ) から漏れないようにする。
+        # Use the **post-redaction** summary for the subject as well as the body. If a
+        # custom redactor scrubs summary, this prevents leakage through the subject
+        # (SMTP header).
         subject_summary = payload.get("summary", request.summary)
         message["Subject"] = f"{self.subject_prefix}: {subject_summary}"
         message.set_content(self.body_formatter(payload))
@@ -472,10 +501,11 @@ class EmailNotifier:
 
 
 class ConsoleNotifier:
-    """承認要求を stream (既定 stderr) に 1 行 JSON で書き出す Notifier。
+    """Notifier that writes approval requests to a stream (default stderr) as one-line JSON.
 
-    依存ゼロのデバッグ/ローカル運用向け。cp932 コンソールでのクラッシュを避けるため
-    既定 ``ensure_ascii=True`` (非 ASCII を ``\\uXXXX`` エスケープ) で出力する。
+    Intended for dependency-free debugging/local operation. The default is
+    ``ensure_ascii=True`` (escape non-ASCII as ``\\uXXXX``) to avoid crashes on cp932
+    consoles.
     """
 
     def __init__(
@@ -499,10 +529,11 @@ class ConsoleNotifier:
 
 @dataclass
 class MultiNotifier:
-    """複数 Notifier へ best-effort で fan-out する Notifier。
+    """Notifier that fans out to multiple Notifiers on a best-effort basis.
 
-    各 backend を独立に呼び、1 つが失敗しても残りへの送信を続ける (失敗は
-    ``warnings.warn`` で可視化)。webhook と email を同時に投げる等に使う。
+    Calls each backend independently and continues sending to the rest even if one
+    fails (failures are surfaced with ``warnings.warn``). Useful for sending to webhook
+    and email at the same time, for example.
     """
 
     notifiers: Sequence[Notifier] = field(default_factory=tuple)
@@ -511,7 +542,7 @@ class MultiNotifier:
         for notifier in self.notifiers:
             try:
                 notifier.notify(request)
-            except Exception as exc:  # noqa: BLE001 - fan-out は best-effort
+            except Exception as exc:  # noqa: BLE001 - fan-out is best-effort
                 warnings.warn(
                     f"notifier {type(notifier).__name__} failed for gate "
                     f"{request.gate_key!r}: {type(exc).__name__}: {exc}",

@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""検証駆動デモ: sandbox のテストが green になるまで gather->act->verify を反復する。
+"""Verification-driven demo: repeat gather->act->verify until sandbox tests are green.
 
-loop-agent のループコアを *実コード* に当てる具体デモ。一時ディレクトリに
-わざと壊した関数 ``add`` とその pytest を書き出し、検証(verify)が実際の
-pytest の exit-code を見て green になるまでループを回す。
+A concrete demo that applies loop-agent's loop core to *real code*. It writes an
+intentionally broken ``add`` function and its pytest tests to a temporary
+directory, then runs the loop until verification sees the real pytest exit code
+turn green.
 
-シナリオ:
+Scenario:
 
-1. sandbox に ``add`` の壊れた実装(``a - b``)と ``test_add.py`` を用意する。
-2. act    = 反復ごとに「次の修正候補」を ``add.py`` へ書き込む(修正役のスタブ)。
-   候補は [引き算 -> 掛け算 -> 正しい足し算] の順で、3 手目で初めて正しくなる。
-3. verify = sandbox で pytest を subprocess 実行し exit-code を読む(ground truth)。
-   exit-code 0(green)で ``goal_met=True`` となり、ループは *自然終了* する。
-4. どの候補でも直らない場合でも、``MaxIterations`` 等のハード上限が必ず止める
-   (暴走防止。本格実証は #7)。
+1. Prepare a sandbox with a broken ``add`` implementation (``a - b``) and
+   ``test_add.py``.
+2. act    = write the "next repair candidate" to ``add.py`` on each iteration
+   (a stub for the repair role). Candidates are tried in the order
+   [subtraction -> multiplication -> correct addition], and only the third
+   attempt is correct.
+3. verify = run pytest in the sandbox as a subprocess and read its exit code
+   (ground truth). Exit code 0 (green) sets ``goal_met=True``, so the loop
+   terminates naturally.
+4. Even if no candidate fixes the code, hard limits such as ``MaxIterations``
+   always stop the loop (runaway prevention; the full proof is #7).
 
-実行:
+Run:
 
     python3 examples/verify_driven_demo.py
 
-このモジュールは ``tests/test_verify_demo.py`` からも import され、ここで定義した
-シナリオそのものが pytest で実走検証される(出荷物 == 検証対象)。
+This module is also imported by ``tests/test_verify_demo.py``, where this exact
+scenario is verified by actually running pytest (the shipped artifact is the
+verification target).
 """
 
 from __future__ import annotations
@@ -45,12 +51,12 @@ from loop_agent.demo import (
 )
 from loop_agent.state import LoopState
 
-# -- sandbox の中身 --------------------------------------------------------
+# -- sandbox contents ------------------------------------------------------
 
 TARGET_FILENAME = "add.py"
 TEST_FILENAME = "test_add.py"
 
-# 修正候補。0,1 番目は red のまま、2 番目で初めて全テストが green になる。
+# Repair candidates. The first two stay red; the third makes all tests green.
 BROKEN_SUBTRACT = "def add(a, b):\n    return a - b\n"   # add(2,3) -> -1 (red)
 BROKEN_MULTIPLY = "def add(a, b):\n    return a * b\n"   # add(2,3) ->  6 (red)
 CORRECT_ADD = "def add(a, b):\n    return a + b\n"       # add(2,3) ->  5 (green)
@@ -75,7 +81,7 @@ TEST_SOURCE = (
 
 
 class DemoRun(NamedTuple):
-    """1 回のデモ実走の結果と、観測に使ったフックの記録。"""
+    """The result of one demo run and records from the hooks used for observation."""
 
     result: LoopResult
     act: CandidateApplier
@@ -83,10 +89,10 @@ class DemoRun(NamedTuple):
 
 
 def prepare_sandbox(workdir: Path) -> None:
-    """sandbox にテストと(初期状態として)壊れた実装を書き出す。
+    """Write the tests and the initially broken implementation to the sandbox.
 
-    初期 ``add.py`` を壊した状態にしておくので、ループ開始前に手で
-    ``pytest`` を回すと red になる(= 直すべき対象があることを示す)。
+    The initial ``add.py`` is intentionally broken, so running ``pytest``
+    manually before starting the loop is red (= there is something to repair).
     """
     write_sandbox(
         workdir,
@@ -104,13 +110,13 @@ def run_repair(
     conditions: Optional[list] = None,
     on_step=None,
 ) -> DemoRun:
-    """``workdir`` を sandbox として、テストが green になるまで修正ループを回す。
+    """Use ``workdir`` as the sandbox and run the repair loop until tests are green.
 
     Args:
-        workdir: sandbox にするディレクトリ(呼び出し側が用意・後始末する)。
-        candidates: 反復ごとに当てる ``add.py`` のソース列。
-        conditions: stop 条件。省略時は実用的なハード上限の合成を使う。
-        on_step: 各反復完了後に呼ばれる観測フック。
+        workdir: Directory to use as the sandbox; the caller creates and cleans it up.
+        candidates: Sequence of ``add.py`` sources to apply on each iteration.
+        conditions: Stop conditions. When omitted, a practical set of hard limits is used.
+        on_step: Observation hook called after each iteration completes.
     """
     prepare_sandbox(workdir)
 
@@ -159,7 +165,7 @@ def main() -> int:
         print(f"tokens     : {result.tokens_used}")
         print(f"exit-codes : {run.verify.exit_codes}  (0 == tests green)")
 
-    # 検証可能ゴール(テスト green)に到達してループが自然終了したことを保証する。
+    # Ensure the loop naturally terminated after reaching a verifiable goal (green tests).
     ok = result.goal_met and result.stop is None
     print("\nOK: loop terminated naturally on a verified GREEN goal."
           if ok else "\nNG: loop did not reach the verified goal.")

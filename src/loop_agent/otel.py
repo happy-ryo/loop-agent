@@ -1,25 +1,27 @@
-"""OTel GenAI span 連携（report.md S4.5「観測性」）。**optional 依存**。
+"""OTel GenAI span integration (report.md S4.5 "Observability"). **Optional dependency**.
 
-ループの一生を 1 本の OpenTelemetry span として表し、GenAI semantic conventions
-の ``gen_ai.*`` 属性 + 反復番号 + 終了理由を載せる（task 指定）。
+Represents the lifetime of a loop as a single OpenTelemetry span and attaches
+GenAI semantic convention ``gen_ai.*`` attributes, the iteration number, and
+the termination reason (task requirement).
 
-``opentelemetry`` は **optional 依存** であり、未導入環境でも壊れない。import に
-失敗した場合、:class:`LoopSpan` は no-op（記録しないダミー）へ degrade し、観測の
-JSONL/event sink 側はそのまま機能する。``enabled=False`` でも同じ no-op になる。
+``opentelemetry`` is an **optional dependency**, so environments without it do
+not break. If the import fails, :class:`LoopSpan` degrades to a no-op (a dummy
+object that records nothing), while the observation JSONL/event sink side keeps
+working as-is. ``enabled=False`` also produces the same no-op behavior.
 
-semantic conventions の対応（experimental な GenAI 規約に準拠しつつ、ループ固有の
-情報は ``loop_agent.*`` 名前空間に置く）:
+Semantic convention mapping (following the experimental GenAI conventions while
+placing loop-specific information in the ``loop_agent.*`` namespace):
 
-- ``gen_ai.operation.name`` = ``"loop"``      （この span が表す操作）
+- ``gen_ai.operation.name`` = ``"loop"``      (the operation this span represents)
 - ``gen_ai.system``         = ``"loop_agent"``
-- ``gen_ai.usage.output_tokens`` = 累積 tokens（ダッシュボード互換のため GenAI usage に写像）
-- ``loop_agent.iterations``       = 総反復数（= 反復番号）
+- ``gen_ai.usage.output_tokens`` = cumulative tokens (mapped to GenAI usage for dashboard compatibility)
+- ``loop_agent.iterations``       = total iterations (= iteration number)
 - ``loop_agent.status``           = ``"goal_met" | "stopped" | "error" | "incomplete"``
-- ``loop_agent.stop``             = 発火した停止条件名（無ければ未設定）
-- ``loop_agent.termination_reason`` = 人間可読の終了理由
-- ``loop_agent.tokens_used`` / ``loop_agent.elapsed`` = メトリクス
+- ``loop_agent.stop``             = triggered stop condition name (unset if none)
+- ``loop_agent.termination_reason`` = human-readable termination reason
+- ``loop_agent.tokens_used`` / ``loop_agent.elapsed`` = metrics
 
-各反復は span の add_event（``loop_step``）としてタイムラインに刻む。
+Each iteration is recorded on the timeline as a span add_event (``loop_step``).
 """
 
 from __future__ import annotations
@@ -27,23 +29,23 @@ from __future__ import annotations
 import warnings
 from typing import Any, Optional
 
-try:  # optional 依存: 未導入でも壊れないよう degrade する
+try:  # Optional dependency: degrade cleanly when it is not installed.
     from opentelemetry import trace as _otel_trace
     from opentelemetry.trace import Status, StatusCode
 
     _OTEL_AVAILABLE = True
-except ImportError:  # pragma: no cover - 環境依存（OTel 未導入時のみ通る）
+except ImportError:  # pragma: no cover - environment-dependent (only when OTel is not installed)
     _otel_trace = None  # type: ignore[assignment]
     Status = None  # type: ignore[assignment,misc]
     StatusCode = None  # type: ignore[assignment,misc]
     _OTEL_AVAILABLE = False
 
-# GenAI semantic-convention の属性キー（文字列リテラルを散在させない）。
+# GenAI semantic-convention attribute keys (kept centralized).
 GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
 GEN_AI_SYSTEM = "gen_ai.system"
 GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 
-# ループ固有の属性は loop_agent.* 名前空間に置く（GenAI 規約を汚さない）。
+# Loop-specific attributes live in the loop_agent.* namespace (without polluting the GenAI convention).
 ATTR_ITERATIONS = "loop_agent.iterations"
 ATTR_STATUS = "loop_agent.status"
 ATTR_STOP = "loop_agent.stop"
@@ -55,10 +57,12 @@ DEFAULT_SPAN_NAME = "loop_agent.loop"
 OPERATION_NAME = "loop"
 SYSTEM_NAME = "loop_agent"
 
-# 外側 Reflexion ループ (run_reflexion) 観測用の span 規約 (Issue #30)。内側 loop と
-# 同じ GenAI 規約 (gen_ai.operation.name / gen_ai.system) を踏襲しつつ、外側固有の情報は
-# loop_agent.reflexion.* 名前空間へ置く。span event (episode/epoch_boundary/lesson_decision)
-# が epoch 番号・評価器 version (= 採点係 id)・lesson 由来 (provenance) をタイムラインに刻む。
+# Span convention for observing the outer Reflexion loop (run_reflexion) (Issue #30).
+# It follows the same GenAI conventions as the inner loop (gen_ai.operation.name /
+# gen_ai.system), while placing outer-loop-specific information in the
+# loop_agent.reflexion.* namespace. Span events (episode/epoch_boundary/lesson_decision)
+# record the epoch number, evaluator version (= grader id), and lesson provenance
+# on the timeline.
 REFLEXION_SPAN_NAME = "loop_agent.reflexion"
 REFLEXION_OPERATION_NAME = "reflexion"
 
@@ -77,19 +81,20 @@ ATTR_REFLEXION_EPSILON = "loop_agent.reflexion.epsilon"
 
 
 def otel_available() -> bool:
-    """``opentelemetry`` が import できる環境かどうかを返す。"""
+    """Return whether ``opentelemetry`` can be imported in this environment."""
     return _OTEL_AVAILABLE
 
 
 class LoopSpan:
-    """ループ run 1 回を表す OTel span の薄いラッパ。OTel 不在なら no-op。
+    """Thin wrapper around the OTel span for one loop run. No-op when OTel is absent.
 
-    span のライフサイクルは :class:`~loop_agent.observe.LoopObserver` が握る:
-    :meth:`start` で開始、:meth:`add_step` で反復をタイムラインに刻み、
-    :meth:`end` で gen_ai.* 属性 + 終了理由を載せて終了する。
+    The span lifecycle is managed by :class:`~loop_agent.observe.LoopObserver`:
+    :meth:`start` starts the span, :meth:`add_step` records iterations on the
+    timeline, and :meth:`end` attaches gen_ai.* attributes plus the termination
+    reason before ending it.
 
-    OTel が未導入、または ``enabled=False`` の場合は全メソッドが安全に何もしない
-    （:attr:`recording` は ``False`` を返す）。
+    If OTel is not installed or ``enabled=False``, all methods safely do nothing
+    (:attr:`recording` returns ``False``).
     """
 
     def __init__(
@@ -102,7 +107,7 @@ class LoopSpan:
         self._span_name = span_name
         self._span: "Optional[Any]" = None
         self._ended = False
-        # OTel 不在 / 明示無効化のどちらでも no-op に倒す。
+        # Fall back to no-op when OTel is absent or explicitly disabled.
         self._enabled = bool(enabled) and _OTEL_AVAILABLE
         if self._enabled and tracer is None:
             tracer = _otel_trace.get_tracer(__name__)
@@ -110,12 +115,12 @@ class LoopSpan:
 
     @property
     def recording(self) -> bool:
-        """この span が実際に記録中か（no-op なら ``False``）。"""
+        """Return whether this span is actually recording (``False`` for no-op)."""
         return self._span is not None and not self._ended
 
     @staticmethod
     def _warn(op: str, exc: BaseException) -> None:
-        """span 操作の失敗を可視化しつつ握り潰す（観測はループを殺さない）。"""
+        """Expose span operation failures while swallowing them (observation must not kill the loop)."""
         warnings.warn(
             f"OTel span {op} failed: {type(exc).__name__}: {exc}",
             RuntimeWarning,
@@ -123,9 +128,10 @@ class LoopSpan:
         )
 
     def start(self) -> "LoopSpan":
-        """span を開始し、不変の GenAI 属性を載せる。no-op なら何もしない。
+        """Start the span and attach immutable GenAI attributes. Do nothing for no-op.
 
-        tracer 例外でループを殺さないよう best-effort。開始に失敗したら以後 no-op。
+        Best-effort so tracer exceptions do not kill the loop. If start fails,
+        subsequent operations become no-op.
         """
         if not self._enabled or self._span is not None:
             return self
@@ -133,8 +139,8 @@ class LoopSpan:
             self._span = self._tracer.start_span(self._span_name)
             self._span.set_attribute(GEN_AI_OPERATION_NAME, OPERATION_NAME)
             self._span.set_attribute(GEN_AI_SYSTEM, SYSTEM_NAME)
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
-            self._span = None  # 半端な span は捨て、以後 no-op に倒す
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
+            self._span = None  # Drop the partial span and fall back to no-op.
             self._warn("start", exc)
         return self
 
@@ -148,10 +154,10 @@ class LoopSpan:
         goal_met: bool,
         detail: str = "",
     ) -> None:
-        """1 反復を span の add_event（``loop_step``）としてタイムラインに刻む。
+        """Record one iteration on the timeline as a span add_event (``loop_step``).
 
-        ``add_step`` は driver の hot な on_step 経路で呼ばれるため、tracer 例外が
-        ループへ伝播しないよう best-effort で握る。
+        ``add_step`` is called on the driver's hot on_step path, so tracer
+        exceptions are swallowed best-effort instead of propagating to the loop.
         """
         if not self.recording:
             return
@@ -167,7 +173,7 @@ class LoopSpan:
                     "detail": detail,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("add_step", exc)
 
     def end(
@@ -181,12 +187,14 @@ class LoopSpan:
         stop: Optional[str] = None,
         error: "Optional[BaseException]" = None,
     ) -> None:
-        """終了理由 + メトリクスを gen_ai.* / loop_agent.* に載せて span を閉じる。
+        """Attach the termination reason and metrics to gen_ai.* / loop_agent.* and close the span.
 
-        ``status="error"`` または ``error`` が渡された場合は span status を ERROR に
-        し、例外を記録する。goal_met / stopped は正常終了として OK 扱い。
-        二重 end は無視する。tracer 例外でループを殺さないよう best-effort で、失敗時も
-        span.end() の到達を試み（span リークを避ける）、確実に ended 状態へ倒す。
+        If ``status="error"`` or ``error`` is passed, set the span status to
+        ERROR and record the exception. goal_met / stopped are treated as normal
+        completion and marked OK. Duplicate end calls are ignored. This is
+        best-effort so tracer exceptions do not kill the loop; even on failure it
+        still attempts to reach span.end() (to avoid span leaks) and reliably
+        moves to the ended state.
         """
         if not self.recording:
             self._ended = True
@@ -198,7 +206,7 @@ class LoopSpan:
             span.set_attribute(ATTR_TERMINATION_REASON, reason)
             span.set_attribute(ATTR_TOKENS_USED, tokens_used)
             span.set_attribute(ATTR_ELAPSED, elapsed)
-            # ダッシュボード互換のため累積トークンを GenAI usage にも写像する。
+            # Map cumulative tokens to GenAI usage as well for dashboard compatibility.
             span.set_attribute(GEN_AI_USAGE_OUTPUT_TOKENS, tokens_used)
             if stop is not None:
                 span.set_attribute(ATTR_STOP, stop)
@@ -209,36 +217,39 @@ class LoopSpan:
                 span.set_status(Status(StatusCode.ERROR, reason))
             else:
                 span.set_status(Status(StatusCode.OK))
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("end", exc)
         finally:
-            # 属性設定が失敗しても span は必ず閉じる（リーク防止）。
+            # Always close the span even if setting attributes fails (leak prevention).
             try:
                 span.end()
-            except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+            except Exception as exc:  # noqa: BLE001 - observation is best-effort
                 self._warn("end", exc)
             self._ended = True
 
 
 class ReflexionSpan:
-    """外側 Reflexion run 1 回を表す OTel span の薄いラッパ。OTel 不在なら no-op。
+    """Thin wrapper around the OTel span for one outer Reflexion run. No-op when OTel is absent.
 
-    内側 :class:`LoopSpan` と同じライフサイクル契約 (start/…/end + best-effort degrade) を
-    踏襲する。違いは、刻むタイムラインが **反復** ではなく **episode / epoch 境界 / lesson 採否**
-    である点だけ。span のライフサイクルは :class:`~loop_agent.reflexion_observe.ReflexionObserver`
-    が握る:
+    Follows the same lifecycle contract as the inner :class:`LoopSpan`
+    (start/.../end + best-effort degradation). The only difference is that the
+    recorded timeline contains **episodes / epoch boundaries / lesson admission
+    decisions** rather than **iterations**. The span lifecycle is managed by
+    :class:`~loop_agent.reflexion_observe.ReflexionObserver`:
 
-    - :meth:`start` で span を開始し、run 不変の GenAI 属性 + 構成 (declared_keys/epoch_len/epsilon)
-      を載せる。
-    - :meth:`add_episode` で 1 episode を ``episode`` event として刻む (epoch 番号・評価器
-      version = 採点係 id・一次集約 / reward・lesson 採否 / 由来 provenance を属性化)。
-    - :meth:`add_epoch` で 1 epoch 境界を ``epoch_boundary`` event として刻む (評価器昇格/却下と
-      version 遷移)。
-    - :meth:`end` で外側の終了理由 + 集計を ``loop_agent.reflexion.*`` に載せて span を閉じる。
+    - :meth:`start` starts the span and attaches run-invariant GenAI attributes
+      plus configuration (declared_keys/epoch_len/epsilon).
+    - :meth:`add_episode` records one episode as an ``episode`` event (with
+      attributes for epoch number, evaluator version = grader id, primary
+      aggregate / reward, lesson admission decision / provenance).
+    - :meth:`add_epoch` records one epoch boundary as an ``epoch_boundary`` event
+      (evaluator promotion/rejection and version transition).
+    - :meth:`end` attaches the outer-loop termination reason plus aggregates to
+      ``loop_agent.reflexion.*`` and closes the span.
 
-    OTel が未導入、または ``enabled=False`` の場合は全メソッドが安全に何もしない
-    (:attr:`recording` は ``False`` を返す)。tracer/span の例外は best-effort で握り、外側
-    ループを殺さない (観測はループを殺さない)。
+    If OTel is not installed or ``enabled=False``, all methods safely do nothing
+    (:attr:`recording` returns ``False``). tracer/span exceptions are swallowed
+    best-effort and do not kill the outer loop (observation must not kill the loop).
     """
 
     def __init__(
@@ -258,7 +269,7 @@ class ReflexionSpan:
 
     @property
     def recording(self) -> bool:
-        """この span が実際に記録中か (no-op なら ``False``)。"""
+        """Return whether this span is actually recording (``False`` for no-op)."""
         return self._span is not None and not self._ended
 
     @staticmethod
@@ -277,7 +288,7 @@ class ReflexionSpan:
         epoch_len: Optional[int] = None,
         epsilon: Optional[float] = None,
     ) -> "ReflexionSpan":
-        """span を開始し、不変の GenAI 属性 + 構成を載せる。no-op なら何もしない。"""
+        """Start the span and attach immutable GenAI attributes plus configuration. Do nothing for no-op."""
         if not self._enabled or self._span is not None:
             return self
         try:
@@ -285,7 +296,7 @@ class ReflexionSpan:
             self._span.set_attribute(GEN_AI_OPERATION_NAME, REFLEXION_OPERATION_NAME)
             self._span.set_attribute(GEN_AI_SYSTEM, SYSTEM_NAME)
             if declared_keys:
-                # OTel 属性値はスカラ列のみ許容。宣言軸はそのまま配列属性で載せる。
+                # OTel attribute values only allow scalar sequences. Store declared axes as an array attribute.
                 self._span.set_attribute(
                     ATTR_REFLEXION_DECLARED_KEYS, list(declared_keys)
                 )
@@ -297,13 +308,13 @@ class ReflexionSpan:
                 self._span.set_attribute(ATTR_REFLEXION_EPOCH_LEN, epoch_len)
             if epsilon is not None:
                 self._span.set_attribute(ATTR_REFLEXION_EPSILON, epsilon)
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
-            self._span = None  # 半端な span は捨て、以後 no-op に倒す
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
+            self._span = None  # Drop the partial span and fall back to no-op.
             self._warn("start", exc)
         return self
 
     def add_episode_begin(self, *, episode: int, epoch: int, evaluator_version: str) -> None:
-        """episode 開始を ``episode_begin`` event として刻む。"""
+        """Record episode start as an ``episode_begin`` event."""
         if not self.recording:
             return
         try:
@@ -315,7 +326,7 @@ class ReflexionSpan:
                     "evaluator_version": evaluator_version,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("add_episode_begin", exc)
 
     def add_episode(
@@ -333,7 +344,7 @@ class ReflexionSpan:
         lesson_provenance: str = "",
         detail: str = "",
     ) -> None:
-        """1 episode を ``episode`` event として span タイムラインに刻む。"""
+        """Record one episode on the span timeline as an ``episode`` event."""
         if not self.recording:
             return
         attributes: "dict[str, Any]" = {
@@ -348,13 +359,13 @@ class ReflexionSpan:
             "lesson_provenance": lesson_provenance,
             "detail": detail,
         }
-        # best が -inf (ground-truth-backed episode が未到来) なら属性化しない (OTel に -inf を
-        # 載せない。run-end の end() ガードと同じ規約)。
+        # Do not attach best when it is -inf (no ground-truth-backed episode has arrived),
+        # avoiding -inf in OTel. This follows the same convention as the run-end end() guard.
         if best_gt_aggregate != float("-inf"):
             attributes["best_gt_aggregate"] = best_gt_aggregate
         try:
             self._span.add_event("episode", attributes=attributes)
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("add_episode", exc)
 
     def add_lesson(
@@ -366,7 +377,7 @@ class ReflexionSpan:
         support: float = 0.0,
         reason: str = "",
     ) -> None:
-        """lesson 採用/拒否を ``lesson_decision`` event として刻む。"""
+        """Record lesson admission/rejection as a ``lesson_decision`` event."""
         if not self.recording:
             return
         try:
@@ -380,7 +391,7 @@ class ReflexionSpan:
                     "reason": reason,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("add_lesson", exc)
 
     def add_epoch(
@@ -394,7 +405,7 @@ class ReflexionSpan:
         incumbent_agreement: Optional[float] = None,
         candidate_agreement: Optional[float] = None,
     ) -> None:
-        """1 epoch 境界を ``epoch_boundary`` event として刻む (評価器昇格/却下)。"""
+        """Record one epoch boundary as an ``epoch_boundary`` event (evaluator promotion/rejection)."""
         if not self.recording:
             return
         attributes: "dict[str, Any]" = {
@@ -410,7 +421,7 @@ class ReflexionSpan:
             attributes["candidate_agreement"] = candidate_agreement
         try:
             self._span.add_event("epoch_boundary", attributes=attributes)
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("add_epoch", exc)
 
     def end(
@@ -427,11 +438,13 @@ class ReflexionSpan:
         stop: Optional[str] = None,
         error: "Optional[BaseException]" = None,
     ) -> None:
-        """外側の終了理由 + 集計を ``loop_agent.reflexion.*`` に載せて span を閉じる。
+        """Attach the outer-loop termination reason plus aggregates to ``loop_agent.reflexion.*`` and close the span.
 
-        ``status="error"`` または ``error`` が渡された場合は span status を ERROR にし例外を
-        記録する。``converged`` / ``stopped`` / ``paused`` は正常終了として OK 扱い。二重 end は
-        無視する。属性設定が失敗しても span.end() の到達を試み (リーク防止)、確実に ended へ倒す。
+        If ``status="error"`` or ``error`` is passed, set the span status to
+        ERROR and record the exception. ``converged`` / ``stopped`` / ``paused``
+        are treated as normal completion and marked OK. Duplicate end calls are
+        ignored. Even if setting attributes fails, still attempt to reach
+        span.end() (leak prevention) and reliably move to ended.
         """
         if not self.recording:
             self._ended = True
@@ -442,8 +455,8 @@ class ReflexionSpan:
             span.set_attribute(ATTR_REFLEXION_REASON, reason)
             span.set_attribute(ATTR_REFLEXION_EPISODES, episodes)
             span.set_attribute(ATTR_REFLEXION_EPOCHS, epochs)
-            # best が -inf (ground-truth-backed episode が 1 つも無い) のときは属性化しない
-            # (OTel に -inf を載せない / ダッシュボード側の数値集計を壊さない)。
+            # Do not attach best when it is -inf (there are no ground-truth-backed
+            # episodes), avoiding -inf in OTel and preserving dashboard-side numeric aggregation.
             if best_gt_aggregate != float("-inf"):
                 span.set_attribute(ATTR_REFLEXION_BEST, best_gt_aggregate)
             span.set_attribute(ATTR_REFLEXION_REFLECTIONS, reflections)
@@ -461,11 +474,11 @@ class ReflexionSpan:
                 span.set_status(Status(StatusCode.ERROR, reason))
             else:
                 span.set_status(Status(StatusCode.OK))
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("end", exc)
         finally:
             try:
                 span.end()
-            except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+            except Exception as exc:  # noqa: BLE001 - observation is best-effort
                 self._warn("end", exc)
             self._ended = True

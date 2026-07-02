@@ -1,30 +1,39 @@
-"""外側 Reflexion ループ駆動: 試行間の言語的自己改善 + RQGM epoch 安全核 (Issue #22).
+"""Outer Reflexion loop driver: linguistic self-improvement across attempts + RQGM epoch safety core (Issue #22).
 
-内側 ReAct ループ (:func:`loop_agent.loop.run_loop`) を **1 episode** として包み、episode
-境界で ``reflect(trajectory, signal, reward)`` を回して言語的指針を
-:class:`~loop_agent.memory.EpisodicMemory` に取り込み、次 episode の context へ配線する
-(report.md S4.4 擬似コード / S5 Phase3)。
+Wrap the inner ReAct loop (:func:`loop_agent.loop.run_loop`) as **one episode**,
+run ``reflect(trajectory, signal, reward)`` at episode boundaries, admit the
+resulting linguistic guidance into :class:`~loop_agent.memory.EpisodicMemory`,
+and wire it into the next episode's context (report.md S4.4 pseudocode /
+S5 Phase3).
 
-**二信号モデル (本設計の肝・安全核)**: 各 episode は 2 つの異なる信号を生む。
+**Two-signal model (the heart of this design and its safety core)**: each
+episode produces two distinct signals.
 
-- ``signal`` (:class:`~loop_agent.evaluator.GroundTruthSignal`): **ground-truth 一次**。
-  内側 verify (test/lint/exit-code) と ``LoopResult.succeeded`` に由来し、駆動側が計算する。
-  収束/頭打ち/best/評価器昇格ゲート/lesson 採用 ― すべての **帰結ある制御** はこれが駆動する。
-  epoch をまたぐ評価器の入れ替えに依存しない (評価器非依存スケール)。
-- ``reward`` (float): **epoch 内で固定**された rubric 評価器の出力。Reflexion の verbal
-  reinforcement として **``reflect`` だけが消費** する。収束/採用判定には一切載らない。
+- ``signal`` (:class:`~loop_agent.evaluator.GroundTruthSignal`): **ground-truth
+  primary**. It comes from inner verification (test/lint/exit-code) and
+  ``LoopResult.succeeded`` and is computed by the driver. All **consequential
+  control** decisions -- convergence, plateauing, best score, evaluator
+  promotion gates, and lesson admission -- are driven by this signal. It does
+  not depend on evaluator replacement across epochs (evaluator-independent
+  scale).
+- ``reward`` (float): output from the rubric evaluator **fixed within the
+  epoch**. Only **``reflect`` consumes** it as Reflexion verbal reinforcement.
+  It is never used for convergence or admission decisions.
 
-これにより「gameable な評価器スカラを押し上げて収束を宣言する」抜け道が構造的に塞がれる
-(report.md 原則: ground-truth 優先)。評価器の入れ替えは **epoch 境界** でのみ、かつ held-out
-固定 gold に対する epsilon-best-belief ゲート (:func:`loop_agent.evaluator.admit_evaluator`)
-を通ったときに限る (RQGM。Issue #4)。
+This structurally closes the loophole of "pushing up a gameable evaluator scalar
+and declaring convergence" (report.md principle: ground truth first). Evaluators
+may be replaced only at **epoch boundaries**, and only after passing the
+epsilon-best-belief gate (:func:`loop_agent.evaluator.admit_evaluator`) against
+fixed held-out gold data (RQGM; Issue #4).
 
-**dual-component 分離**: production 経路 (``episode`` -> 内側 run_loop。副作用あり) と、評価器
-昇格の測定経路 (事前収録 :class:`~loop_agent.evaluator.HeldOut` probe の採点。副作用なし) を
-分ける。両者の task 名前空間が素であることを構成時に検証する。
+**Dual-component separation**: separate the production path (``episode`` ->
+inner run_loop, with side effects) from the evaluator-promotion measurement path
+(scoring predefined :class:`~loop_agent.evaluator.HeldOut` probes, with no side
+effects). Configuration verifies that their task namespaces are disjoint.
 
-本モジュールは **単一プロセス** の self-improving に集中する。分散協調・外側ループの永続化は
-本 issue の範囲外 (前者は #21、後者は追跡 follow-up)。
+This module focuses on **single-process** self-improvement. Distributed
+coordination and outer-loop persistence are out of scope for this issue (the
+former is #21; the latter is a tracked follow-up).
 """
 
 from __future__ import annotations
@@ -57,10 +66,11 @@ from .state import StepRecord
 
 @dataclass(frozen=True)
 class EpisodeOutcome:
-    """内側 :class:`~loop_agent.loop.LoopResult` の **読み取り専用** ビュー。
+    """A **read-only** view of an inner :class:`~loop_agent.loop.LoopResult`.
 
-    ground-truth 一次信号 (内側 verify の結果) の権威ソース。reflect / 取込前検証 / 評価器が
-    参照するのは ``history`` (軌跡) と ``succeeded`` (権威ある成否)。
+    Authoritative source for the ground-truth primary signal (the result of
+    inner verification). ``reflect``, pre-admission verification, and evaluators
+    consult ``history`` (trajectory) and ``succeeded`` (authoritative outcome).
     """
 
     result: LoopResult
@@ -84,12 +94,17 @@ class EpisodeOutcome:
 
 @dataclass(frozen=True)
 class ReflexionContext:
-    """``episode`` フックに渡す文脈。``memory_block`` を内側 gather に折り込むのは呼び出し側。
+    """Context passed to the ``episode`` hook.
 
-    - ``episode`` / ``epoch`` : 現在の外側カウンタ。
-    - ``task``                : この episode の production タスク (held-out と素な名前空間)。
-    - ``evaluator``           : この epoch で **固定**された評価器 (reward 採点用)。
-    - ``memory_block``        : :meth:`EpisodicMemory.render` の文字列。前試行の学びの配線元。
+    The caller incorporates ``memory_block`` into the inner episode context or
+    prompt before running the inner loop.
+
+    - ``episode`` / ``epoch`` : current outer counters.
+    - ``task``                : production task for this episode (namespace
+      disjoint from held-out tasks).
+    - ``evaluator``           : evaluator **fixed** for this epoch (for reward scoring).
+    - ``memory_block``        : string from :meth:`EpisodicMemory.render`, used
+      to wire lessons from prior attempts.
     """
 
     episode: int
@@ -101,13 +116,13 @@ class ReflexionContext:
 
 @dataclass
 class EpisodeRecord:
-    """1 episode の確定記録 (監査・観測単位)。"""
+    """Finalized record for one episode (audit and observation unit)."""
 
     episode: int
     epoch: int
     evaluator_version: str
-    signal: GroundTruthSignal  # 一次
-    reward: float  # epoch 固定評価器の reflect 用ラベル
+    signal: GroundTruthSignal  # Primary signal.
+    reward: float  # Label from the epoch-fixed evaluator for reflect.
     gt_aggregate: float
     lesson: Optional[Lesson] = None
     admitted: bool = False
@@ -117,33 +132,36 @@ class EpisodeRecord:
 
 @dataclass(frozen=True)
 class EpochRecord:
-    """1 epoch 境界の確定記録 (監査・観測単位)。評価器交代の判定結果を運ぶ。
+    """Finalized record for one epoch boundary (audit and observation unit).
 
-    epoch 境界は incumbent 評価器を入れ替えてよい **唯一** の地点 (RQGM 安全ゲート)。本記録は
-    その境界で何が起きたか ― 候補が提案されたか / 昇格したか却下されたか / version がどう動いたか
-    ― を観測する **読み取り専用** ビューで、:func:`run_reflexion` の判断ロジックには一切載らない
-    (観測の側チャネル)。``admission`` が ``None`` なら候補は提案されなかった (評価器不変)。
+    Carries the evaluator-replacement decision. An epoch boundary is the
+    **only** point where the incumbent evaluator may be replaced (RQGM safety
+    gate). This record is a **read-only** observation of what happened at that
+    boundary -- whether a candidate was proposed, promoted, or rejected, and how
+    the version moved -- and is never used by :func:`run_reflexion` decision
+    logic (an observation side channel). If ``admission`` is ``None``, no
+    candidate was proposed (the evaluator is unchanged).
     """
 
-    epoch: int  # 境界で進んだ後の新 epoch 番号
-    boundary_episode: int  # 境界が発生した時点の完了 episode 数
-    previous_version: str  # 判定前の incumbent version
-    evaluator_version: str  # 判定後の incumbent version
-    admission: Optional[AdmissionResult] = None  # 候補提案時のみ昇格判定結果が載る
+    epoch: int  # New epoch number after advancing at the boundary.
+    boundary_episode: int  # Completed episode count when the boundary occurred.
+    previous_version: str  # Incumbent version before the decision.
+    evaluator_version: str  # Incumbent version after the decision.
+    admission: Optional[AdmissionResult] = None  # Promotion decision result, only if a candidate was proposed.
 
     @property
     def proposed(self) -> bool:
-        """この境界で候補評価器が提案されたか。"""
+        """Whether a candidate evaluator was proposed at this boundary."""
         return self.admission is not None
 
     @property
     def promoted(self) -> bool:
-        """候補が実際に昇格したか (提案され、かつ採用された)。"""
+        """Whether the candidate was actually promoted (proposed and accepted)."""
         return self.admission is not None and self.admission.promoted
 
     @property
     def decision(self) -> str:
-        """境界の評価器決定: ``"unchanged"`` (未提案) / ``"promoted"`` / ``"rejected"``。"""
+        """Evaluator decision at the boundary: ``"unchanged"`` (not proposed), ``"promoted"``, or ``"rejected"``."""
         if self.admission is None:
             return "unchanged"
         return "promoted" if self.admission.promoted else "rejected"
@@ -151,7 +169,7 @@ class EpochRecord:
 
 @dataclass
 class ReflexionState:
-    """外側ループの可変アキュムレータ (収束条件が射影 :meth:`outer_state` を見る)。"""
+    """Mutable accumulator for the outer loop (convergence conditions inspect the :meth:`outer_state` projection)."""
 
     episode: int = 0
     epoch: int = 0
@@ -165,7 +183,7 @@ class ReflexionState:
     memory: EpisodicMemory = field(default_factory=EpisodicMemory)
 
     def outer_state(self) -> OuterState:
-        """収束条件 (:class:`~loop_agent.convergence.OuterState`) 用の不変射影を返す。"""
+        """Return an immutable projection for convergence conditions (:class:`~loop_agent.convergence.OuterState`)."""
         return OuterState(
             episode=self.episode,
             epoch=self.epoch,
@@ -180,17 +198,21 @@ class ReflexionState:
 
 @dataclass
 class ReflexiveResult:
-    """外側ループの結果。``status`` は ``"converged"`` / ``"stopped"`` / ``"paused"``。
+    """Result of the outer loop. ``status`` is ``"converged"``, ``"stopped"``, or ``"paused"``.
 
-    ``succeeded`` は **トリガ順に依存せず** 状態から判定する: 終了時点で成功条件
-    (:class:`~loop_agent.convergence.RubricThreshold`) が満たされていれば成功
-    (内側ループの ``stop.name`` 依存判定が抱える順序問題を踏まない)。
+    ``succeeded`` is determined from state **without depending on trigger
+    order**: if a success condition (:class:`~loop_agent.convergence.RubricThreshold`)
+    is satisfied at termination, the run succeeded (avoiding the ordering issue
+    of inner-loop checks that depend on ``stop.name``).
 
-    ``status == "paused"`` は内側 episode が人間ゲートで中断した場合 (``stop`` は ``None``、
-    ``pending`` に内側 :class:`~loop_agent.loop.LoopResult` の pending を載せる)。この episode は
-    **未完了**として記録せず (gt/reflect も走らせず) episode を進めない。人間がゲート決定を
-    永続化した後に同じ引数で resume すれば、同じ episode が再実行され内側ゲートが決定を適用して
-    完了する (内側の pause/resume 契約をそのまま外側へ伝播する。Issue #15)。
+    ``status == "paused"`` means the inner episode paused at a human gate
+    (``stop`` is ``None`` and ``pending`` carries the pending value from the
+    inner :class:`~loop_agent.loop.LoopResult`). This episode is treated as
+    **incomplete**: it is not recorded, gt/reflect are not run, and the episode
+    counter is not advanced. After the human gate decision is persisted,
+    resuming with the same arguments reruns the same episode and lets the inner
+    gate apply the decision and complete (propagating the inner pause/resume
+    contract outward unchanged; Issue #15).
     """
 
     status: str
@@ -225,18 +247,22 @@ class ReflexiveResult:
         return self.stop.reason if self.stop is not None else ""
 
 
-# フック型。
+# Hook types.
 EpisodeFn = Callable[[ReflexionContext], LoopResult]
-# reflect: (軌跡, 一次信号, 固定評価器の reward) -> 言語的 lesson (or None)。
-# 返した Lesson の ``episode`` / ``support`` は driver が正本で上書きする (hook は正しい
-# episode 番号や権威 support を知らないため。``text`` / ``provenance`` のみ hook 由来)。
+# reflect: (trajectory, primary signal, fixed evaluator reward) -> linguistic lesson (or None).
+# The driver overwrites ``episode`` and ``support`` on the returned Lesson as
+# the source of truth because the hook does not know the correct episode number
+# or authoritative support. Only ``text`` and ``provenance`` come from the hook.
 ReflectHook = Callable[
     [tuple[StepRecord, ...], GroundTruthSignal, float], Optional[Lesson]
 ]
 EpisodeHook = Callable[[EpisodeRecord, ReflexionState], None]
-# epoch 境界の観測フック。境界で評価器交代の判定が確定した後に呼ばれる純粋な側チャネル
-# (制御に載らない)。例外で run を倒さないよう、実装側が best-effort に握る責務を負う
-# (既存 on_episode と同契約。観測の degrade は :class:`~loop_agent.reflexion_observe.ReflexionObserver`)。
+# Observation hook for epoch boundaries. Called after the evaluator-replacement
+# decision is finalized at the boundary, as a pure side channel (not used for
+# control). Implementations are responsible for best-effort exception handling
+# so they do not bring down the run (same contract as existing on_episode;
+# observation degradation belongs to
+# :class:`~loop_agent.reflexion_observe.ReflexionObserver`).
 EpochHook = Callable[[EpochRecord], None]
 ProposeEvaluatorFn = Callable[[OuterState, Evaluator], Optional[Evaluator]]
 OuterConditions = Union[AnyOf, Sequence[StopCondition]]
@@ -254,11 +280,13 @@ def _normalize_conditions(conditions: OuterConditions) -> AnyOf:
 
 
 def _is_success(stop: AnyOf, state: OuterState) -> bool:
-    """終了時点で **いずれかの成功条件** が満たされているか (順序非依存)。
+    """Whether **any success condition** is satisfied at termination (order-independent).
 
-    AnyOf が最初に発火した条件を返すため、成功条件とハード上限が同一 guard で同時発火した
-    場合に ``stop.name`` で成否を決めると順序に依存する。代わりに「成功条件が現在満たされて
-    いるか」を直接問うことで、どの順で並んでいても成否が一定になる。
+    Because AnyOf returns the first triggered condition, deciding success from
+    ``stop.name`` becomes order-dependent if a success condition and a hard
+    limit trigger simultaneously under the same guard. Instead, directly ask
+    whether a success condition is currently satisfied, so the outcome is stable
+    regardless of condition ordering.
     """
     for condition in stop.conditions:
         if is_success_condition(condition) and condition.check(state) is not None:
@@ -276,27 +304,36 @@ def _advance_epoch_boundary(
     delta: float,
     on_epoch: Optional[EpochHook] = None,
 ) -> Evaluator:
-    """epoch 境界処理: epoch を 1 つ進め、incumbent を入れ替えてよい **唯一** の場所。
+    """Epoch-boundary processing: advance one epoch, the **only** place the incumbent may be replaced.
 
-    本体は ``run_reflexion`` のメインループから切り出した **挙動不変** のヘルパ (安全核の昇格
-    ゲート :func:`~loop_agent.evaluator.admit_evaluator` / 二信号モデル / 採択基準には一切踏み
-    込まない。呼び出し点を増やすだけ)。メインループの境界と、resume 時に「中断地点で *終端扱い*
-    として抑止された末尾境界」を取り戻す recovery の **両方** から呼ぶ。これにより、ある境界を
-    跨いで継続する resume が通し実行と同じ epoch 進行・評価器昇格・**観測 (on_epoch) emit** を
-    再現する (Issue #29: 中断→resume が通し実行と一致 / Issue #30: epoch 観測の整合)。
+    This helper is factored out of the ``run_reflexion`` main loop with
+    **behavior unchanged**. It does not alter the safety-core promotion gate
+    (:func:`~loop_agent.evaluator.admit_evaluator`), the two-signal model, or
+    adoption criteria; it only adds call sites. It is called both from normal
+    main-loop boundaries and from resume recovery that restores a "tail
+    boundary suppressed as terminal at the interruption point." This lets a
+    resume that continues across a boundary reproduce the same epoch advance,
+    evaluator promotion, and **observation (on_epoch) emission** as an
+    uninterrupted run (Issue #29: interrupt -> resume matches uninterrupted
+    execution / Issue #30: epoch observation consistency).
 
-    集約ゲートは回転 fold で測る (anti-overfit) が、fold/critical 後退チェックは held-out 全体で
-    行う (選ばれなかった fold の犠牲を弾く)。``state.epoch`` を先に進めてから ``held_out.fold``
-    を引くので、fold 回転は **進めた後** の epoch で決まる (元のメインループと同一)。
+    The aggregate gate is measured on a rotating fold (anti-overfit), while
+    fold/critical regression checks run across the full held-out set (rejecting
+    sacrifices on folds that were not selected). Since ``state.epoch`` advances
+    before ``held_out.fold`` is taken, fold rotation is determined by the epoch
+    **after** advancing (same as the original main loop).
 
-    ``on_epoch`` (側チャネル観測) は判定が完全に確定した後に呼ぶので帰結ある制御に介入しない。
-    両呼び出し点から渡すことで、suppressed 末尾境界を resume の recovery で取り戻したときも
-    ``epoch_boundary`` event が 1 度 emit され、観測の epoch 数が最終 ``state.epoch`` と整合する
-    (recovery で event を出さないと、通し実行に比べ epoch_boundary が 1 件欠ける)。
+    ``on_epoch`` (side-channel observation) is called only after the decision is
+    fully finalized, so it cannot intervene in consequential control. Passing it
+    from both call sites ensures that when resume recovery restores a suppressed
+    tail boundary, one ``epoch_boundary`` event is emitted and the observed
+    epoch count agrees with final ``state.epoch`` (without a recovery event,
+    there would be one fewer epoch_boundary than in uninterrupted execution).
     """
     state.epoch += 1
-    # 観測用に判定前 version と昇格結果を控える (判断ロジックは不変。admission は候補が提案された
-    # ときだけ埋まり、未提案なら None = 評価器不変を表す)。
+    # Keep the pre-decision version and promotion result for observation
+    # (decision logic is unchanged). ``admission`` is populated only when a
+    # candidate is proposed; otherwise None means the evaluator is unchanged.
     previous_version = incumbent.version
     admission: Optional[AdmissionResult] = None
     if propose_evaluator is not None:
@@ -348,48 +385,71 @@ def run_reflexion(
     persist: Optional[EpisodeHook] = None,
     initial_state: Optional[ReflexionState] = None,
 ) -> ReflexiveResult:
-    """外側 Reflexion ループを回す入口 (二信号モデル + RQGM epoch ゲート)。
+    """Entry point for running the outer Reflexion loop (two-signal model + RQGM epoch gate).
 
     Args:
-        episode: production 経路。``ReflexionContext`` を受け取り内側 ``run_loop`` を 1 回
-            回して :class:`~loop_agent.loop.LoopResult` を返す (driver は内側に手を入れない)。
-        ground_truth: **一次信号源**。``EpisodeOutcome`` から
-            :class:`~loop_agent.evaluator.GroundTruthSignal` を作る (内側 verify 由来)。
-        reflect: episode 境界で軌跡/一次信号/reward から言語的 lesson を抽出するフック。
-            例外は **非致命** (lesson を捨てて続行する)。
-        evaluator: 初期 incumbent 評価器。各 epoch 内で固定され、reward (reflect 用ラベル)
-            を採点する。境界でのみ :func:`~loop_agent.evaluator.admit_evaluator` 経由で交代。
-        convergence: :class:`~loop_agent.conditions.AnyOf` または停止条件列
-            (:mod:`loop_agent.convergence`)。内側と同じ合成プロトコルを再利用する。
-        declared_keys: 多様評価の宣言軸 (集約は宣言軸の最小値。欠落は 0.0)。非空必須。
-        production_tasks: episode ごとの production タスク列 (``episode % len`` で循環)。
-        held_out: 評価器昇格の測定基盤 (固定 gold ラベル付き probe)。dual-component の測定経路。
-        epoch_len: 1 epoch の episode 数。``>= 2`` 必須 (1 は「毎 episode 更新 = 動く評価器」)。
-        epsilon: epsilon-best-belief の churn 防止余白。``> 0`` 必須。
-        delta: fold 単位後退の許容幅。
-        propose_evaluator: 境界で候補評価器を提案するフック (``None`` なら評価器は不変)。
-        admit_lesson: 取込前検証フック (既定 :func:`~loop_agent.memory.default_admit`)。
-            **support は driver が grounding から再計算して上書き** するので、自己申告 support は
-            効かない。意味的/効果ベースの検証はここを差し替える。
-        memory: 既存の :class:`EpisodicMemory` (resume 等)。``None`` なら新規。
-        task_id: production タスク -> 識別子。held-out との素性検証に使う (既定 ``str``)。
-        on_episode: 各 episode 確定後・**epoch 境界処理の前**に呼ぶ観測フック (record 監査用)。
-        on_epoch: 各 epoch 境界で評価器交代の判定が確定した後に呼ぶ観測フック
-            (:class:`EpochRecord` を受け取る純粋な側チャネル。制御には載らない)。
-        persist: 各 episode が **完全に確定した後** (epoch 昇格・評価器入れ替えを含む境界処理の
-            *後*) に呼ぶ永続化フック。``on_episode`` が境界処理 *前* の状態を見るのに対し、
-            ``persist`` は **settled な** :class:`ReflexionState` (post-boundary の epoch /
-            evaluator_version / evaluator_updates) を見るので、これを state.db に書けば中断
-            地点から resume したとき通し実行と一致する (epoch 進行・採用 lesson・評価器 version・
-            best ground-truth)。例外は **非致命にしない** (永続化に失敗したら resume できない
-            ので loud に倒す。:class:`~loop_agent.reflexion_store.DBReflexionLog` が配線例)。
-        initial_state: 外側 resume の seed (内側 ``run_loop`` の ``initial_state`` に対応)。
-            :meth:`~loop_agent.reflexion_store.ReflexionStore.load_or_init` が state.db から
-            復元した :class:`ReflexionState` を渡すと、永続化済みの続きから再開できる。
+        episode: production path. Receives ``ReflexionContext``, runs the inner
+            ``run_loop`` once, and returns :class:`~loop_agent.loop.LoopResult`
+            (the driver does not modify the inner loop).
+        ground_truth: **Primary signal source**. Builds
+            :class:`~loop_agent.evaluator.GroundTruthSignal` from
+            ``EpisodeOutcome`` (derived from inner verification).
+        reflect: hook that extracts a linguistic lesson from
+            trajectory/primary signal/reward at an episode boundary. Exceptions
+            are **non-fatal** (the lesson is discarded and execution continues).
+        evaluator: initial incumbent evaluator. It is fixed within each epoch
+            and scores reward (the label for reflect). It is replaced only at
+            boundaries via :func:`~loop_agent.evaluator.admit_evaluator`.
+        convergence: :class:`~loop_agent.conditions.AnyOf` or a sequence of
+            stop conditions (:mod:`loop_agent.convergence`). Reuses the same
+            composition protocol as the inner loop.
+        declared_keys: declared axes for diverse evaluation (aggregate is the
+            minimum over declared axes; missing axes are 0.0). Must be non-empty.
+        production_tasks: sequence of production tasks per episode (cycles with
+            ``episode % len``).
+        held_out: measurement substrate for evaluator promotion (probes with
+            fixed gold labels). This is the dual-component measurement path.
+        epoch_len: number of episodes in one epoch. Must be ``>= 2`` (1 would
+            mean "update every episode = moving evaluator").
+        epsilon: anti-churn margin for epsilon-best-belief. Must be ``> 0``.
+        delta: allowed per-fold regression margin.
+        propose_evaluator: hook that proposes a candidate evaluator at a
+            boundary (``None`` means the evaluator is unchanged).
+        admit_lesson: pre-admission verification hook (default
+            :func:`~loop_agent.memory.default_admit`). **support is recomputed
+            from grounding and overwritten by the driver**, so self-reported
+            support has no effect. Replace this hook for semantic/effect-based
+            verification.
+        memory: existing :class:`EpisodicMemory` (for resume, etc.). ``None``
+            creates a new memory.
+        task_id: production task -> identifier. Used to verify disjointness
+            from held-out tasks (default ``str``).
+        on_episode: observation hook called after each episode is finalized and
+            **before epoch-boundary processing** (for record auditing).
+        on_epoch: observation hook called at each epoch boundary after the
+            evaluator-replacement decision is finalized (pure side channel
+            receiving :class:`EpochRecord`; not used for control).
+        persist: persistence hook called after each episode is **fully
+            finalized** (*after* boundary processing, including epoch promotion
+            and evaluator replacement). While ``on_episode`` sees state *before*
+            boundary processing, ``persist`` sees the **settled**
+            :class:`ReflexionState` (post-boundary epoch / evaluator_version /
+            evaluator_updates). Writing this to state.db makes resume from an
+            interruption point match uninterrupted execution (epoch advancement,
+            admitted lessons, evaluator version, and best ground truth).
+            Exceptions are **not non-fatal**: if persistence fails, resume is
+            impossible, so fail loudly. :class:`~loop_agent.reflexion_store.DBReflexionLog`
+            is an example wiring.
+        initial_state: seed for outer resume (corresponds to inner
+            ``run_loop``'s ``initial_state``). Passing a :class:`ReflexionState`
+            restored from state.db by
+            :meth:`~loop_agent.reflexion_store.ReflexionStore.load_or_init`
+            resumes from the persisted continuation point.
 
     Raises:
-        ConfigError: ``epoch_len < 2`` / ``epsilon <= 0`` / ``declared_keys`` 空 /
-            ``production_tasks`` 空 / production と held-out の task 名前空間が交差する場合。
+        ConfigError: if ``epoch_len < 2``, ``epsilon <= 0``, ``declared_keys``
+            is empty, ``production_tasks`` is empty, or production and held-out
+            task namespaces overlap.
     """
     if epoch_len < 2:
         raise ConfigError(
@@ -401,7 +461,8 @@ def run_reflexion(
         raise ConfigError("declared_keys must be non-empty (diverse evaluation)")
     if not production_tasks:
         raise ConfigError("production_tasks must be non-empty")
-    # dual-component 分離: production と held-out の task 名前空間が素であることを検証。
+    # Dual-component separation: verify that production and held-out task
+    # namespaces are disjoint.
     prod_ids = {task_id(t) for t in production_tasks}
     held_ids = {p.case_id for p in held_out.probes}
     overlap = prod_ids & held_ids
@@ -414,11 +475,14 @@ def run_reflexion(
     stop = _normalize_conditions(convergence)
 
     if initial_state is not None:
-        # 外側 resume: 前 run が境界で評価器を昇格していたら、復元 state の evaluator_version は
-        # その昇格後の version を指す。評価器 (callable) は直列化できず復元できないため、
-        # **silently 別 evaluator に差し替えない**。復元 version と渡された evaluator.version が
-        # 食い違うなら、resume 地点で有効だった評価器を渡すよう loud に要求する (epoch-freeze の
-        # 監査証跡を resume の継ぎ目で壊さない。version→Evaluator registry での完全復元は follow-up)。
+        # Outer resume: if the previous run promoted an evaluator at a boundary,
+        # the restored state's evaluator_version points to the post-promotion
+        # version. Because evaluators (callables) cannot be serialized and
+        # restored, do **not silently swap in a different evaluator**. If the
+        # restored version and supplied evaluator.version differ, fail loudly and
+        # require the evaluator that was active at the resume point (preserving
+        # the epoch-freeze audit trail across the resume join). Full restoration
+        # through a version -> Evaluator registry is a follow-up.
         if (
             initial_state.evaluator_version
             and initial_state.evaluator_version != evaluator.version
@@ -429,10 +493,13 @@ def run_reflexion(
                 "reconstruct an evaluator (callables are not serializable); supply the evaluator "
                 "that was active at the resume point (its version must match the persisted one)."
             )
-        # 同様に declared_keys の整合も要求する: 復元 state の gt_aggregate_history /
-        # best_gt_aggregate は **当時の declared_keys で集約された値**。別の軸集合で resume すると、
-        # その stale な集約に対して RubricThreshold 等が誤発火し、過去 episode が満たしていない
-        # rubric で「収束」を宣言しうる。一致しなければ loud に弾く (集約は遡及再計算しない方針)。
+        # Likewise, require declared_keys to match: the restored state's
+        # gt_aggregate_history / best_gt_aggregate were **aggregated under the
+        # declared_keys of that run**. Resuming with a different axis set could
+        # make RubricThreshold and similar conditions fire on stale aggregates,
+        # declaring "convergence" for a rubric the past episodes did not satisfy.
+        # Reject mismatches loudly (aggregates are intentionally not recomputed
+        # retroactively).
         if (
             initial_state.declared_keys
             and tuple(initial_state.declared_keys) != tuple(declared_keys)
@@ -443,11 +510,13 @@ def run_reflexion(
                 "history was computed under the old axes and would be stale. Supply the same "
                 "declared_keys used for the original run (or start a fresh run)."
             )
-        # 内側 run_loop と同じく seed を **破壊的に使わない**: caller が保持する resume snapshot を
-        # その場で進めてしまうと、失敗/再試行の再 resume が既に進んだ seed から始まり episode を
-        # 飛ばす。list と memory を複製した独立 state にコピーする (EpisodeRecord/Lesson は
-        # append-only かつ frozen なので浅く共有してよい)。memory が明示指定されていればそれを
-        # live で使う (caller が満たす目的で渡した live オブジェクト)。
+        # As in the inner run_loop, do **not mutate the seed destructively**: if
+        # the caller's resume snapshot were advanced in place, a failed retry
+        # could resume from an already-advanced seed and skip episodes. Copy into
+        # an independent state with duplicated lists and memory (EpisodeRecord /
+        # Lesson are append-only and frozen, so shallow sharing is fine). If
+        # memory was supplied explicitly, use it live (the caller passed that
+        # object for a reason).
         state = ReflexionState(
             episode=initial_state.episode,
             epoch=initial_state.epoch,
@@ -461,22 +530,29 @@ def run_reflexion(
             memory=memory if memory is not None else initial_state.memory.copy(),
         )
     else:
-        # `memory or EpisodicMemory()` は不可: 空の EpisodicMemory は __len__==0 で falsy のため
-        # 渡された空 memory が捨てられる。明示的に None 判定する。
+        # Do not use `memory or EpisodicMemory()`: an empty EpisodicMemory is
+        # falsy because __len__==0, which would discard an explicitly supplied
+        # empty memory. Check for None explicitly.
         state = ReflexionState(memory=memory if memory is not None else EpisodicMemory())
     state.declared_keys = declared_keys
     incumbent = evaluator
     state.evaluator_version = incumbent.version
 
-    # resume の末尾境界 recovery: 前 run が **epoch 境界ちょうど** (episode % epoch_len == 0) で
-    # 中断していると、その境界処理は「終端扱い」として抑止され epoch/評価器昇格が未処理のまま
-    # 永続化される (メインループの境界は現在の stop が発火していると抑止するため。これは単発 run
-    # では正しいが、より緩い budget で継続する resume では「跨ぐべき境界」を取りこぼす)。継続する
-    # resume はこの **唯一抑止されうる末尾境界** をここで取り戻し、通し実行と同じ epoch 進行・
-    # 評価器昇格を再現する。判定: episode が境界の倍数なのに epoch がその含意する境界数に 1 足り
-    # ない (= 末尾境界が未処理) かつ、渡された convergence で今まさに終端でない (終端なら単発 run
-    # と同じく抑止のままにし、直後の while ガードで即終了させる)。抑止されうる末尾境界は高々 1 つ
-    # (それ以前の境界はすべて非終端で処理済み) なので recovery も最大 1 回。
+    # Tail-boundary recovery for resume: if the previous run stopped **exactly
+    # at an epoch boundary** (episode % epoch_len == 0), that boundary processing
+    # may have been suppressed as "terminal", leaving epoch advancement and
+    # evaluator promotion unprocessed in persisted state. Main-loop boundaries
+    # are suppressed when the current stop condition is already triggered. That
+    # is correct for a single run, but a resume with a looser budget should not
+    # miss a boundary it must cross. A continuing resume restores this **only
+    # tail boundary that can be suppressed** here, reproducing the same epoch
+    # advancement and evaluator promotion as uninterrupted execution. Criteria:
+    # the episode count is a boundary multiple, epoch is one short of the implied
+    # boundary count (= tail boundary unprocessed), and the supplied convergence
+    # is not terminal right now (if terminal, keep it suppressed like a single
+    # run and let the immediately following while guard return). At most one
+    # tail boundary can be suppressed (all earlier boundaries were non-terminal
+    # and already processed), so recovery runs at most once.
     if (
         initial_state is not None
         and state.episode > 0
@@ -510,10 +586,13 @@ def run_reflexion(
         )
         result = episode(ctx)
 
-        # 内側 episode が人間ゲートで中断したら、外側もそこで中断して pending を伝播する。
-        # この episode は未完了なので score/reflect せず episode も進めない。人間が決定を
-        # 永続化して resume すれば同じ episode が再実行され、内側ゲートが決定を適用して完了する
-        # (不可逆 action が承認前に再提案・二重実行されるのを防ぐ。Issue #15 の pause 契約)。
+        # If the inner episode pauses at a human gate, pause the outer loop
+        # there as well and propagate pending. This episode is incomplete, so do
+        # not score/reflect it and do not advance the episode counter. After the
+        # human decision is persisted and resume is called, the same episode is
+        # rerun and the inner gate applies the decision and completes (preventing
+        # irreversible actions from being reproposed or double-executed before
+        # approval; Issue #15 pause contract).
         if getattr(result, "paused", False):
             return ReflexiveResult(
                 status="paused", stop=None, state=state, pending=result.pending
@@ -521,10 +600,12 @@ def run_reflexion(
 
         outcome = EpisodeOutcome(result)
 
-        # (1) 一次信号: 内側 verify 由来を driver が計算 (評価器ではない)。
+        # (1) Primary signal: the driver computes it from inner verification
+        # (not from the evaluator).
         signal = ground_truth(outcome)
         gt_aggregate = signal.score.aggregate(declared_keys)
-        # (2) reward: epoch 内で固定された評価器のラベル (reflect 専用)。
+        # (2) Reward: label from the evaluator fixed within the epoch (for
+        # reflect only).
         reward = incumbent.score(outcome).ground_truth
 
         record = EpisodeRecord(
@@ -537,25 +618,32 @@ def run_reflexion(
             succeeded=signal.succeeded,
         )
 
-        # (3) episode 境界の reflect。reflect/取込前検証の例外は非致命 (lesson 破棄)。
+        # (3) Reflect at the episode boundary. Exceptions from reflect or
+        # pre-admission verification are non-fatal (the lesson is discarded).
         lesson: Optional[Lesson] = None
         admitted = False
         try:
             lesson = reflect(outcome.history, signal, reward)
-        except Exception as exc:  # noqa: BLE001 - reflect 失敗で run 全体を倒さない
+        except Exception as exc:  # noqa: BLE001 - reflect failure should not fail the whole run
             record.detail = f"reflect failed: {type(exc).__name__}: {exc}"
             lesson = None
         if lesson is not None:
-            # support は **権威ある grounding から再計算して上書き** (自己申告を信用しない)。
-            # episode も driver が正本で打ち直す: reflect は (軌跡, 信号, reward) しか受け取らず
-            # 正しい episode 番号を知らないため、hook の placeholder を残すと memory の
-            # episode ベース eviction/監査が誤る (例: 後続 episode の lesson が ep0 扱い)。
+            # Recompute and overwrite support from **authoritative grounding**
+            # (do not trust self-reported support). The driver also rewrites the
+            # episode as the source of truth: reflect receives only (trajectory,
+            # signal, reward) and does not know the correct episode number, so
+            # leaving a hook placeholder would break episode-based eviction and
+            # auditing in memory (for example, a later episode's lesson could be
+            # treated as ep0).
             #
-            # grounding には **ground_truth_backed も要求** する: 実信号 (test/lint 等) の無い
-            # episode は収束履歴に算入しない (RubricThreshold/Plateau)。同じ理由で、その episode
-            # 由来の lesson も support 0 にして memory に入れない。さもないと「収束には算入しないが
-            # 次 context は書き換える」未検証 episode が production 挙動に影響してしまい、
-            # ground-truth 一次の不変条件と矛盾する。
+            # Grounding also requires **ground_truth_backed**: episodes without
+            # a real signal (tests/lint/etc.) are not included in convergence
+            # history (RubricThreshold/Plateau). For the same reason, lessons
+            # from such episodes get support 0 and are not admitted into memory.
+            # Otherwise, an unverified episode could "not count toward
+            # convergence but still rewrite the next context", affecting
+            # production behavior and violating the ground-truth-primary
+            # invariant.
             grounded = (
                 signal.ground_truth_backed
                 and lesson.provenance in trajectory_signatures(outcome.history)
@@ -575,7 +663,8 @@ def run_reflexion(
         record.lesson = lesson
         record.admitted = admitted
 
-        # 一次信号のみ収束履歴に積む (実信号の無い episode は算入しない)。
+        # Add only primary signals to convergence history (episodes without real
+        # signals do not count).
         if signal.ground_truth_backed:
             state.gt_aggregate_history.append(gt_aggregate)
             state.best_gt_aggregate = max(state.best_gt_aggregate, gt_aggregate)
@@ -585,11 +674,13 @@ def run_reflexion(
         if on_episode is not None:
             on_episode(record, state)
 
-        # (4) epoch 境界: incumbent を入れ替えてよい **唯一** の場所。
-        # ただし、この episode で収束/打ち切り条件が既に成立しているなら昇格しない:
-        # 次以降の episode が無いのに propose/admit を走らせると、終端 run の evaluator_version を
-        # 無用に書き換えたり、proposal hook の例外で終端 run を倒したりしうるため
-        # (次の while ガードで同じ stop が発火して即終了する)。
+        # (4) Epoch boundary: the **only** place the incumbent may be replaced.
+        # However, do not promote if this episode already satisfies convergence
+        # or cutoff conditions: running propose/admit when there are no later
+        # episodes could unnecessarily rewrite the terminal run's
+        # evaluator_version or let a proposal hook exception bring down a run
+        # that has already reached termination (the next while guard will
+        # immediately fire the same stop and return).
         if (
             state.episode % epoch_len == 0
             and stop.first_triggered(state.outer_state()) is None
@@ -604,11 +695,13 @@ def run_reflexion(
                 on_epoch=on_epoch,
             )
 
-        # (5) 永続化の継ぎ目: episode が **完全に確定** した (epoch 境界処理まで終えた) 後に
-        # settled な state を書き出す。on_episode (境界 *前*) と違い、ここで見える epoch /
-        # evaluator_version / evaluator_updates は post-boundary なので、これを state.db の SoT
-        # にすれば「中断地点から resume = 通し実行と一致」を満たす (paused episode はこの行に
-        # 到達せず persist されない = 未確定 episode を書かない)。
+        # (5) Persistence join: after the episode is **fully finalized**
+        # (including epoch-boundary processing), write the settled state. Unlike
+        # on_episode (which runs *before* the boundary), the epoch /
+        # evaluator_version / evaluator_updates visible here are post-boundary.
+        # If this is the SoT written to state.db, "resume from interruption point
+        # = uninterrupted execution" holds. Paused episodes never reach this
+        # line and are not persisted, so incomplete episodes are not written.
         if persist is not None:
             persist(record, state)
 

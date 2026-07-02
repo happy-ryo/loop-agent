@@ -54,32 +54,38 @@ from ._async import (
     reject_awaitables,
 )
 from .conditions import AnyOf, GoalMet, StopCondition, StopTrigger
-# SeamTimeout / UnsupportedTimeoutKill の正準定義は loop_agent.errors にある
-# (Issue #71 で LoopError 統一階層へ再配置)。後方互換のためここから re-export する:
-# 既存の `from loop_agent.loop import SeamTimeout` / `loop_agent.loop.SeamTimeout`
-# 参照や、トップレベル `loop_agent` への露出 (__init__ が .loop から取り込む) を壊さない。
+# The canonical definitions of SeamTimeout / UnsupportedTimeoutKill live in
+# loop_agent.errors (moved under the unified LoopError hierarchy in Issue #71).
+# Re-export them from here for backward compatibility:
+# keep existing `from loop_agent.loop import SeamTimeout` /
+# `loop_agent.loop.SeamTimeout` references, and top-level `loop_agent` exposure
+# (__init__ imports them from .loop), working.
 from .errors import ConfigError, SeamTimeout, StateError, UnsupportedTimeoutKill
 from .state import LoopState, StepRecord
 
-# 人間ゲートの disposition: 提案 action をそのまま実行 / 実行せず記録だけ / 中断。
+# Human-gate disposition: execute the proposed action as-is / only record
+# without executing / pause.
 GATE_PROCEED = "proceed"
 GATE_SKIP = "skip"
 GATE_PAUSE = "pause"
 
-# act/review/verify の per-call timeout 超過時の挙動 (Issue #42)。
-#   graceful: 当該シームを諦め、failed=True な合成 step を記録して **次 iteration** へ。
-#             ループは返り続ける (例外を投げない)。stop 条件 (MaxIterations / Timeout /
-#             NoProgress) が次の guard で繰り返し timeout を捕捉・収束させる。
-#   kill    : 当該シームを cancel し、:class:`SeamTimeout` を **ループ外へ送出** する
-#             (LoopResult は返らない)。async シームは asyncio の task cancel で実際に cancel
-#             され、sync シームは POSIX main thread の SIGALRM で実際に中断される。
+# Behavior when an act/review/verify per-call timeout is exceeded (Issue #42).
+#   graceful: abandon that seam, record a synthetic step with goal_met=False, and
+#             move to the **next iteration**. The loop keeps returning (no
+#             exception is raised). Stop conditions (MaxIterations / Timeout /
+#             NoProgress) catch and converge repeated timeouts at the next guard.
+#   kill    : cancel that seam and raise :class:`SeamTimeout` **out of the loop**
+#             (no LoopResult is returned). Async seams are actually cancelled
+#             with asyncio task cancellation, and sync seams are actually
+#             interrupted by SIGALRM on the POSIX main thread.
 TIMEOUT_GRACEFUL = "graceful"
 TIMEOUT_KILL = "kill"
 _TIMEOUT_MODES = (TIMEOUT_GRACEFUL, TIMEOUT_KILL)
 
-# graceful timeout で記録する合成 step の observation マーカー (seam 別)。
-# JSON ネイティブで hashable な文字列にしてあるので、永続化 / resume を通っても安定し、
-# NoProgress の既定 key (observation そのもの) で「timeout の繰り返し」を検出できる。
+# Observation markers for synthetic steps recorded on graceful timeout (by seam).
+# They are JSON-native, hashable strings, so they remain stable across
+# persistence / resume and let NoProgress's default key (the observation itself)
+# detect repeated timeouts.
 ACT_TIMEOUT_OBSERVATION = "<seam-timeout:act>"
 REVIEW_TIMEOUT_OBSERVATION = "<seam-timeout:review>"
 VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
@@ -88,8 +94,9 @@ VERIFY_TIMEOUT_OBSERVATION = "<seam-timeout:verify>"
 class _GracefulTimeout(Exception):
     """Internal: a seam overran its deadline under ``on_timeout="graceful"``.
 
-    Caught inside :func:`_drive_loop` to record a synthetic failed step and
-    continue to the next iteration; never escapes the loop.
+    Caught inside :func:`_drive_loop` to record a synthetic
+    ``goal_met=False`` step and continue to the next iteration; never escapes
+    the loop.
     """
 
     def __init__(self, seam: str, seconds: float) -> None:
@@ -611,7 +618,7 @@ class ReviewOutcome:
     Review is optional and distinct from :class:`ActionGate`: a gate approves a
     proposed irreversible action before it runs, while review evaluates the
     artifact that ``act`` already produced. A non-approved ``"blocking"`` review
-    is recorded as a failed step and skips ``verify`` for that iteration so the
+    is recorded as a ``goal_met=False`` step and skips ``verify`` for that iteration so the
     next ``gather`` can feed the feedback back into ``act``.
     """
 
@@ -648,16 +655,20 @@ class GateReview:
     observation: Any = None
     detail: str = ""
     pending: Optional[Any] = None
-    # GATE_SKIP のとき、この skip を観測フック (on_step) に流すか。既定 True。
-    # resume 再生で既実行ゲートを読み飛ばすだけの "replay no-op" な skip は False にして、
-    # 前 run が永続化済みの本来の step 行を上書き (UNIQUE(run_id, iteration) upsert) で
-    # 壊さないようにする。
+    # For GATE_SKIP, whether to send this skip to the observation hook (on_step).
+    # Defaults to True. A "replay no-op" skip that only skips an already-executed
+    # gate during resume replay sets this to False, so it does not corrupt the
+    # real step row persisted by the previous run via overwrite
+    # (UNIQUE(run_id, iteration) upsert).
     persist: bool = True
-    # GATE_PROCEED のとき、step を記録 (on_step) した *後* に driver が呼ぶ任意の完了通知。
-    # gate が in-progress リース (report.md S5 Phase3 / Issue #21) を張った場合、ここで
-    # executing -> executed を確定する (step 永続化後に呼ぶので「executed なら step 行は
-    # 必ず存在」が保たれ、勝者クラッシュ時の step 欠落を防ぐ)。driver は中身を解さず呼ぶだけ。
-    # 他シーム同様 sync/async どちらでも可 (driver が maybe_await で await する; Issue #40)。
+    # For GATE_PROCEED, an optional completion notification that the driver calls
+    # *after* recording the step (on_step). If the gate created an in-progress
+    # lease (report.md S5 Phase3 / Issue #21), this confirms
+    # executing -> executed here. Because it is called after step persistence,
+    # the invariant "executed implies the step row exists" is preserved, avoiding
+    # a missing step if the winner crashes. The driver treats it as opaque and
+    # only calls it. Like other seams, it may be sync or async (the driver awaits
+    # it via maybe_await; Issue #40).
     on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
 
 
@@ -671,8 +682,10 @@ class ActionGate(Protocol):
 
     ``review`` may also be **async** (return an awaitable resolving to a
     :class:`GateReview`) -- e.g. a gate that awaits a remote approval service.
-    :func:`async_run_loop` awaits the result either way; :func:`run_loop` drives
-    an async gate through its internal event loop too.
+    :func:`async_run_loop` awaits the result either way. :func:`run_loop` is the
+    strict synchronous entry point: it creates no event loop and raises
+    :class:`loop_agent.errors.AsyncSeamInSyncLoop` if a gate or completion hook
+    returns an awaitable.
     """
 
     def review(
@@ -763,8 +776,9 @@ class LoopResult:
         return self.stop.reason if self.stop is not None else ""
 
 
-# 各シームは sync callable のまま受けつつ、async (acallable) も受けられる (Issue #40)。
-# 戻り値が awaitable なら driver が await する (loop_agent._async.maybe_await)。
+# Each seam still accepts a sync callable, and also accepts an async callable
+# (Issue #40). If the return value is awaitable, the driver awaits it
+# (loop_agent._async.maybe_await).
 GatherHook = Callable[[LoopState], Union[Any, Awaitable[Any]]]
 ActHook = Callable[[Any], Union[ActOutcome, Awaitable[ActOutcome]]]
 VerifyHook = Callable[[ActOutcome], Union[VerifyOutcome, Awaitable[VerifyOutcome]]]
@@ -804,18 +818,22 @@ async def async_run_loop(
     time_fn: Callable[[], float] = time.monotonic,
     initial_state: Optional[LoopState] = None,
     timeout: TimeoutArg = None,
-    # _strict_sync は run_loop 専用の内部フラグ (公開 API では使わない)。True の間
-    # maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
+    # _strict_sync is an internal flag for run_loop only (not used by the public
+    # API). While True, maybe_await / afirst_triggered reject awaitables with
+    # AsyncSeamInSyncLoop.
     _strict_sync: bool = False,
 ) -> LoopResult:
     """Async driver: gather -> act -> review? -> verify -> repeat until the goal or a cap.
 
-    This is the **single source of truth** for the loop's control flow; the
-    synchronous :func:`run_loop` is a thin ``asyncio.run`` wrapper around it. Use
-    this entry point when you are already inside an event loop (``await
-    async_run_loop(...)``) or when any hook is a coroutine function.
+    This is the **single source of truth** for the loop's control flow. The
+    synchronous :func:`run_loop` reuses this coroutine by stepping it directly in
+    strict-sync mode, without creating an event loop; if any seam returns an
+    awaitable, ``run_loop`` raises
+    :class:`loop_agent.errors.AsyncSeamInSyncLoop`. Use this entry point when
+    you are already inside an event loop (``await async_run_loop(...)``) or when
+    any hook is a coroutine function.
 
-    **sync/async シーム (Issue #40).** Every injected seam -- ``gather``,
+    **Sync/async seams (Issue #40).** Every injected seam -- ``gather``,
     ``act``, ``review``, ``verify``, each ``conditions`` ``check``,
     ``gate.review``, ``on_step`` (and a
     gate's ``on_complete``) -- may be a plain synchronous callable *or* an async
@@ -825,7 +843,7 @@ async def async_run_loop(
     synchronous hook adds no awaiting overhead -- its return value is not
     awaitable, so it is used as-is.
 
-    **asyncio の使い方.** This coroutine performs no concurrency of its own: it
+    **asyncio usage.** This coroutine performs no concurrency of its own: it
     ``await``\\s each seam *sequentially* to preserve the exact gather -> gate ->
     act -> review? -> verify ordering and the stop-condition evaluation timing
     of the synchronous loop. It runs on whatever event loop awaits it. To run
@@ -851,7 +869,7 @@ async def async_run_loop(
         review: Optional post-act artifact review hook. It receives the
             :class:`ActOutcome` before ground-truth ``verify``. A blocking
             ``ReviewOutcome(approved=False, severity="blocking")`` records a
-            failed step, skips ``verify`` for that iteration, and leaves JSON
+            ``goal_met=False`` step, skips ``verify`` for that iteration, and leaves JSON
             review feedback in ``StepRecord.detail`` for the next ``gather``.
         on_step: Optional observer invoked with ``(record, state)`` after each
             completed iteration (a minimal observability seam; report.md R7).
@@ -1022,8 +1040,9 @@ async def _drive_loop(
 
         context = await maybe_await(gather(state))
 
-        # gated PROCEED が張ったリースの完了通知 (executing->executed)。act 実行後・
-        # step 永続化後に呼ぶため、ここで掴んでおく (非ゲート step では None のまま)。
+        # Completion notification for the lease created by gated PROCEED
+        # (executing->executed). Keep it here because it is called after act
+        # execution and step persistence (it remains None for non-gated steps).
         gate_on_complete: Optional[Callable[[], Union[None, Awaitable[None]]]] = None
         if gate is not None:
             gate_review = await maybe_await(gate.review(context, state))
@@ -1049,8 +1068,9 @@ async def _drive_loop(
                 state.history.append(record)
                 state.iteration += 1
                 state.elapsed = time_fn() - start
-                # replay no-op な skip (review.persist=False) は on_step を呼ばない:
-                # 前 run が永続化した本来の step 行を上書きで壊さないため。
+                # A replay no-op skip (review.persist=False) does not call
+                # on_step, so it does not corrupt the real step row persisted by
+                # the previous run via overwrite.
                 if on_step is not None and gate_review.persist:
                     await maybe_await(on_step(record, state))
                 continue
@@ -1070,9 +1090,10 @@ async def _drive_loop(
                 context = gate_review.context
             gate_on_complete = gate_review.on_complete
 
-        # act -- per-call timeout 適用可 (Issue #42)。policy 未設定なら従来どおり
-        # maybe_await 直呼びで追加コストゼロ。graceful timeout は当該 step を failed
-        # として記録し次 iteration へ (kill は SeamTimeout がループ外へ伝播)。
+        # act -- per-call timeout can be applied (Issue #42). If no policy is
+        # set, call maybe_await directly as before with zero extra cost. A
+        # graceful timeout records a synthetic goal_met=False step and moves to
+        # the next iteration (kill propagates SeamTimeout out of the loop).
         act_timeout = (
             None
             if policy is None
@@ -1103,8 +1124,9 @@ async def _drive_loop(
                 state.elapsed = time_fn() - start
                 if on_step is not None:
                     await maybe_await(on_step(record, state))
-                # gate がリースを張っていれば、合成 step 永続化後に完了確定する
-                # (executed なら step 行は必ず存在、の不変条件を保つ)。
+                # If the gate created a lease, confirm completion after
+                # persisting the synthetic step (preserving the invariant that
+                # executed implies the step row exists).
                 if gate_on_complete is not None:
                     await maybe_await(gate_on_complete())
                 continue
@@ -1162,8 +1184,9 @@ async def _drive_loop(
                     await maybe_await(gate_on_complete())
                 continue
 
-        # verify -- 同上。act の outcome (tokens 計上済) はそのまま、verify が時間切れ
-        # なら failed step を記録して次 iteration へ。
+        # verify -- same as above. Keep the act outcome (tokens already counted);
+        # if verify times out, record a synthetic goal_met=False step and move
+        # to the next iteration.
         verify_timeout = (
             None
             if policy is None
@@ -1216,11 +1239,15 @@ async def _drive_loop(
         if on_step is not None:
             await maybe_await(on_step(record, state))
 
-        # step を永続化した *後* にリース完了を確定する (executing->executed)。順序が肝:
-        # 「executed なら step 行は必ず存在」を満たし、勝者クラッシュ時の step 欠落を防ぐ。
-        # ここで例外が出たら (DB エラー等) あえて握り潰さず伝播させる: status は executing の
-        # まま残り、別プロセスがリース失効で取り直して完遂する (= クラッシュと同じ復旧経路)。
-        # 握り潰して継続すると未確定のまま後続へ進み順序整合を壊すため、fail-loud が安全。
+        # Confirm lease completion (executing->executed) *after* persisting the
+        # step. The order is critical: it satisfies "executed implies the step
+        # row exists" and avoids a missing step if the winner crashes. If an
+        # exception occurs here (for example a DB error), deliberately propagate
+        # it instead of swallowing it: the status remains executing, and another
+        # process can retake the lease after expiry and finish it (the same
+        # recovery path as a crash). Swallowing the error and continuing would
+        # advance with the lease unconfirmed and break ordering consistency, so
+        # fail-loud is safer.
         if gate_on_complete is not None:
             await maybe_await(gate_on_complete())
 

@@ -1,45 +1,55 @@
-"""work-discovery: 次反復対象の入力選定 (propose-only / 人間ゲート維持, Issue #24).
+"""work-discovery: input selection for the next iteration (propose-only / human gate preserved, Issue #24).
 
-report.md S3.5 / S4.6 / S5 Phase 3 が定める **work-discovery** を実装する。完了した
-ループの「次に何を反復するか」を決める入力選定ループで、**計算層（read-only・決定的）と
-配達層（人間ゲート）の二層構造**により「発見の自律性は上げるが、着手判断は人間に残す」
-(report.md S3.5 INV) を構造で担保する。
+Implements the **work-discovery** described by report.md S3.5 / S4.6 / S5 Phase 3.
+This is the input-selection loop that decides "what to iterate on next" after a
+completed loop. Its **two-layer structure of a compute layer (read-only,
+deterministic) and a delivery layer (human gate)** structurally guarantees that
+"discovery autonomy increases, but the decision to start remains with the human"
+(report.md S3.5 INV).
 
-二層の責務分離:
+Separation of responsibilities between the two layers:
 
-- **計算層 (:func:`triage`)**: 副作用ゼロ・同一入力同一出力の純関数。候補 (:class:`Candidate`)
-  群を ``done`` (完了済み id 集合) に対して triage する — 依存解決 (deps が全て done なら
-  *ready*)、優先度・工数による決定的ランキング、未充足依存の理由付け、依存循環の検出。
-  「N 件の候補 + 推奨 1 件」(report.md S3.5) を :class:`Triage` として返す。loop 状態に
-  一切触れない (read-only)。
-- **配達層 (:class:`WorkDiscovery`)**: triage 結果を **提案** として state.db の人間ゲート
-  レジスタ (:class:`~loop_agent.store.LoopStore` の ``pending_decision``) に登録する。
-  ここで **必ず止まる (propose-only)**: 完全自動では一切着手せず、人間が
-  :meth:`~loop_agent.store.LoopStore.resolve_decision` (= MVP 限定人間ゲートと同一経路)
-  で採否を決めるまで pending のまま保持する。採択された候補だけが次ループの入力になる。
+- **Compute layer (:func:`triage`)**: a pure function with no side effects and the
+  same output for the same input. It triages a set of candidates (:class:`Candidate`)
+  against ``done`` (the set of completed ids): dependency resolution (*ready* when
+  all deps are done), deterministic ranking by priority and effort, reasons for
+  unmet dependencies, and dependency-cycle detection. It returns "N candidates +
+  one recommendation" (report.md S3.5) as :class:`Triage`. It never touches loop
+  state (read-only).
+- **Delivery layer (:class:`WorkDiscovery`)**: registers the triage result as a
+  **proposal** in the human-gate register in state.db (``pending_decision`` on
+  :class:`~loop_agent.store.LoopStore`). It **always stops here (propose-only)**:
+  nothing starts fully automatically; the proposal remains pending until the human
+  accepts or rejects it through :meth:`~loop_agent.store.LoopStore.resolve_decision`
+  (= the same path as the MVP limited human gate). Only an accepted candidate becomes
+  input to the next loop.
 
-**propose-only 継承** (report.md S5 Phase 3): MVP の限定人間ゲート (:mod:`loop_agent.gate`)
-は「不可逆 *action* を実行前に止める」ゲートだった。本層はその人間ゲートを **入力選定** へ
-読み替える — 「次反復の対象を *採択* する前に止める」。LangGraph interrupt パリティの 4 決定
-(approve / edit / reject / respond) を、採択へ次のように写像する:
+**propose-only inheritance** (report.md S5 Phase 3): the MVP limited human gate
+(:mod:`loop_agent.gate`) stopped before executing an irreversible *action*. This
+layer reinterprets that human gate as **input selection**: it stops before *adopting*
+the target of the next iteration. The four decisions from LangGraph interrupt parity
+(approve / edit / reject / respond) map to adoption as follows:
 
-- ``approve`` -> 推奨候補 (recommended) を採択
-- ``edit``    -> 人間が指定した別の *ready* 候補を採択 (id を payload で指定)
-- ``reject``  -> 何も採択しない (次反復を起こさない)
-- ``respond`` -> 何も採択せず人間の応答を記録 (次の triage 文脈に渡せる)
+- ``approve`` -> adopt the recommended candidate
+- ``edit``    -> adopt another human-selected *ready* candidate (id supplied in payload)
+- ``reject``  -> adopt nothing (do not start a next iteration)
+- ``respond`` -> adopt nothing and record the human response (available to later triage context)
 
-**完了 -> 次反復の接続** (:func:`discover_next`, report.md S5 Phase 3 成功条件 d):
-直前のループ結果 (:class:`~loop_agent.loop.LoopResult`) が **完了している** ときだけ提案を
-出す。``paused`` (人間ゲートで中断中) のときは「まだ何も完了していない」ので提案しない。
-これにより「完了 -> (人間ゲート越しの) 次反復入力選定」の連鎖が、人間の採否決定を必ず挟んで
-回る (= 完全自動着手しない)。
+**Completed -> next-iteration connection** (:func:`discover_next`, report.md S5
+Phase 3 success criterion d): a proposal is created only when the previous loop
+result (:class:`~loop_agent.loop.LoopResult`) has **completed**. When it is
+``paused`` (interrupted at a human gate), nothing has completed yet, so no proposal
+is created. This keeps the "completed -> next-iteration input selection (through a
+human gate)" chain passing through a human adoption decision every time (= no fully
+automatic start).
 
-**reuse の境界**: 配達層は claude-org の work-discovery 配達層 (skill / dispatcher) を
-そのまま使わず *新設計* する (report.md S4.6「配達層は新設計」)。一方で人間ゲートの永続化は
-MVP で確立した ``pending_decision`` レジスタを丸ごと reuse する (gate_key prefix
-``"discovery-"`` で in-loop の action ゲートと名前空間を分離)。これにより pause/resume・
-冪等・監査 (event log)・「一度下した決定は再決定しない」を無償で継承する。Reflexion /
-transport とは独立。
+**Reuse boundary**: the delivery layer is newly designed instead of directly using
+the claude-org work-discovery delivery layer (skill / dispatcher) (report.md S4.6,
+"the delivery layer is newly designed"). Human-gate persistence, however, fully
+reuses the ``pending_decision`` register established in the MVP (the gate_key prefix
+``"discovery-"`` separates the namespace from in-loop action gates). This gives it
+pause/resume, idempotence, auditability (event log), and "a decision already made is
+not decided again" for free. It is independent of Reflexion / transport.
 """
 
 from __future__ import annotations
@@ -50,26 +60,30 @@ from typing import Any, Iterable, Optional
 from ..errors import ConfigError
 from ..store import LoopStore
 
-# 配達層が使う gate_key の prefix。in-loop の不可逆 action ゲート (gate-<iteration>) と
-# 名前空間を分け、同じ ``pending_decision`` レジスタを安全に相乗りさせる。
+# Prefix for gate_key values used by the delivery layer. This separates the namespace
+# from in-loop irreversible action gates (gate-<iteration>) so both can safely share
+# the same ``pending_decision`` register.
 GATE_KEY_PREFIX = "discovery-"
 
 
 @dataclass(frozen=True)
 class Candidate:
-    """次反復の対象になりうる 1 件の仕事候補 (計算層の入力)。
+    """One work candidate that may become the next iteration target (compute-layer input).
 
-    全フィールドは **JSON ネイティブ** であること: 候補は配達層で state.db に永続化され
-    (提案の action として保存)、resume をまたいで復元・採択されるため。``payload`` には
-    採択時に次ループの入力へ渡す任意の JSON ネイティブ値を載せる (タスク本文・seed 等)。
+    All fields must be **JSON native** because candidates are persisted to state.db by
+    the delivery layer (stored as the proposal action) and later restored/adopted
+    across resume. ``payload`` carries any JSON-native value to pass to the next loop
+    input on adoption (task text, seed, etc.).
 
     Args:
-        id: 候補の安定識別子 (非空・候補集合内で一意)。依存解決と採択指定のキー。
-        priority: 優先度。**大きいほど優先** (ランキングで降順)。既定 0。
-        effort: 見積り工数 (``>= 0``)。同優先度のタイブレークで **小さいほど優先**。既定 1。
-        depends_on: この候補が依存する id 群。全て ``done`` にあれば *ready*。
-        summary: 人間がゲートで読む 1 行要約。
-        payload: 採択時に次ループ入力へ渡す JSON ネイティブ値 (任意)。
+        id: Stable candidate identifier (non-empty and unique within the candidate set).
+            Key for dependency resolution and adoption selection.
+        priority: Priority. **Higher means earlier** (descending in the ranking). Default 0.
+        effort: Estimated effort (``>= 0``). For same-priority tiebreaks,
+            **lower means earlier**. Default 1.
+        depends_on: IDs this candidate depends on. It is *ready* if all are in ``done``.
+        summary: One-line summary shown to the human at the gate.
+        payload: Optional JSON-native value passed to the next loop input on adoption.
     """
 
     id: str
@@ -84,25 +98,28 @@ class Candidate:
             raise ConfigError("Candidate.id must be a non-empty string")
         if self.effort < 0:
             raise ConfigError("Candidate.effort must be >= 0")
-        # depends_on をタプルに正規化 (list 等で渡されても凍結後は不変タプルに揃える)。
+        # Normalize depends_on to a tuple (even if passed as a list) so the frozen
+        # instance consistently stores an immutable tuple.
         object.__setattr__(self, "depends_on", tuple(self.depends_on))
 
     @property
     def sort_key(self) -> tuple[int, int, str]:
-        """ready ランキングの決定的キー: 優先度降順 -> 工数昇順 -> id 昇順。
+        """Deterministic key for ready ranking: priority desc -> effort asc -> id asc.
 
-        id が一意なので全順序になり、入力の並び順に依存しない安定なランキングになる。
+        Because ids are unique, this gives a total order and a stable ranking that does
+        not depend on input order.
         """
         return (-self.priority, self.effort, self.id)
 
 
 @dataclass(frozen=True)
 class BlockedCandidate:
-    """ready でない候補と、その理由 (依存が未充足 / 未知 / 循環)。
+    """A candidate that is not ready and the reason (unmet / unknown / cyclic deps).
 
-    人間がゲートで「なぜこの候補がまだ選べないか」を理解できるよう、未充足依存を
-    *既知の候補待ち* (``pending_deps``) と *未知の id* (``unknown_deps``) に分類し、
-    依存循環に属する場合は ``in_cycle`` を立てる。``reason`` はそれらを要約した 1 行。
+    To help the human understand at the gate why this candidate cannot be selected yet,
+    unmet dependencies are classified as *waiting on known candidates* (``pending_deps``)
+    or *unknown ids* (``unknown_deps``). ``in_cycle`` is set when the candidate belongs
+    to a dependency cycle. ``reason`` is a one-line summary of those facts.
     """
 
     candidate: Candidate
@@ -115,10 +132,11 @@ class BlockedCandidate:
 
 @dataclass(frozen=True)
 class Triage:
-    """計算層の出力: ランキング済み ready・blocked・推奨 1 件 (report.md S3.5)。
+    """Compute-layer output: ranked ready, blocked, and one recommendation (report.md S3.5).
 
-    ``ready`` は :attr:`Candidate.sort_key` でランキング済み (推奨順)。``recommended`` は
-    その先頭 (ready が空なら ``None``)。``blocked`` は登録順ではなく id 昇順で安定化する。
+    ``ready`` is ranked by :attr:`Candidate.sort_key` (recommendation order).
+    ``recommended`` is the first ready item (or ``None`` when ready is empty).
+    ``blocked`` is stabilized by id ascending instead of registration order.
     """
 
     ready: tuple[Candidate, ...]
@@ -127,19 +145,23 @@ class Triage:
 
 
 def _find_cycle_ids(candidates_by_id: dict[str, Candidate]) -> set[str]:
-    """候補依存グラフ上で **循環に属する** 候補 id 集合を返す (診断用)。
+    """Return candidate ids that **belong to cycles** in the dependency graph (diagnostic).
 
-    readiness 自体は ``deps ⊆ done`` だけで決まるので循環は readiness に影響しないが、
-    「全候補が永続的に blocked」になる不可能依存を人間に明示できるよう検出する。
+    Readiness itself is determined only by ``deps ⊆ done``, so cycles do not affect
+    readiness. They are still detected so impossible dependencies that would keep all
+    candidates permanently blocked can be shown to the human.
 
-    **Tarjan の強連結成分 (SCC) 分解** で求める: サイズ 2 以上の SCC に属する候補、または
-    自己依存 (自分の id を ``depends_on`` に含む) を循環とみなす。素朴な back-edge DFS は
-    「既に探索完了 (BLACK) したノードを経由してのみ循環へ戻る」メンバーを cross-edge と
-    誤判定して取りこぼす (false negative) ため、SCC で完全に検出する。外部依存 (候補に
-    存在しない id) は辺を張らない。反復実装 (再帰なし) で深いグラフでも安全。ノードを
-    ``sorted`` 順に走査し、出力は集合なので ``depends_on`` の並び順に依存しない (決定的)。
+    Uses **Tarjan's strongly connected component (SCC) decomposition**: candidates in
+    SCCs of size 2 or larger, or self-dependencies (their own id in ``depends_on``), are
+    considered cyclic. A naive back-edge DFS can misclassify members that return to a
+    cycle only through an already completed (BLACK) node as cross-edges and miss them
+    (false negatives), so SCCs provide complete detection. External dependencies (ids
+    not present as candidates) do not create edges. The iterative implementation (no
+    recursion) is safe for deep graphs. Nodes are scanned in ``sorted`` order, and the
+    output is a set, so it does not depend on ``depends_on`` order (deterministic).
     """
-    # 内部辺のみ (外部依存は循環グラフに含めない)。並び順は SCC *メンバー集合* に影響しない。
+    # Internal edges only (external deps are not part of the cycle graph). Order does
+    # not affect the SCC *member sets*.
     succ = {
         cid: [d for d in c.depends_on if d in candidates_by_id]
         for cid, c in candidates_by_id.items()
@@ -154,7 +176,8 @@ def _find_cycle_ids(candidates_by_id: dict[str, Candidate]) -> set[str]:
     for root in sorted(candidates_by_id):
         if root in index:
             continue
-        # work: (node, 次に見る後続インデックス)。再帰 Tarjan を明示スタックで反復化。
+        # work: (node, next successor index). This turns recursive Tarjan into an
+        # iterative algorithm with an explicit stack.
         work: list[tuple[str, int]] = [(root, 0)]
         while work:
             node, pi = work[-1]
@@ -178,7 +201,7 @@ def _find_cycle_ids(candidates_by_id: dict[str, Candidate]) -> set[str]:
             if recursed:
                 continue
             if low[node] == index[node]:
-                # node は SCC の根: scc_stack から成分を pop する。
+                # node is the SCC root: pop the component from scc_stack.
                 comp: list[str] = []
                 while True:
                     w = scc_stack.pop()
@@ -189,28 +212,34 @@ def _find_cycle_ids(candidates_by_id: dict[str, Candidate]) -> set[str]:
                 if len(comp) > 1 or node in succ[node]:
                     in_cycle.update(comp)
             work.pop()
-            if work:  # 子の探索完了を親の low へ伝播 (再帰 return 相当)。
+            if work:  # Propagate child completion to the parent low value (like return).
                 parent = work[-1][0]
                 low[parent] = min(low[parent], low[node])
     return in_cycle
 
 
 def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Triage:
-    """候補を ``done`` に対して triage する純関数 (計算層・read-only・決定的)。
+    """Pure function that triages candidates against ``done`` (compute layer, read-only, deterministic).
 
-    手順 (report.md S3.5 「依存解決・優先度・工数」):
+    Steps (report.md S3.5 "dependency resolution, priority, and effort"):
 
-    1. **依存解決**: 候補の ``depends_on`` が全て ``done`` にあれば *ready*。1 つでも欠ければ
-       *blocked* で、欠けた依存を「既知候補待ち (pending)」と「未知 id (unknown)」に分類する。
-    2. **ランキング**: ready を :attr:`Candidate.sort_key` (優先度降順 -> 工数昇順 -> id 昇順)
-       で安定ソートし、**推奨 = 先頭** とする。入力の並び順に依存しない。
-    3. **循環検出**: 候補依存グラフの循環を診断として blocked に注記する。
+    1. **Dependency resolution**: a candidate is *ready* when all of its ``depends_on``
+       ids are in ``done``. If any dependency is missing, it is *blocked*, and the
+       missing dependencies are classified as "waiting on known candidates (pending)"
+       or "unknown ids (unknown)".
+    2. **Ranking**: stably sort ready candidates by :attr:`Candidate.sort_key`
+       (priority desc -> effort asc -> id asc), and set **recommended = first**. This
+       does not depend on input order.
+    3. **Cycle detection**: annotate blocked candidates with cycles in the candidate
+       dependency graph as diagnostics.
 
-    既に ``done`` の id を持つ候補は「完了済み」として出力から除外する (次反復対象ではない)。
-    同一入力 (順不同) は必ず同一の :class:`Triage` を返す。
+    Candidates whose id is already in ``done`` are excluded as completed (not targets
+    for the next iteration). The same input (regardless of order) always returns the
+    same :class:`Triage`.
 
     Raises:
-        ConfigError: 候補 id が重複している場合 (決定的出力に一意 id が必須)。
+        ConfigError: Candidate ids are duplicated (unique ids are required for
+            deterministic output).
     """
     items = list(candidates)
     done_set = set(done)
@@ -221,7 +250,8 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
             raise ConfigError(f"duplicate candidate id {c.id!r}; ids must be unique")
         by_id[c.id] = c
 
-    # 完了済み候補は次反復対象ではないので除外する (依存充足の判定では done を使う)。
+    # Exclude completed candidates because they are not next-iteration targets (done is
+    # still used when checking dependency satisfaction).
     pending_candidates = {cid: c for cid, c in by_id.items() if cid not in done_set}
     cycle_ids = _find_cycle_ids(pending_candidates)
 
@@ -232,7 +262,8 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
         if not unmet:
             ready.append(c)
             continue
-        # 未充足依存を「未完了の既知候補待ち」と「未知 id」に分類 (重複は順序保持で除去)。
+        # Classify unmet deps as "waiting on unfinished known candidates" or "unknown
+        # ids" (deduplicated while preserving order).
         seen: set[str] = set()
         pending_deps: list[str] = []
         unknown_deps: list[str] = []
@@ -244,11 +275,11 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
         in_cycle = cid in cycle_ids
         parts: list[str] = []
         if in_cycle:
-            parts.append("依存循環")
+            parts.append("dependency cycle")
         if pending_deps:
-            parts.append(f"未完了の依存: {pending_deps}")
+            parts.append(f"unfinished dependencies: {pending_deps}")
         if unknown_deps:
-            parts.append(f"未知の依存: {unknown_deps}")
+            parts.append(f"unknown dependencies: {unknown_deps}")
         blocked.append(
             BlockedCandidate(
                 candidate=c,
@@ -268,11 +299,11 @@ def triage(candidates: Iterable[Candidate], *, done: Iterable[str] = ()) -> Tria
     )
 
 
-# -- 配達層 (人間ゲート, propose-only) ----------------------------------------
+# -- Delivery layer (human gate, propose-only) --------------------------------
 
 
 def _candidate_to_dict(c: Candidate) -> dict[str, Any]:
-    """候補を JSON ネイティブ dict へ (depends_on は list 化)。"""
+    """Convert a candidate to a JSON-native dict (with depends_on as a list)."""
     return {
         "id": c.id,
         "priority": c.priority,
@@ -284,7 +315,7 @@ def _candidate_to_dict(c: Candidate) -> dict[str, Any]:
 
 
 def _candidate_from_dict(d: dict[str, Any]) -> Candidate:
-    """:func:`_candidate_to_dict` の逆 (depends_on を tuple へ戻す)。"""
+    """Inverse of :func:`_candidate_to_dict` (converts depends_on back to a tuple)."""
     return Candidate(
         id=d["id"],
         priority=d.get("priority", 0),
@@ -296,11 +327,12 @@ def _candidate_from_dict(d: dict[str, Any]) -> Candidate:
 
 
 def _triage_to_action(triage_result: Triage, cycle: int) -> dict[str, Any]:
-    """triage 結果を提案 action (JSON ネイティブ dict) へ符号化する。
+    """Encode a triage result as a proposal action (JSON-native dict).
 
-    ``pending_decision.action`` として永続化され、resume / 採択時に
-    :func:`_candidate_from_dict` で復元される。``recommended`` は id 参照で持ち、復元時に
-    ready から引き当てる (候補本体の二重保存を避ける)。
+    It is persisted as ``pending_decision.action`` and restored with
+    :func:`_candidate_from_dict` during resume / adoption. ``recommended`` stores an id
+    reference and is resolved from ready candidates on restore (avoids saving the
+    candidate body twice).
     """
     return {
         "kind": "work-discovery",
@@ -324,11 +356,13 @@ def _triage_to_action(triage_result: Triage, cycle: int) -> dict[str, Any]:
 
 
 def _action_to_triage(action: dict[str, Any]) -> Triage:
-    """永続化された提案 action から :class:`Triage` を復元する (:func:`_triage_to_action` の逆)。
+    """Restore :class:`Triage` from a persisted proposal action (inverse of :func:`_triage_to_action`).
 
-    配達層が *永続化済みの提案* を権威として返す/読むために使う。同一 cycle を別の候補集合で
-    再 propose しても (``request_decision`` が既存行を上書きしないため)、返す :class:`Triage` は
-    常に **永続化され実際に採択対象となる提案** と一致する (内部不整合を作らない)。
+    Used by the delivery layer so the *persisted proposal* is the authority for reads
+    and returns. Even if the same cycle is proposed again with a different candidate
+    set (``request_decision`` does not overwrite the existing row), the returned
+    :class:`Triage` always matches the **persisted proposal that is actually available
+    for adoption** (avoids internal inconsistency).
     """
     ready = tuple(_candidate_from_dict(c) for c in action["ready"])
     ready_by_id = {c.id: c for c in ready}
@@ -350,11 +384,13 @@ def _action_to_triage(action: dict[str, Any]) -> Triage:
 
 @dataclass(frozen=True)
 class Proposal:
-    """登録された 1 件の提案 (triage 結果 + 永続化された人間ゲート行)。
+    """One registered proposal (triage result + persisted human-gate row).
 
-    :meth:`WorkDiscovery.propose` が返す。``pending`` は ``request_decision`` が返した
-    ``pending_decision`` 行 (gate_key / status / action を含む)。**propose-only** なので
-    生成直後は常に ``status == "pending"`` (既に解決済みの cycle を再 propose した場合を除く)。
+    Returned by :meth:`WorkDiscovery.propose`. ``pending`` is the ``pending_decision``
+    row returned by ``request_decision`` (including gate_key / status / action). Because
+    this is **propose-only**, immediately after creation it is always
+    ``status == "pending"`` (except when re-proposing a cycle that has already been
+    resolved).
     """
 
     triage: Triage
@@ -365,12 +401,13 @@ class Proposal:
 
 @dataclass(frozen=True)
 class AdoptionResult:
-    """人間の採否決定を解決した結果 (どの候補が次反復入力になるか)。
+    """Result of resolving the human adoption decision (which candidate becomes next input).
 
-    ``status`` は ``"pending"`` (未決定) / ``"resolved"`` (決定済み) / ``"absent"``
-    (その cycle の提案が存在しない)。``candidate`` は採択された候補 (approve/edit) または
-    ``None`` (reject/respond/未決定)。``recommended`` は提案時の推奨 (参考表示用)。
-    ``response`` は respond 決定の応答本文。
+    ``status`` is ``"pending"`` (undecided), ``"resolved"`` (decided), or ``"absent"``
+    (no proposal exists for that cycle). ``candidate`` is the adopted candidate
+    (approve/edit), or ``None`` (reject/respond/undecided). ``recommended`` is the
+    proposal-time recommendation (for display). ``response`` is the response body from
+    a respond decision.
     """
 
     status: str
@@ -381,31 +418,33 @@ class AdoptionResult:
 
     @property
     def adopted(self) -> bool:
-        """次反復の入力候補が採択されたか (= ``candidate`` が存在するか)。"""
+        """Whether a next-iteration input candidate was adopted (= ``candidate`` exists)."""
         return self.candidate is not None
 
 
 class WorkDiscovery:
-    """work-discovery 配達層: triage を提案として人間ゲートに載せる (propose-only)。
+    """work-discovery delivery layer: put triage on the human gate as a proposal (propose-only).
 
-    人間ゲートの永続化は MVP の ``pending_decision`` レジスタを reuse する
-    (:class:`~loop_agent.store.LoopStore`)。gate_key は cycle ごとに安定で
-    (``discovery-<cycle>``)、in-loop の不可逆 action ゲート (``gate-<iteration>``) と
-    名前空間を分ける。生成時に ``load_or_init(run_id)`` で run 行を確保する (FK のため)。
+    Human-gate persistence reuses the MVP ``pending_decision`` register
+    (:class:`~loop_agent.store.LoopStore`). The gate_key is stable per cycle
+    (``discovery-<cycle>``) and uses a separate namespace from in-loop irreversible
+    action gates (``gate-<iteration>``). During construction,
+    ``load_or_init(run_id)`` ensures the run row exists (for the FK).
 
     Args:
-        store: 提案・決定を永続化する :class:`~loop_agent.store.LoopStore`。
-        run_id: 対象 run の ID。
+        store: :class:`~loop_agent.store.LoopStore` that persists proposals and decisions.
+        run_id: ID of the target run.
     """
 
     def __init__(self, store: LoopStore, run_id: str) -> None:
         self.store = store
         self.run_id = run_id
-        # run 行を確保 (request_decision の FK と begin event を冪等に満たす)。
+        # Ensure the run row exists (idempotently satisfies the request_decision FK
+        # and begin event).
         self.store.load_or_init(run_id)
 
     def gate_key(self, cycle: int) -> str:
-        """cycle に対応する安定な gate_key (``discovery-<cycle>``)。"""
+        """Stable gate_key for the cycle (``discovery-<cycle>``)."""
         return f"{GATE_KEY_PREFIX}{cycle}"
 
     def propose(
@@ -415,23 +454,29 @@ class WorkDiscovery:
         done: Iterable[str] = (),
         cycle: int = 0,
     ) -> Proposal:
-        """候補を triage し、その提案を人間ゲートに ``pending`` で登録する (propose-only)。
+        """Triage candidates and register the proposal as ``pending`` on the human gate (propose-only).
 
-        計算層 (:func:`triage`) で「N 件 + 推奨 1 件」を求め、:func:`_triage_to_action` で
-        符号化した提案を ``request_decision`` で登録する。**ここで止まる**: 何も採択せず、
-        人間が :meth:`resolve` (または直接 ``store.resolve_decision``) で決めるまで pending。
+        The compute layer (:func:`triage`) calculates "N items + 1 recommendation",
+        encodes that proposal with :func:`_triage_to_action`, and registers it with
+        ``request_decision``. **It stops here**: nothing is adopted, and the proposal
+        remains pending until the human decides through :meth:`resolve` (or directly
+        through ``store.resolve_decision``).
 
-        同一 ``(run_id, cycle)`` に対し冪等: ``request_decision`` が既存行を上書きしないため、
-        同じ cycle で再 propose しても最初の提案・決定を壊さない (新しい候補集合で提案し直す
-        には別の ``cycle`` を使う)。triage 自体は決定的なので返す :class:`Triage` は毎回同じ。
+        Idempotent for the same ``(run_id, cycle)``: because ``request_decision`` does
+        not overwrite an existing row, re-proposing the same cycle does not corrupt
+        the first proposal or decision (use another ``cycle`` to propose again with a
+        new candidate set). Since triage itself is deterministic, the returned
+        :class:`Triage` is the same every time.
         """
         triage_result = triage(candidates, done=done)
         gk = self.gate_key(cycle)
         action = _triage_to_action(triage_result, cycle)
         pending = self.store.request_decision(self.run_id, gk, action)
-        # 返す triage は **永続化された提案** (pending["action"]) から復元する。同一 cycle を
-        # 別の候補集合で再 propose しても request_decision は既存行を上書きしないので、
-        # 返り値が実際の採択対象 (pending / adopted) と矛盾しないよう権威ある側に揃える。
+        # Restore the returned triage from the **persisted proposal** (pending["action"]).
+        # Since request_decision does not overwrite an existing row when the same cycle
+        # is re-proposed with a different candidate set, align the return value with the
+        # authoritative source so it cannot contradict the actual adoption target
+        # (pending / adopted).
         return Proposal(
             triage=_action_to_triage(pending["action"]),
             cycle=cycle,
@@ -442,12 +487,14 @@ class WorkDiscovery:
     def resolve(
         self, cycle: int, decision: str, payload: Any = None
     ) -> AdoptionResult:
-        """人間の採否決定を記録する型付きラッパ (= 人間ゲートの解決)。
+        """Typed wrapper that records the human adoption decision (= human-gate resolution).
 
-        ``store.resolve_decision`` への薄い委譲だが、``edit`` のときは payload (採択する
-        候補 id) が **その提案の ready 候補** であることを *永続前に* 検証して fail loud する
-        (blocked / 未知の候補を誤って採択しないため = 依存解決の不変条件を配達層でも守る)。
-        記録後の :class:`AdoptionResult` を返す (= :meth:`adopted` と同じ写像)。
+        This is a thin delegation to ``store.resolve_decision``, but for ``edit`` it
+        validates *before persistence* that the payload (the candidate id to adopt) is
+        **a ready candidate in that proposal** and fails loudly otherwise (to avoid
+        accidentally adopting a blocked / unknown candidate = preserving the dependency
+        resolution invariant in the delivery layer too). Returns the recorded
+        :class:`AdoptionResult` (= the same mapping as :meth:`adopted`).
         """
         if decision == "edit":
             self._require_ready_selection(cycle, payload)
@@ -455,12 +502,12 @@ class WorkDiscovery:
         return self.adopted(cycle)
 
     def _load_proposal_action(self, cycle: int) -> Optional[dict[str, Any]]:
-        """その cycle の登録済み提案 action を返す (未登録なら ``None``)。"""
+        """Return the registered proposal action for the cycle (or ``None`` if absent)."""
         row = self.store.get_decision(self.run_id, self.gate_key(cycle))
         return row["action"] if row is not None else None
 
     def _require_ready_selection(self, cycle: int, selected_id: Any) -> None:
-        """``edit`` の選択 id が提案の ready 候補であることを検証 (なければ ConfigError)。"""
+        """Validate that the ``edit`` selection id is a ready candidate in the proposal (else ConfigError)."""
         action = self._load_proposal_action(cycle)
         if action is None:
             raise ConfigError(
@@ -474,16 +521,17 @@ class WorkDiscovery:
             )
 
     def adopted(self, cycle: int = 0) -> AdoptionResult:
-        """その cycle の人間決定を読み、採択された候補へ写像する (resume をまたいで安定)。
+        """Read the human decision for the cycle and map it to the adopted candidate (stable across resume).
 
-        永続化された ``pending_decision`` 行と提案 action から復元するので、別プロセス /
-        resume 後に呼んでも同じ採択結果になる (純粋な読み出し・冪等)。決定の写像:
+        Restores from the persisted ``pending_decision`` row and proposal action, so
+        calls from another process / after resume produce the same adoption result
+        (pure read, idempotent). Decision mapping:
 
-        - ``approve`` -> 推奨候補 (recommended) を採択
-        - ``edit``    -> payload が指す ready 候補を採択 (ready 外なら ConfigError)
-        - ``reject``  -> 採択なし (``candidate=None``)
-        - ``respond`` -> 採択なし。応答本文を ``response`` に載せる
-        - 未決定 (pending) / 提案なし (absent) -> 採択なし
+        - ``approve`` -> adopt the recommended candidate
+        - ``edit``    -> adopt the ready candidate identified by payload (ConfigError if not ready)
+        - ``reject``  -> adopt nothing (``candidate=None``)
+        - ``respond`` -> adopt nothing; place the response body in ``response``
+        - undecided (pending) / no proposal (absent) -> adopt nothing
         """
         gk = self.gate_key(cycle)
         row = self.store.get_decision(self.run_id, gk)
@@ -519,7 +567,7 @@ class WorkDiscovery:
             candidate = ready_by_id[payload]
         elif decision == "respond":
             response = payload
-        # reject -> candidate は None のまま (採択なし)。
+        # reject -> candidate remains None (nothing adopted).
         return AdoptionResult(
             status="resolved",
             decision=decision,
@@ -538,17 +586,19 @@ def discover_next(
     done: Iterable[str] = (),
     cycle: int = 0,
 ) -> Optional[Proposal]:
-    """完了 -> 次反復の接続点: 直前ループが完了していれば次候補を提案する (propose-only)。
+    """Completed -> next-iteration connection point: propose next candidates if the previous loop completed (propose-only).
 
-    report.md S5 Phase 3 成功条件 d 「完了 -> 次反復の接続が人間ゲート越しに回る」を体現する
-    入口。``result`` (直前の :class:`~loop_agent.loop.LoopResult`) を渡すと、それが
-    **``paused`` のときは提案しない** (``None`` を返す) — まだ何も完了しておらず、先に人間が
-    そのゲートを解決すべきだから。完了 (goal_met / stopped) または ``result=None`` のときだけ
-    :meth:`WorkDiscovery.propose` を呼ぶ。
+    Entry point that embodies report.md S5 Phase 3 success criterion d, "Completed
+    -> next-iteration connection runs through the human gate." When ``result`` (the
+    previous :class:`~loop_agent.loop.LoopResult`) is passed and it is **``paused``**,
+    no proposal is created (``None`` is returned), because nothing has completed yet
+    and the human should resolve that gate first. :meth:`WorkDiscovery.propose` is
+    called only after completion (goal_met / stopped) or when ``result=None``.
 
-    **完全自動着手はしない**: 本関数は提案 (pending) を登録するだけで、採択も次ループ起動も
-    行わない。採択は人間が :meth:`WorkDiscovery.resolve` で決め、採択された候補
-    (:meth:`WorkDiscovery.adopted`) を呼び出し側が次ループの入力にする。
+    **No fully automatic start**: this function only registers a proposal (pending)
+    and does not adopt anything or start the next loop. The human decides adoption
+    with :meth:`WorkDiscovery.resolve`, and the caller uses the adopted candidate
+    (:meth:`WorkDiscovery.adopted`) as the next loop input.
     """
     if result is not None and getattr(result, "paused", False):
         return None

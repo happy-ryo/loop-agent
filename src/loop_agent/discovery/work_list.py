@@ -1,43 +1,55 @@
-"""multi-item ループの公平 scheduling gather (Issue #56).
+"""Fair scheduling gather for multi-item loops (Issue #56).
 
-``run_loop`` の ``gather`` フックは ``Callable[[LoopState], ctx]`` -- 「次に何をやるか」を
-state から選ぶ 1 点 (report.md S4.4)。N ファイル / N bug を 1 本のループで回すとき、素朴な
-``gather`` (「先頭の未完 item を返す」) は **1 item が ``MaxIterations`` を独占して他を
-starve させる**: 失敗を繰り返す 1 件が全反復を食い、残りに一度も触れずにループが終わる。
+The ``run_loop`` ``gather`` hook is ``Callable[[LoopState], ctx]``: one point
+that selects "what to do next" from state (report.md S4.4). When running N files
+or N bugs through a single loop, a naive ``gather`` ("return the first unfinished
+item") lets **one item monopolize ``MaxIterations`` and starve the rest**: one
+repeatedly failing item can consume every iteration, ending the loop before the
+remaining items are touched even once.
 
-#37 (Self-translation PoC) は手書きの round-robin gather でこれを回避した::
+#37 (Self-translation PoC) avoided this with a handwritten round-robin gather::
 
     def gather(state):
         rem = [f for f in files if f not in done]
-        return min(rem, key=lambda f: (attempts[f], files.index(f)))   # 公平 scheduling
+        return min(rem, key=lambda f: (attempts[f], files.index(f)))   # fair scheduling
 
-:class:`WorkListGather` はこの pattern を再利用可能に正規化する。提供するもの:
+:class:`WorkListGather` normalizes this pattern into a reusable component. It
+provides:
 
-- **公平 scheduling 戦略** (``round_robin`` / ``fewest_attempts`` / ``fifo`` / ``priority`` /
-  任意の custom callable) -- どの item に次の 1 反復を割り当てるか。
-- **per-item 上限** (``max_attempts_per_item``) -- 1 item が独占しないよう、規定回数試して
-  完了しなければその item を *exhausted* として外す (グローバルな ``MaxIterations`` とは独立)。
-- **done 判定フック** (``done_when``) -- verify (ループ全体のゴール) とは独立に、「*この item* は
-  終わったか」を user policy で判定する。
-- **attempt counter の正規 API** -- :meth:`WorkListGather.attempts` /
-  :meth:`~WorkListGather.report` 等で進捗を読む。
-- **triage との接続** (:meth:`WorkListGather.from_triage`) -- work-list の優先度・順序計算を
-  既存の :func:`loop_agent.discovery.triage` に委譲する。
+- **fair scheduling strategies** (``round_robin`` / ``fewest_attempts`` /
+  ``fifo`` / ``priority`` / any custom callable): which item receives the next
+  iteration.
+- **per-item limits** (``max_attempts_per_item``): prevent one item from
+  monopolizing the loop by marking it *exhausted* and removing it after the
+  configured number of attempts if it is still incomplete (independent of the
+  global ``MaxIterations``).
+- **done predicate hook** (``done_when``): a user policy that decides whether
+  "*this item* is done", independent of verify (the loop-wide goal).
+- **canonical attempt counter API**: read progress through
+  :meth:`WorkListGather.attempts`, :meth:`~WorkListGather.report`, and related
+  methods.
+- **triage integration** (:meth:`WorkListGather.from_triage`): delegate
+  work-list priority and ordering calculations to the existing
+  :func:`loop_agent.discovery.triage`.
 
-**resume 安全 (state から導出)**: :class:`WorkListGather` は in-process カウンタを *持たない*。
-attempts / done / exhausted は毎回 ``state.history`` を決定的に *リプレイ* して導出する
-(scheduling 戦略が ``(attempts, done, exhausted, last_selected)`` の純関数なので、各反復で
-自分が何を dispatch したかを再現できる)。よって別プロセス / resume 後に同じ ``LoopState`` で
-呼べば同じ判断になる -- README「判定を gather された state から導けば、新プロセスでも同じ判断を
-する」(resume #14) の方針そのまま。``done_when`` は ``StepRecord`` を読むので、JSON 往復で
-ドリフトしないフィールド (``goal_met`` / JSON ネイティブな ``observation``) を見ること
-(loop.py の resume fidelity 注記と同じ約束)。
+**Resume safety (derived from state)**: :class:`WorkListGather` keeps no
+in-process counters. attempts / done / exhausted are deterministically derived
+by replaying ``state.history`` each time (because the scheduling strategy is a
+pure function of ``(attempts, done, exhausted, last_selected)``, so each
+iteration can reconstruct what it dispatched). Calling it with the same
+``LoopState`` in another process or after resume therefore makes the same
+decision, following the README policy that if decisions are derived from
+gathered state, a new process reaches the same decision (resume #14). Because
+``done_when`` reads ``StepRecord``, it should inspect fields that do not drift
+across JSON round trips (``goal_met`` / JSON-native ``observation``), matching
+the resume fidelity note in loop.py.
 
-**drained とループ停止**: 全 item が done か exhausted になると gather は返す item が無い
-(:data:`DRAINED` を返す)。ループを止めるのは gather ではなく停止条件なので、必ず
-:class:`WorkListDrained` を ``conditions`` に composeすること -- 停止条件は各反復の *先頭*
-(gather の前) で評価されるため、drained になった時点で gather が呼ばれる前にループが止まる
-(:data:`DRAINED` が ``act`` に渡ることはない)。
+**Drained and loop stopping**: Once every item is done or exhausted, gather has
+no item to return (it returns :data:`DRAINED`). Stopping the loop is the stop
+condition's job, not gather's, so always compose :class:`WorkListDrained` into
+``conditions``. Stop conditions are evaluated at the *start* of each iteration
+(before gather), so the loop stops before gather is called once the work list is
+drained (:data:`DRAINED` is never passed to ``act``).
 """
 
 from __future__ import annotations
@@ -52,15 +64,19 @@ from ._triage import triage
 
 @dataclass(frozen=True)
 class WorkItem:
-    """scheduling 対象の 1 件 (ファイル / bug / タスク)。
+    """One schedulable unit (file / bug / task).
 
     Args:
-        id: 安定識別子 (非空・work-list 内で一意)。attempts / done の集計キー。
-        priority: ``priority`` 戦略で使う優先度。**大きいほど優先**。既定 0。
-        payload: 採択時に ``act`` へ渡したい任意値 (ファイルパス・タスク本文・seed 等)。
-            既定の ``build_ctx`` は JSON ネイティブ dict ``{"id", "attempt", "priority",
-            "payload"}`` を ``act`` の context にするので、``act`` 側で ``ctx["payload"]`` /
-            ``ctx["id"]`` を読める。``payload`` 自体も (永続ゲートと合成するなら) JSON ネイティブに。
+        id: Stable identifier (non-empty and unique within the work list). Used
+            as the aggregation key for attempts and done.
+        priority: Priority used by the ``priority`` strategy. **Higher means
+            higher priority**. Defaults to 0.
+        payload: Arbitrary value to pass to ``act`` when selected (file path,
+            task body, seed, etc.). The default ``build_ctx`` makes the
+            JSON-native dict ``{"id", "attempt", "priority", "payload"}`` the
+            ``act`` context, so ``act`` can read ``ctx["payload"]`` /
+            ``ctx["id"]``. ``payload`` itself should also be JSON-native if
+            composed with a persistent gate.
     """
 
     id: str
@@ -74,17 +90,22 @@ class WorkItem:
 
 @dataclass(frozen=True)
 class ScheduleContext:
-    """scheduling 戦略に渡す read-only ビュー (この反復で選べる item と集計値)。
+    """Read-only view passed to scheduling strategies.
 
-    custom callable 戦略はこれを受け取り、``selectable`` の中から 1 件 (:class:`WorkItem`
-    または その ``id``) を返す。``selectable`` 外を返すと :class:`WorkListGather` が
-    ``ConfigError`` で fail loud する (誤って done / exhausted を再選択しないため)。
+    It contains the items selectable in this iteration and aggregate values. A
+    custom callable strategy receives this object and returns one item from
+    ``selectable`` (either a :class:`WorkItem` or its ``id``). Returning anything
+    outside ``selectable`` makes :class:`WorkListGather` fail loudly with
+    ``ConfigError`` so done / exhausted items are not accidentally reselected.
 
-    **``attempts`` と ``selections`` の違い**: ``attempts[id]`` は *実行された* 試行回数
-    (per-item 上限 / done 判定 / ModelLadder 用)。``selections[id]`` はその item が *選ばれた*
-    (offer された) 回数で、``item_of`` が非実行 (``None``) とした offer (gate SKIP 等) も含む。
-    **公平性は ``selections`` で測る** -- skip された item も「一度 offer した」分だけ後ろへ回し、
-    同じ item を無限に再提示して他を starve させないため。``item_of`` を使わなければ両者は一致する。
+    **Difference between ``attempts`` and ``selections``**: ``attempts[id]`` is
+    the number of *executed* attempts (for per-item limits, done checks, and
+    ModelLadder). ``selections[id]`` is the number of times the item was
+    *selected* (offered), including offers that ``item_of`` classified as
+    non-executed (``None``), such as gate SKIP. **Fairness is measured by
+    ``selections``**: skipped items move back as "offered once" so the same item
+    is not presented forever while starving the rest. Without ``item_of``, the
+    two counts are identical.
     """
 
     selectable: tuple[WorkItem, ...]
@@ -96,26 +117,29 @@ class ScheduleContext:
     exhausted: frozenset[str]
 
 
-# scheduling 戦略: ``ScheduleContext`` から次に回す item を選ぶ純関数。
+# Scheduling strategy: a pure function that picks the next item from ``ScheduleContext``.
 Scheduler = Callable[[ScheduleContext], Union[WorkItem, str]]
 
-# item を ``act`` の context へ変換するフック (item, この item の既試行回数, state)。
+# Hook that converts an item into the ``act`` context (item, prior attempts, state).
 ContextBuilder = Callable[[WorkItem, int, LoopState], Any]
 
-# 「*この item* は終わったか」を判定する user policy (verify とは独立)。
+# User policy that decides whether "*this item* is done" (independent of verify).
 DonePredicate = Callable[[WorkItem, StepRecord], bool]
 
-# その record が「実際にどの item を act した結果か」を返す (``None`` = 非実行 / 帰属なし)。
-# 既定 (``None`` フック) は schedule リプレイで「選んだ item == act した item」と見なす。
+# Returns which item a record was actually produced by acting on
+# (``None`` = non-executed / unattributed). The default (``None`` hook)
+# treats "selected item == acted item" during schedule replay.
 ItemAttributor = Callable[[StepRecord], Optional[str]]
 
 
 def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
-    """選択回数最小 -> 元の並び順。#37 PoC と同じ公平戦略 (round-robin 相当)。
+    """Fewest selections, then original order.
 
-    公平性は ``selections`` (offer 回数) で測る。``item_of`` を使わなければ
-    ``selections == attempts`` なので「試行回数最小」と一致する。gate SKIP 等で非実行とした
-    offer も後ろへ回るので、skip され続ける item が他を starve させない。
+    This is the same fair strategy as the #37 PoC (round-robin equivalent).
+    Fairness is measured by ``selections`` (offer count). Without ``item_of``,
+    ``selections == attempts``, so this matches "fewest attempts". Offers marked
+    non-executed by gate SKIP or similar still move back, so a continually
+    skipped item does not starve the rest.
     """
     return min(
         ctx.selectable, key=lambda it: (ctx.selections[it.id], ctx.position[it.id])
@@ -123,19 +147,23 @@ def _strat_fewest_attempts(ctx: ScheduleContext) -> WorkItem:
 
 
 def _strat_fifo(ctx: ScheduleContext) -> WorkItem:
-    """元の並び順で最初の未完 item (素朴な戦略; per-item 上限と併用で starve を緩和)。
+    """First unfinished item in original order.
 
-    公平性カウンタを持たない素朴版なので、``item_of`` で非実行とした offer に対しては
-    rotate しない (skip された先頭 item を offer し続ける)。gate と合成して skip を非実行に
-    する場合は ``fewest_attempts`` / ``round_robin`` を使うこと。
+    This is a naive strategy; combine it with per-item limits to reduce
+    starvation. Because it has no fairness counter, it does not rotate after an
+    offer that ``item_of`` marked non-executed (it keeps offering the skipped
+    first item). Use ``fewest_attempts`` / ``round_robin`` when composing with a
+    gate that treats skips as non-executed.
     """
     return min(ctx.selectable, key=lambda it: ctx.position[it.id])
 
 
 def _strat_priority(ctx: ScheduleContext) -> WorkItem:
-    """優先度降順 -> 選択回数昇順 -> 並び順。優先度を尊重しつつ同優先度内は公平。
+    """Priority descending, then selection count ascending, then original order.
 
-    同優先度内の公平性は ``selections`` (offer 回数) で測る (``_strat_fewest_attempts`` と同様)。
+    This respects priority while staying fair within the same priority. Fairness
+    within equal priorities is measured by ``selections`` (offer count), as in
+    ``_strat_fewest_attempts``.
     """
     return min(
         ctx.selectable,
@@ -144,11 +172,14 @@ def _strat_priority(ctx: ScheduleContext) -> WorkItem:
 
 
 def _strat_round_robin(ctx: ScheduleContext) -> WorkItem:
-    """位置順で last_selected の *次* の selectable へ循環 (古典的 round-robin)。
+    """Cycle to the selectable item *after* last_selected by position.
 
-    ``fewest_attempts`` が「試行回数」で公平を測るのに対し、こちらは並び順で厳密に巡回する
-    (同じ item を連続 dispatch しない)。last_selected が done / exhausted で selectable から
-    外れていても、その *位置* を巡回の基準にする (位置は不変なので決定的)。
+    This is classic round-robin. Unlike ``fewest_attempts``, which measures
+    fairness by selection count, this strictly cycles by original order (it
+    does not dispatch the same item consecutively). Even if last_selected has
+    become done / exhausted and is no longer selectable, its *position* remains
+    the cycling reference point (positions are immutable, so this is
+    deterministic).
     """
     if ctx.last_selected is None:
         return min(ctx.selectable, key=lambda it: ctx.position[it.id])
@@ -167,11 +198,13 @@ _BUILTIN_STRATEGIES: dict[str, Scheduler] = {
 
 
 class Drained:
-    """:meth:`WorkListGather.__call__` が「回す item が無い」ことを示す sentinel 型。
+    """Sentinel type indicating that :meth:`WorkListGather.__call__` has no item to run.
 
-    全 item が done / exhausted のとき gather が返す。:data:`DRAINED` (唯一のインスタンス)
-    で参照する。ループ停止は :class:`WorkListDrained` 停止条件が担うので、正しく compose
-    していればこの値が ``act`` に渡ることはない (停止条件が gather より先に評価される)。
+    Gather returns this when every item is done / exhausted. Refer to it via
+    :data:`DRAINED` (the only instance). Loop stopping is handled by the
+    :class:`WorkListDrained` stop condition, so when composed correctly this
+    value is never passed to ``act`` (stop conditions are evaluated before
+    gather).
     """
 
     _singleton: "Optional[Drained]" = None
@@ -193,10 +226,11 @@ DRAINED = Drained()
 
 @dataclass(frozen=True)
 class WorkListProgress:
-    """work-list の進捗スナップショット (:meth:`WorkListGather.report` が返す)。
+    """Work-list progress snapshot returned by :meth:`WorkListGather.report`.
 
-    ``done`` / ``exhausted`` / ``remaining`` は item id のタプル (元の並び順)。``attempts`` は
-    id -> 既試行回数。``drained`` は「回す item がもう無い」 (= ``remaining`` が空)。
+    ``done`` / ``exhausted`` / ``remaining`` are tuples of item ids in original
+    order. ``attempts`` maps id to prior attempt count. ``drained`` means there
+    are no items left to run (= ``remaining`` is empty).
     """
 
     total: int
@@ -207,13 +241,13 @@ class WorkListProgress:
 
     @property
     def drained(self) -> bool:
-        """回す item がもう無いか (全件 done か exhausted)。"""
+        """Whether there are no items left to run (all done or exhausted)."""
         return not self.remaining
 
 
 @dataclass(frozen=True)
 class _Derivation:
-    """``state.history`` リプレイの結果 (内部)。"""
+    """Result of replaying ``state.history`` (internal)."""
 
     attempts: dict[str, int]
     selections: dict[str, int]
@@ -224,25 +258,28 @@ class _Derivation:
 
 
 def _default_done(item: WorkItem, record: StepRecord) -> bool:
-    """既定の done 判定: その反復で verify がゴール到達を報告したか。
+    """Default done predicate: whether verify reported goal completion for the iteration.
 
-    単一ゴールのループ向けの素直な既定。真の multi-item では「*この item* は終わったか」を
-    別シグナルで判定したいことが多いので、``done_when`` で上書きする (record.observation /
-    record.detail に item ごとの完了シグナルを載せておく)。
+    This is a straightforward default for single-goal loops. True multi-item
+    loops often need another signal to decide whether "*this item* is done", so
+    override it with ``done_when`` (store per-item completion signals in
+    record.observation / record.detail).
     """
     return bool(record.goal_met)
 
 
 def _default_build_ctx(item: WorkItem, attempt: int, state: LoopState) -> dict[str, Any]:
-    """既定の context: JSON ネイティブな dict ``{"id", "attempt", "priority", "payload"}``。
+    """Default context: JSON-native dict ``{"id", "attempt", "priority", "payload"}``.
 
-    ``act`` は ``ctx["id"]`` / ``ctx["payload"]`` / ``ctx["attempt"]`` で読む。**JSON ネイティブ
-    にしてあるのは意図的**: 永続人間ゲート (:class:`~loop_agent.gate.HumanGate` /
-    :func:`~loop_agent.gate.run_gated_loop`) と合成したとき、gate が pause すると context が
-    提案 action として state.db に保存される (``request_decision`` は JSON ネイティブを要求する)。
-    :class:`WorkItem` 自身を返すと round-trip できず ``ConfigError`` になるため、dict を既定に
-    する (``payload`` が JSON ネイティブな限り安全)。``WorkItem`` をそのまま欲しい等は ``build_ctx``
-    で上書きする。
+    ``act`` reads ``ctx["id"]`` / ``ctx["payload"]`` / ``ctx["attempt"]``.
+    **JSON-native is intentional**: when composed with a persistent human gate
+    (:class:`~loop_agent.gate.HumanGate` /
+    :func:`~loop_agent.gate.run_gated_loop`), if the gate pauses, context is
+    saved to state.db as the proposed action (``request_decision`` requires
+    JSON-native values). Returning :class:`WorkItem` itself would not round-trip
+    and would raise ``ConfigError``, so the default is a dict (safe as long as
+    ``payload`` is JSON-native). Override with ``build_ctx`` if the raw
+    ``WorkItem`` or another shape is desired.
     """
     return {
         "id": item.id,
@@ -253,47 +290,65 @@ def _default_build_ctx(item: WorkItem, attempt: int, state: LoopState) -> dict[s
 
 
 class WorkListGather:
-    """複数 item を 1 本のループで公平に回す ``gather`` フック (Issue #56)。
+    """``gather`` hook that fairly runs multiple items through one loop (Issue #56).
 
-    ``run_loop(gather=WorkListGather(items, ...), ...)`` のように ``gather`` に渡す
-    (``__call__(state) -> ctx`` が ``GatherHook`` に適合)。各反復で:
+    Pass it as ``gather`` as in ``run_loop(gather=WorkListGather(items, ...),
+    ...)`` (``__call__(state) -> ctx`` conforms to ``GatherHook``). On each
+    iteration:
 
-    1. ``state.history`` を決定的にリプレイし、各 item の attempts / done / exhausted を導出する。
-    2. scheduling 戦略で次に回す item を 1 件選ぶ (selectable = 未 done かつ未 exhausted)。
-    3. ``build_ctx(item, attempt, state)`` を ``act`` の context として返す。
-    4. selectable が空なら :data:`DRAINED` を返す (停止は :class:`WorkListDrained` が担う)。
+    1. Deterministically replay ``state.history`` to derive attempts / done /
+       exhausted for each item.
+    2. Select one next item with the scheduling strategy (selectable = not done
+       and not exhausted).
+    3. Return ``build_ctx(item, attempt, state)`` as the context for ``act``.
+    4. Return :data:`DRAINED` if selectable is empty (stopping is handled by
+       :class:`WorkListDrained`).
 
     Args:
-        items: 回す :class:`WorkItem` 群 (id は一意)。空なら常に drained。:class:`WorkItem`
-            でなく素の文字列を渡しても良い (``id`` として ``WorkItem`` に昇格する)。
-        strategy: ``"round_robin"`` / ``"fewest_attempts"`` (既定) / ``"fifo"`` /
-            ``"priority"``、または ``ScheduleContext -> WorkItem|id`` の custom callable。
-        max_attempts_per_item: per-item 上限。``None`` (既定) なら無制限 (グローバルな
-            ``MaxIterations`` のみで bound)。``>= 1``。規定回数試して done にならない item は
-            *exhausted* として selectable から外れる -- 1 item が ``MaxIterations`` を独占して
-            他を starve させない核 (#37 で素朴 gather がこれで詰んだ)。
-        done_when: 「*この item* は終わったか」を ``(item, record) -> bool`` で判定する
-            user policy (verify とは独立)。既定は ``record.goal_met``。一度 done になった item は
-            再 dispatch されない (sticky)。
-        build_ctx: 選んだ item を ``act`` の context へ変換する ``(item, attempt, state) -> ctx``。
-            ``attempt`` はこの dispatch *前* の既試行回数 (0 始まり) -- ModelLadder と合成して
-            試行回数でモデルを上げる、等に使える。既定は JSON ネイティブ dict ``{"id", "attempt",
-            "priority", "payload"}`` を返す (永続人間ゲートと合成しても state.db に保存できるよう
-            JSON ネイティブにしてある)。
-        item_of: history の各 record が「*実際に* どの item を ``act`` した結果か」を返す
-            ``(record) -> item_id | None`` フック。既定 ``None`` は schedule リプレイで
-            「offer した item == act した item」と見なす (gate 無しの標準 1:1 ループでは正しい)。
-            ``gate`` を合成して offer と record がずれる構成では渡す:
-            ``GATE_SKIP`` (reject/respond) は ``act`` せず record だけ積むので ``None`` を返して
-            非実行にする; ``edit`` で別 item に差し替えると record はその item のものなので、
-            record (例: ``observation`` に焼いた item id) から実 item を返す。``None`` / work-list
-            外の id は実行として数えず attempts / done / per-item 上限を更新しない -- 走っていない
-            item を誤って *exhausted* にしたり、別 item の record を取り違えたりしないため (#56
-            review)。**公平性 (offer 回数) は schedule で測る** ので、``item_of`` が ``None`` を
-            返す skip でも offer は前進し、他 item へ rotate して starve を防ぐ。
+        items: :class:`WorkItem` values to run (ids must be unique). Empty means
+            always drained. Plain strings are also accepted and promoted to
+            ``WorkItem`` as the ``id``.
+        strategy: ``"round_robin"`` / ``"fewest_attempts"`` (default) /
+            ``"fifo"`` / ``"priority"``, or a custom
+            ``ScheduleContext -> WorkItem|id`` callable.
+        max_attempts_per_item: Per-item limit. ``None`` (default) means
+            unlimited (bounded only by the global ``MaxIterations``). Must be
+            ``>= 1``. Items that do not become done after the configured number
+            of attempts are marked *exhausted* and removed from selectable. This
+            is the core protection against one item monopolizing
+            ``MaxIterations`` and starving the rest; #37 avoided that starvation
+            with a handwritten round-robin gather.
+        done_when: User policy ``(item, record) -> bool`` that decides whether
+            "*this item* is done" (independent of verify). Defaults to
+            ``record.goal_met``. Once an item becomes done, it is never
+            dispatched again (sticky).
+        build_ctx: ``(item, attempt, state) -> ctx`` converter from the selected
+            item to the context for ``act``. ``attempt`` is the prior attempt
+            count before this dispatch (0-based), useful for composition such
+            as raising the model by attempt count with ModelLadder. The default
+            returns the JSON-native dict ``{"id", "attempt", "priority",
+            "payload"}`` so it can be saved to state.db when composed with a
+            persistent human gate.
+        item_of: ``(record) -> item_id | None`` hook that returns which item
+            each history record was *actually* produced by acting on. The
+            default ``None`` uses schedule replay and treats "offered item ==
+            acted item" (correct for standard 1:1 loops without a gate). Pass
+            this when composing with a ``gate`` where offers and records can
+            diverge: ``GATE_SKIP`` (reject/respond) adds a record without
+            calling ``act``, so return ``None`` to mark it non-executed; ``edit``
+            can replace the context with another item, so return the actual item
+            from the record (for example an item id embedded in ``observation``).
+            ``None`` or an id outside the work list is not counted as execution
+            and does not update attempts / done / per-item limits, which avoids
+            incorrectly exhausting an item that did not run or attributing
+            another item's record to it (#56 review). **Fairness (offer count)
+            is measured by schedule**, so offers advance even when ``item_of``
+            returns ``None`` for a skip, rotating to other items and preventing
+            starvation.
 
     Raises:
-        ConfigError: item id が重複 / ``strategy`` が未知の文字列 / ``max_attempts_per_item < 1``。
+        ConfigError: duplicate item ids, unknown ``strategy`` string, or
+            ``max_attempts_per_item < 1``.
     """
 
     def __init__(
@@ -339,15 +394,15 @@ class WorkListGather:
 
     @property
     def items(self) -> tuple[WorkItem, ...]:
-        """登録された work item 群 (元の並び順)。"""
+        """Registered work items in original order."""
         return self._items
 
-    # -- scheduling 内部 -----------------------------------------------------
+    # -- scheduling internals -----------------------------------------------
 
     def _selectable(
         self, done: set[str], exhausted: set[str]
     ) -> tuple[WorkItem, ...]:
-        """未 done かつ未 exhausted の item を並び順で。"""
+        """Items that are neither done nor exhausted, in original order."""
         return tuple(
             it for it in self._items if it.id not in done and it.id not in exhausted
         )
@@ -360,7 +415,7 @@ class WorkListGather:
         exhausted: set[str],
         last_selected: Optional[str],
     ) -> Optional[str]:
-        """戦略に 1 件選ばせて id を返す (selectable が空なら ``None``)。"""
+        """Let the strategy select one item and return its id (or ``None`` if empty)."""
         selectable = self._selectable(done, exhausted)
         if not selectable:
             return None
@@ -384,36 +439,51 @@ class WorkListGather:
         return chosen_id
 
     def _derive(self, state: LoopState) -> _Derivation:
-        """``state.history`` を決定的にリプレイし attempts / done / exhausted を導出する。
+        """Deterministically replay ``state.history`` to derive progress.
 
-        各 history record は「直前の反復で本 gatherer が dispatch した item を act した結果」
-        と見なす (戦略が決定的なので step k の選択を再現できる)。これにより in-process カウンタ
-        無しで resume 安全になる。``done`` / ``exhausted`` は sticky (一度立つと再選択しない)。
+        Each history record is treated as the result of acting on the item this
+        gatherer dispatched in the immediately preceding iteration (because the
+        strategy is deterministic, the selection at step k can be reconstructed).
+        This makes resume safe without in-process counters. ``done`` /
+        ``exhausted`` are sticky (once set, the item is not reselected).
 
-        **前提条件 (resume 時の正しさ)**: 帰属は ``state.history`` を *現在の* ``items`` /
-        ``strategy`` / ``max_attempts_per_item`` / ``done_when`` でリプレイして導出する。
-        ``StepRecord`` は「どの item を dispatch したか」を構造的に持たない (戦略から再導出する)
-        ので、**history を生成した時の設定と現在の設定が一致している場合にだけ正しい**。設定が
-        違う gatherer に過去の history を食わせると、step k の記録を別の item に黙って誤帰属する
-        (crash しない)。よって resume は「中断した *同一* gatherer を ``initial_state`` で再開」
-        に限る。:meth:`from_triage` で ready 集合が変わった新 gatherer を作る場合は、items の
-        並び・構成が変わるので **過去の history を引き継がず、新しい ``LoopState`` で開始する**
-        こと (triage が done 済みを除外し、新規 ready は試行 0 から始まるのが正しい挙動)。
+        **Prerequisite for resume correctness**: attribution is derived by
+        replaying ``state.history`` with the *current* ``items`` / ``strategy`` /
+        ``max_attempts_per_item`` / ``done_when``. ``StepRecord`` does not
+        structurally record which item was dispatched (it is rederived from the
+        strategy), so this is correct **only when the current settings match the
+        settings that produced the history**. Feeding history from another
+        gatherer configuration silently misattributes the step k record to a
+        different item (it does not crash). Therefore resume is limited to
+        restarting the *same* interrupted gatherer via ``initial_state``. If
+        :meth:`from_triage` creates a new gatherer because the ready set changed,
+        the item order/composition changes, so **do not carry over prior
+        ``state.history``; start a new loop with a fresh ``LoopState``** (triage
+        excludes already-done items, and new ready items should start at attempt
+        0).
 
-        **offer と 帰属の分離**: ``selections`` (offer 回数) は schedule から決まり公平性を
-        駆動する。attempts / done / exhausted は record の *帰属先* item に付く。既定はこの二つを
-        同一視する (offer == act の 1:1 ループ)。gate が間に入って両者がずれる構成では:
+        **Separating offers from attribution**: ``selections`` (offer count) is
+        determined by schedule and drives fairness. attempts / done / exhausted
+        attach to the item the record is *attributed to*. By default the two are
+        identified (offer == act in a 1:1 loop). When a gate sits between them
+        and they can diverge:
 
-        - ``GATE_SKIP`` (reject/respond) -- ``act`` せず record を積む。``item_of`` が ``None`` を
-          返せば非実行として attempts に数えない (offer は前進するので公平に rotate する)。
-        - ``edit`` -- 別 item の context に差し替えて ``act`` する。record はその item のものなので、
-          ``item_of`` で record から実 item を読めば正しい item に帰属する (offer した元 item は
-          実行ゼロのまま)。``item_of`` を渡さないと record を offer した item に誤帰属する。
+        - ``GATE_SKIP`` (reject/respond): adds a record without calling ``act``.
+          If ``item_of`` returns ``None``, it is treated as non-executed and does
+          not count toward attempts (the offer still advances, so rotation stays
+          fair).
+        - ``edit``: replaces the context and acts on another item. Because the
+          record belongs to that item, reading the actual item from the record
+          with ``item_of`` attributes it correctly (the originally offered item
+          remains at zero executions). Without ``item_of``, the record is
+          incorrectly attributed to the offered item.
 
-        公平性は ``selections`` で測るので、skip された item も後ろへ回り ``fewest_attempts`` /
-        ``priority`` / ``round_robin`` は同じ item を無限に再提示しない (``fifo`` のみ素朴ゆえ
-        非 rotate)。標準の ``run_loop`` (gate 無し / skip も edit もしない gate) では offer と
-        record が 1:1・``selections == attempts`` なので ``item_of`` は不要。
+        Because fairness is measured by ``selections``, skipped items also move
+        back and ``fewest_attempts`` / ``priority`` / ``round_robin`` do not
+        present the same item forever (only ``fifo`` stays naive and does not
+        rotate). In standard ``run_loop`` usage (no gate, or a gate that neither
+        skips nor edits), offers and records are 1:1 and ``selections ==
+        attempts``, so ``item_of`` is unnecessary.
         """
         attempts: dict[str, int] = {it.id: 0 for it in self._items}
         selections: dict[str, int] = {it.id: 0 for it in self._items}
@@ -422,23 +492,29 @@ class WorkListGather:
         last_selected: Optional[str] = None
 
         for record in state.history:
-            # sel = gather が *offer* した item (schedule から)。selectable が尽きた後も
-            # history が続く場合 (本 gatherer 由来でない step / 全 drained 後の余剰) は帰属しない。
+            # sel = item that gather *offered* (from schedule). If history
+            # continues after selectable is exhausted (steps not produced by
+            # this gatherer / surplus after everything drained), leave it
+            # unattributed.
             sel = self._select_id(attempts, selections, done, exhausted, last_selected)
             if sel is None:
                 break
-            # offer は必ず前進させる -- 公平性 (selections) と round_robin の rotation 基準。
-            # 非実行 (skip) でも前進させるので、skip され続ける item が他を starve させない。
+            # Always advance the offer for fairness (selections) and the
+            # round_robin rotation reference. Even non-executed skips advance,
+            # so a continually skipped item does not starve the rest.
             selections[sel] += 1
             last_selected = sel
-            # 帰属 = この record が *実際に act した* item。既定 (item_of=None) は「offer した
-            # item == act した item」(標準の 1:1 ループ)。gate が SKIP (item 無し) / EDIT
-            # (別 item へ差し替え) する構成では offer と record がずれるので、item_of で record
-            # から実 item を読む (None=非実行)。これで attempts/done/exhausted を正しい item に
-            # 付け、走っていない item を上限で誤 exhausted にしない (#56 review)。
+            # Attribution = item this record was *actually acted* on. The
+            # default (item_of=None) treats "offered item == acted item"
+            # (standard 1:1 loop). When a gate can SKIP (no item) / EDIT
+            # (replace with another item), offers and records diverge, so read
+            # the actual item from the record via item_of (None=non-executed).
+            # This attaches attempts/done/exhausted to the correct item and
+            # avoids exhausting an item that did not run (#56 review).
             actual = sel if self._item_of is None else self._item_of(record)
             if actual is None or actual not in self._by_id:
-                # 非実行 (skip) か、本 work-list 外の id への edit -- 実行として数えない。
+                # Non-executed (skip), or edit to an id outside this work list:
+                # do not count it as execution.
                 continue
             attempts[actual] += 1
             if self._done_when(self._by_id[actual], record):
@@ -451,44 +527,44 @@ class WorkListGather:
             attempts, selections, done, exhausted, last_selected, selectable
         )
 
-    # -- gather フック本体 ---------------------------------------------------
+    # -- gather hook body ----------------------------------------------------
 
     def __call__(self, state: LoopState) -> Any:
-        """``GatherHook`` 本体: 次に回す item の context を返す (drained なら :data:`DRAINED`)。"""
+        """``GatherHook`` body: return the next item context, or :data:`DRAINED`."""
         d = self._derive(state)
         if not d.selectable:
             return DRAINED
         sel = self._select_id(
             d.attempts, d.selections, d.done, d.exhausted, d.last_selected
         )
-        assert sel is not None  # selectable が非空なので必ず選べる
+        assert sel is not None  # selectable is non-empty, so selection must succeed
         item = self._by_id[sel]
         return self._build_ctx(item, d.attempts[sel], state)
 
-    # -- attempt counter / 進捗の正規 API ------------------------------------
+    # -- attempt counter / canonical progress API ----------------------------
 
     def attempts(self, state: LoopState) -> dict[str, int]:
-        """各 item の既試行回数 (id -> count) を state から導出して返す。"""
+        """Return prior attempt counts for each item (id -> count), derived from state."""
         return dict(self._derive(state).attempts)
 
     def done_items(self, state: LoopState) -> set[str]:
-        """``done_when`` で完了と判定された item id 集合。"""
+        """Set of item ids considered complete by ``done_when``."""
         return set(self._derive(state).done)
 
     def exhausted_items(self, state: LoopState) -> set[str]:
-        """per-item 上限に達したが未完了の item id 集合 (starve 防止で外された側)。"""
+        """Set of incomplete item ids removed after reaching the per-item limit."""
         return set(self._derive(state).exhausted)
 
     def remaining(self, state: LoopState) -> tuple[WorkItem, ...]:
-        """まだ回せる item (未 done かつ未 exhausted) を並び順で。"""
+        """Items still runnable (not done and not exhausted), in original order."""
         return self._derive(state).selectable
 
     def drained(self, state: LoopState) -> bool:
-        """回す item がもう無いか (全件 done か exhausted)。"""
+        """Whether there are no items left to run (all done or exhausted)."""
         return not self._derive(state).selectable
 
     def report(self, state: LoopState) -> WorkListProgress:
-        """進捗スナップショット (:class:`WorkListProgress`) を 1 回の導出で返す。"""
+        """Return a progress snapshot (:class:`WorkListProgress`) from one derivation."""
         d = self._derive(state)
         return WorkListProgress(
             total=len(self._items),
@@ -498,7 +574,7 @@ class WorkListGather:
             attempts=dict(d.attempts),
         )
 
-    # -- triage との接続 -----------------------------------------------------
+    # -- triage integration --------------------------------------------------
 
     @classmethod
     def from_triage(
@@ -509,27 +585,34 @@ class WorkListGather:
         strategy: Union[str, Scheduler] = "fewest_attempts",
         **kwargs: Any,
     ) -> "WorkListGather":
-        """優先度・順序計算を :func:`loop_agent.discovery.triage` に委譲して構築する。
+        """Build by delegating priority and ordering to :func:`loop_agent.discovery.triage`.
 
-        ``candidates`` (:class:`~loop_agent.discovery.Candidate` 群) を ``triage`` にかけ、
-        *ready* (依存が満たされた) 候補だけを triage のランキング順 (優先度降順 -> 工数昇順 ->
-        id) で :class:`WorkItem` に写す (``priority`` / ``payload`` を引き継ぐ)。*blocked*
-        (依存未充足) 候補はまだ回せないので除外する。
+        Run ``triage`` over ``candidates`` (a collection of
+        :class:`~loop_agent.discovery.Candidate` values), then map only *ready*
+        candidates (dependencies satisfied) to :class:`WorkItem` in triage
+        ranking order (priority descending -> effort ascending -> id), carrying
+        over ``priority`` / ``payload``. *blocked* candidates (dependencies not
+        satisfied) are excluded because they cannot run yet.
 
-        これで責務が綺麗に分かれる: **何を どの順で回す価値があるか** は triage (依存解決 +
-        優先度)、**それらを どう公平に回すか** は :class:`WorkListGather` (scheduling +
-        per-item 上限)。依存が解けて新たに ready になった候補を取り込むには、その時点の
-        ``done`` で ``from_triage`` を呼び直して新しい gatherer を作る -- このとき items の構成が
-        変わるので、過去の ``state.history`` は引き継がず **新しい ``LoopState`` でループを開始
-        する** (:meth:`_derive` の前提条件を参照: 設定の違う history を食わせると誤帰属する)。
+        This keeps responsibilities separate: triage decides **what is worth
+        running, and in what order** (dependency resolution + priority), while
+        :class:`WorkListGather` decides **how to run those items fairly**
+        (scheduling + per-item limits). To include newly ready candidates after
+        dependencies are resolved, call ``from_triage`` again with the current
+        ``done`` set and create a new gatherer. Because the item composition
+        changes, do not carry over prior ``state.history``; **start the loop
+        with a new ``LoopState``** (see the :meth:`_derive` prerequisites:
+        history from another configuration will be misattributed).
 
         Args:
-            candidates: triage する候補群。
-            done: triage 時点で完了済みの id (依存充足判定に使う)。
-            strategy: scheduling 戦略 (既定 ``"fewest_attempts"``)。triage が順序を決めるので
-                ``"fifo"`` でも triage ランキング順に回る。
-            **kwargs: :class:`WorkListGather` の他引数 (``max_attempts_per_item`` /
-                ``done_when`` / ``build_ctx``)。
+            candidates: Candidates to triage.
+            done: Ids already complete at triage time (used for dependency
+                satisfaction).
+            strategy: Scheduling strategy (default ``"fewest_attempts"``).
+                Because triage determines order, even ``"fifo"`` runs in triage
+                ranking order.
+            **kwargs: Other :class:`WorkListGather` arguments
+                (``max_attempts_per_item`` / ``done_when`` / ``build_ctx``).
         """
         result = triage(candidates, done=done)
         items = tuple(
@@ -540,18 +623,23 @@ class WorkListGather:
 
 
 class WorkListDrained:
-    """:class:`WorkListGather` が drained (全件 done/exhausted) になったら止める停止条件。
+    """Stop condition that stops once :class:`WorkListGather` is drained.
 
-    ``StopCondition`` プロトコル (``check(state) -> reason|None`` + ``name``) に適合し、
-    ``AnyOf`` / ``run_loop(conditions=...)`` にそのまま compose できる。停止条件は各反復の
-    *先頭* (gather の前) で評価されるので、drained 化した時点で gather が呼ばれる前に
-    ループが止まる -- :data:`DRAINED` が ``act`` へ漏れない設計上の要。
+    Drained means every item is done/exhausted. This conforms to the
+    ``StopCondition`` protocol (``check(state) -> reason|None`` + ``name``) and
+    can be composed directly with ``AnyOf`` / ``run_loop(conditions=...)``. Stop
+    conditions are evaluated at the *start* of each iteration (before gather),
+    so once the gatherer is drained the loop stops before gather is called. This
+    is the key design point that prevents :data:`DRAINED` from leaking into
+    ``act``.
 
-    これは *中立* な停止 (成功でも abort でもない): 「やるべき item を回し切った / 上限まで
-    試した」を意味する。個々の item の成否は :meth:`WorkListGather.report` で読む。
+    This is a *neutral* stop (neither success nor abort): it means "all items to
+    run have been completed or tried up to their limits". Read individual item
+    outcomes from :meth:`WorkListGather.report`.
 
     Args:
-        gatherer: 監視対象の :class:`WorkListGather` (同じ ``items`` 設定を共有する個体)。
+        gatherer: :class:`WorkListGather` to monitor (the instance sharing the
+            same ``items`` configuration).
     """
 
     name: ClassVar[str] = "work_list_drained"

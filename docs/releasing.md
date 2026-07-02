@@ -1,78 +1,100 @@
-# リリース運用ガイド
+# Release Operations Guide
 
-loop-agent を PyPI へリリースする手順と方針をまとめる。発行は GitHub Actions
-（[`.github/workflows/release.yml`](../.github/workflows/release.yml)）が
-**OIDC Trusted Publishing** で自動実行する。API token も secrets も使わない。
+This document summarizes the procedure and policy for releasing loop-agent to PyPI.
+Publishing is performed automatically by GitHub Actions
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)) through
+**OIDC Trusted Publishing**. It uses neither API tokens nor secrets.
 
-## バージョニング方針（SemVer）
+## Versioning Policy (SemVer)
 
-[Semantic Versioning](https://semver.org/lang/ja/) に従い `MAJOR.MINOR.PATCH`
-を付ける。
+Use `MAJOR.MINOR.PATCH` versions according to
+[Semantic Versioning](https://semver.org/).
 
-- **MAJOR**: 後方互換を壊す変更（公開 API の削除・改名・シグネチャ変更、永続
-  スキーマの非互換変更など）。
-- **MINOR**: 後方互換を保つ機能追加（新しい公開 API・新 extra・新オプション）。
-- **PATCH**: 後方互換を保つ bug fix・ドキュメント・内部改善。
+- **MAJOR**: Changes that break backward compatibility, such as removing,
+  renaming, or changing the signature of a public API, or making incompatible
+  changes to a persistent schema.
+- **MINOR**: Backward-compatible feature additions, such as new public APIs, new
+  extras, or new options.
+- **PATCH**: Backward-compatible bug fixes, documentation changes, and internal
+  improvements.
 
-### 0.x 系の注意
+### Notes for the 0.x Series
 
-`0.y.z` の間は公開 API が安定保証の対象外である。実務上は次の運用とする:
+During `0.y.z`, the public API is not covered by a stability guarantee. In
+practice, use the following policy:
 
-- 破壊変更は MINOR（`0.y` の `y`）を上げる。
-- 機能追加・bug fix は PATCH（`z`）を上げる。
-- 公開 API が安定したら `1.0.0` を切り、以後は厳密な SemVer に移行する。
+- Raise MINOR (`y` in `0.y`) for breaking changes.
+- Raise PATCH (`z`) for feature additions and bug fixes.
+- Once the public API is stable, release `1.0.0` and move to strict SemVer from
+  then on.
 
-「公開 API」とは `loop_agent/__init__.py` の `__all__` でエクスポートされる
-シンボルを指す。
+"Public API" means the symbols exported through `__all__` in
+`loop_agent/__init__.py`.
 
-### 1.0.0 以降の互換性
+### Compatibility After 1.0.0
 
-`1.0.0` 以降は [stability.md](./stability.md) を安定契約の正本とする。
+After `1.0.0`, [stability.md](./stability.md) is the authoritative stability
+contract.
 
-- 公開 API の削除・改名・非互換なシグネチャ変更は MAJOR。
-- 後方互換の機能追加・新 option・新 helper は MINOR。
-- bug fix・docs・内部改善・後方互換な metadata 修正は PATCH。
-- CLI のサブコマンド名・終了コード・TOML の主要キーは安定契約に含む。
-- state.db の非破壊 migration は MINOR/PATCH、既存 DB の読み取り互換を壊す変更は MAJOR。
+- Removing, renaming, or making incompatible signature changes to a public API is
+  MAJOR.
+- Backward-compatible feature additions, new options, and new helpers are MINOR.
+- Bug fixes, docs, internal improvements, and backward-compatible metadata fixes
+  are PATCH.
+- CLI subcommand names, exit codes, and primary TOML keys are included in the
+  stability contract.
+- Non-destructive migrations for state.db are MINOR/PATCH; changes that break
+  read compatibility with existing DBs are MAJOR.
 
-破壊変更は、可能な限り minor release で deprecation を告知し、後続 major release で削除する。安全性や正しさのために旧挙動を維持できない場合は、CHANGELOG に理由と移行手順を書く。
+For breaking changes, announce the deprecation in a minor release whenever
+possible, then remove the deprecated behavior in a subsequent major release. If
+the old behavior cannot be preserved for safety or correctness reasons, document
+the reason and migration steps in the CHANGELOG.
 
-### 1.0.0 release gate
+### 1.0.0 Release Gate
 
-`1.0.0` を切る前に次を満たす:
+This is the `1.0.0 release gate`.
 
-- README から [stability.md](./stability.md) が辿れる。
-- `pyproject.toml` classifier が `Development Status :: 5 - Production/Stable`。
-- `pyproject.toml` / `loop_agent.__version__` / `CHANGELOG.md` / tag が同一 version。
-- `python -m ruff check .` が pass。
-- `python -m mypy` が pass。
-- `python -m pytest` が pass。
-- `python -m build` が pass。
-- `python -m twine check dist/*` が pass。
-- `python scripts/verify_wheel_skill_bundle.py` が pass。
+Before releasing `1.0.0`, the following must be true:
 
-## 単一の version source
+- [stability.md](./stability.md) is reachable from the README.
+- The `pyproject.toml` classifier is `Development Status :: 5 - Production/Stable`.
+- `pyproject.toml` / `loop_agent.__version__` / `CHANGELOG.md` / tag all use the
+  same version.
+- `python -m ruff check .` passes.
+- `python -m mypy` passes.
+- `python -m pytest` passes.
+- `python -m build` passes.
+- `python -m twine check dist/*` passes.
+- `python scripts/verify_wheel_skill_bundle.py` passes.
 
-version は 2 箇所に書く。リリース前に**必ず一致**させる:
+## Single Version Source
 
-1. [`pyproject.toml`](../pyproject.toml) の `[project].version`
-   （ビルド成果物 = wheel/sdist の版になる。タグが publish する版はこれ）
-2. [`src/loop_agent/__init__.py`](../src/loop_agent/__init__.py) の `__version__`
+The version is written in two places. They **must match** before release:
 
-`git tag` の `vX.Y.Z` と上記 2 つの `X.Y.Z` を揃える。タグの版と pyproject の
-版が食い違うと、タグ名と異なる版が publish される事故になる。
+1. `[project].version` in [`pyproject.toml`](../pyproject.toml)
+   (this becomes the version of the build artifacts, namely the wheel/sdist; the
+   tag publishes this version)
+2. `__version__` in
+   [`src/loop_agent/__init__.py`](../src/loop_agent/__init__.py)
 
-## リリース手順
+Align the `X.Y.Z` in the `git tag` value `vX.Y.Z` with the two values above. If
+the tag version and the pyproject version differ, a package version that does
+not match the tag name may be published.
 
-1. **version bump**: `pyproject.toml` と `__init__.py` の version を新しい
-   `X.Y.Z` に更新する。
-2. **CHANGELOG 更新**: [`CHANGELOG.md`](../CHANGELOG.md) の `[Unreleased]` の
-   内容を `[X.Y.Z] - YYYY-MM-DD` セクションへ移し、日付を確定する。新しい空の
-   `[Unreleased]` を残し、末尾のリンク定義（compare URL）も更新する。
-3. **PR 作成 -> レビュー -> `main` マージ**: 上記をまとめた PR を出し、CI
-   （[`ci.yml`](../.github/workflows/ci.yml)）が green であることを確認して
-   `main` へマージする。
-4. **タグ push**: `main` の該当コミットに `vX.Y.Z` タグを打って push する。
+## Release Procedure
+
+1. **Version bump**: Update the versions in `pyproject.toml` and `__init__.py`
+   to the new `X.Y.Z`.
+2. **Update CHANGELOG**: Move the contents of `[Unreleased]` in
+   [`CHANGELOG.md`](../CHANGELOG.md) into an `[X.Y.Z] - YYYY-MM-DD` section and
+   finalize the date. Leave a new empty `[Unreleased]` section, and update the
+   link definitions at the end of the file (compare URLs).
+3. **Create PR -> review -> merge to `main`**: Open a PR containing the changes
+   above, confirm that CI ([`ci.yml`](../.github/workflows/ci.yml)) is green,
+   then merge it to `main`.
+4. **Push tag**: Create and push a `vX.Y.Z` tag on the relevant commit in
+   `main`.
 
    ```bash
    git checkout main && git pull
@@ -80,88 +102,102 @@ version は 2 箇所に書く。リリース前に**必ず一致**させる:
    git push origin v1.0.0
    ```
 
-   これは**人間が判断して行う最終ゲート**。タグ push が publish の引き金になる。
-5. **自動 publish**: `v*` タグ push で `release.yml` が起動し、`python -m build`
-   -> `twine check` -> PyPI publish を実行する。
-6. **確認**: PyPI のページ（https://pypi.org/project/loop-agent/）に新版が出た
-   ことと、GitHub Actions のジョブが成功したことを確認する。
+   This is the **final gate performed by human judgment**. Pushing the tag
+   triggers publishing.
+5. **Automatic publish**: Pushing a `v*` tag starts `release.yml`, which runs
+   `python -m build` -> `twine check` -> PyPI publish.
+6. **Verify**: Confirm that the new version appears on the PyPI page
+   (https://pypi.org/project/loop-agent/) and that the GitHub Actions job
+   succeeded.
 
-### リリース前のローカル検証
+### Local Verification Before Release
 
-タグを打つ前に、ワークフローと同じ検証をローカルで実行できる:
+Before creating the tag, you can run the same checks as the workflow locally:
 
 ```bash
 python -m pip install -e .[dev]
 python -m ruff check .
 python -m mypy
 python -m pytest
-python -m build                                # dist/ に wheel と sdist を生成
-python -m twine check dist/*                   # メタデータ / long description を検証
+python -m build                                # Generate wheel and sdist in dist/
+python -m twine check dist/*                   # Validate metadata / long description
 ```
 
-`twine check` は README（long description）が PyPI で正しく描画されるかも検証
-する。`readme = "README.md"` のため content-type は `text/markdown` として
-自動付与される。
+`twine check` also verifies that the README (long description) will render
+correctly on PyPI. Because `readme = "README.md"`, the content type is
+automatically set to `text/markdown`.
 
-## OIDC Trusted Publishing の仕組み
+## How OIDC Trusted Publishing Works
 
-PyPI への発行は **OIDC（OpenID Connect）Trusted Publishing** で行う。長期 API
-token を持たず、**secrets を一切リポジトリに置かない**のが要点。
+Publishing to PyPI is done through **OIDC (OpenID Connect) Trusted Publishing**.
+The key point is that the repository does not hold a long-lived API token and
+**does not store any secrets**.
 
-仕組みの流れ:
+Flow:
 
-1. PyPI 側で「この PyPI プロジェクトは、この GitHub リポジトリのこのワークフロー
-   からの発行を信頼する」という **trusted publisher** をあらかじめ登録しておく
-   （リポジトリ・ワークフローファイル名・environment を指定）。
-2. ワークフロー実行時、GitHub Actions が短命の **OIDC token**（実行元の
-   リポジトリ・ワークフロー・ref などを証明する署名付き JWT）を発行する。
-3. `pypa/gh-action-pypi-publish` がその OIDC token を PyPI に提示し、PyPI は
-   登録済み trusted publisher と突き合わせて検証し、**その場限りの短命な発行
-   権限**を返す。
-4. その短命権限で wheel/sdist を upload する。token はジョブ終了とともに失効する。
+1. On the PyPI side, register in advance a **trusted publisher** that says "this
+   PyPI project trusts publishing from this workflow in this GitHub repository"
+   (specifying the repository, workflow file name, and environment).
+2. During workflow execution, GitHub Actions issues a short-lived **OIDC token**
+   (a signed JWT proving the source repository, workflow, ref, and related
+   claims).
+3. `pypa/gh-action-pypi-publish` presents that OIDC token to PyPI. PyPI compares
+   it with the registered trusted publisher, validates it, and returns a
+   **short-lived publishing credential for that run only**.
+4. That short-lived credential is used to upload the wheel/sdist. The token
+   expires when the job ends.
 
-そのために `release.yml` のジョブには次の permission が必要:
+For this reason, the job in `release.yml` needs the following permissions:
 
 ```yaml
 permissions:
-  id-token: write   # OIDC token をワークフローに発行させる（Trusted Publishing の核）
+  id-token: write   # Allows the workflow to receive an OIDC token (the core of Trusted Publishing)
   contents: read
 ```
 
-`id-token: write` が無いと OIDC token を取得できず発行に失敗する。逆に、これが
-あれば PyPI 用の API token を secrets に置く必要はない。
+Without `id-token: write`, the workflow cannot obtain an OIDC token and
+publishing fails. Conversely, with this permission in place, there is no need to
+store a PyPI API token in secrets.
 
-> NOTE: trusted publisher の登録は PyPI 側の人手設定であり、リポジトリのコード
-> では完結しない。新規プロジェクトや publisher 設定変更時は PyPI の
-> "Publishing" 設定で対象ワークフローが登録済みか確認する。
+> NOTE: Registering the trusted publisher is a manual setting on the PyPI side;
+> it cannot be completed solely in repository code. For new projects or changes
+> to publisher settings, confirm in PyPI's "Publishing" settings that the target
+> workflow is registered.
 
-## インシデント対応
+## Incident Response
 
-### yank（公開済み版の取り下げ）
+### Yank (Withdraw a Published Version)
 
-壊れた版を公開してしまった場合、PyPI からファイルを**削除するのではなく
-yank する**。yank された版は、明示的にその版を pin した既存利用者には引き続き
-解決されるが、新規の `pip install loop-agent` の解決候補からは除外される。
+If a broken version has been published, **yank it instead of deleting files**
+from PyPI. A yanked version can still be resolved for existing users who
+explicitly pin that version, but it is excluded from candidates for a new
+`pip install loop-agent`.
 
-- 手順: PyPI のプロジェクト管理画面（Manage -> Releases）で対象版を yank する。
-- 同じ版番号での再 upload はできない（PyPI は版の上書きを許さない）。修正版は
-  次の PATCH（例: `0.1.1`）として出し直す。
+- Procedure: Yank the target version from the PyPI project management screen
+  (Manage -> Releases).
+- You cannot re-upload the same version number (PyPI does not allow overwriting
+  versions). Release the fix as the next PATCH version, for example `0.1.1`.
 
-### 緊急修正（hotfix）
+### Emergency Fix (Hotfix)
 
-1. `main` から `fix/...` ブランチを切り、最小の修正を入れる。
-2. PATCH を上げる（例: `0.1.0` -> `0.1.1`）。CHANGELOG に `Fixed` を記載。
-3. 通常のリリース手順（PR -> マージ -> タグ push）で publish する。
-4. 旧版に深刻な不具合がある場合は、上記の通り旧版を yank して新版へ誘導する。
+1. Create a `fix/...` branch from `main` and apply the smallest necessary fix.
+2. Raise PATCH, for example `0.1.0` -> `0.1.1`. Record the fix under `Fixed` in
+   the CHANGELOG.
+3. Publish using the normal release procedure (PR -> merge -> tag push).
+4. If the old version has a serious defect, yank it as described above to guide
+   users to the new version.
 
-### publish 失敗時
+### If Publishing Fails
 
-GitHub Actions の `release.yml` ジョブログを確認する。よくある原因:
+Check the GitHub Actions job log for `release.yml`. Common causes:
 
-- `twine check` の失敗（メタデータ / long description 不正） -> 修正して再リリース。
-- OIDC の失敗（`id-token: write` 欠落 / PyPI 側 trusted publisher 未登録 /
-  リポジトリ・ワークフロー名の不一致） -> permission と PyPI 設定を確認。
+- `twine check` failure (invalid metadata / long description) -> fix it and
+  release again.
+- OIDC failure (`id-token: write` missing / trusted publisher not registered on
+  the PyPI side / repository or workflow name mismatch) -> check the permission
+  and PyPI settings.
 
-PyPI への upload 前にジョブが落ちた場合は版が publish されていないため、修正後に
-同じタグを打ち直せる（既存タグを消してから再 push する）。upload まで進んでいた
-場合は版が確定しているので、yank + 次 PATCH で対応する。
+If the job failed before uploading to PyPI, the version has not been published,
+so after fixing the issue you can recreate the same tag (delete the existing tag
+first, then push it again). If the job reached the upload step, the version is
+final; handle it with yank + next PATCH.

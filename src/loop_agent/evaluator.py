@@ -1,26 +1,32 @@
-"""RQGM epoch-evaluator: 固定基準 + held-out ground truth ゲートの安全核 (Issue #22/#4).
+"""RQGM epoch evaluator: safety core for fixed criteria + held-out ground-truth gates (Issue #22/#4).
 
-外側 Reflexion ループの **評価器** を、self-optimize による reward hacking から守るための
-中核 (report.md S6 + RQGM arXiv:2606.26294 / Issue #4 コメント)。本モジュールは葉モジュールで
-LLM 依存を持たない (評価は注入された純関数 :data:`ScoreFn`)。
+Core logic for protecting the outer Reflexion loop's **evaluator** from reward hacking
+through self-optimization (report.md S6 + RQGM arXiv:2606.26294 / Issue #4 comment).
+This module is a leaf module and has no LLM dependency; scoring is supplied through the
+injected pure function :data:`ScoreFn`.
 
-安全設計の要点 ― ここで担保する不変条件:
+Safety design essentials and invariants enforced here:
 
-- **多様評価 (diverse evaluation)**: :class:`Score` は単一スカラではなく
-  ``ground_truth`` (一次) + 宣言された ``components`` の複数軸を持ち、
-  :meth:`Score.aggregate` は **宣言キーの最小値** を取る。1 軸だけ高くしても aggregate は
-  上がらない (single-scalar gaming を弾く)。宣言キー欠落は 0.0 に潰す。
-- **epsilon-best-belief 昇格ゲート**: :func:`admit_evaluator` は候補評価器を、**held-out の
-  固定 gold ラベル** に対する一致度 (:func:`agreement`) で incumbent と比較し、
-  ``agreement(candidate) > agreement(incumbent) + epsilon`` を **厳格に**満たし、かつ
-  どの fold でも (および critical probe でも) 後退しないときに限り採用する。さもなくば
-  incumbent 据え置き (status-quo bias)。``epsilon <= 0`` は churn 防止の安全余白を失うため拒否。
-- **gold ラベルは評価器が作らない**: :class:`Probe` の ``gold_label`` は評価器と独立な
-  外部 ground truth。「全部 1.0 と返す」緩い候補は varied な gold に対して一致度が **低く**
-  なり昇格できない (meta-reward-hacking を弾く)。
-- **dual-component 分離**: 本モジュールの測定経路 (:func:`agreement` / :func:`admit_evaluator`)
-  は **事前収録された** :class:`Probe` を採点するだけで、production の act/gate/memory に
-  一切触れない (性能測定と本番実行の分離)。
+- **Diverse evaluation**: :class:`Score` is not a single scalar. It carries
+  ``ground_truth`` (primary) plus multiple declared ``components`` axes, and
+  :meth:`Score.aggregate` takes the **minimum value across declared keys**. Raising only
+  one axis cannot raise the aggregate, which blocks single-scalar gaming. Missing
+  declared keys collapse to 0.0.
+- **epsilon-best-belief promotion gate**: :func:`admit_evaluator` compares a candidate
+  evaluator against the incumbent by its agreement (:func:`agreement`) with **fixed
+  held-out gold labels**. It admits the candidate only when
+  ``agreement(candidate) > agreement(incumbent) + epsilon`` is satisfied **strictly** and
+  no fold, nor any critical probe, regresses. Otherwise the incumbent remains in place
+  (status-quo bias). ``epsilon <= 0`` is rejected because it removes the anti-churn
+  safety margin.
+- **Gold labels are not produced by evaluators**: :class:`Probe` ``gold_label`` values
+  are external ground truth independent of the evaluator. A lax candidate that "returns
+  1.0 for everything" has **low** agreement against varied gold labels and cannot be
+  promoted, blocking meta-reward hacking.
+- **Dual-component separation**: the measurement paths in this module
+  (:func:`agreement` / :func:`admit_evaluator`) only score **pre-recorded**
+  :class:`Probe` instances and never touch production act/gate/memory, separating
+  performance measurement from production execution.
 """
 
 from __future__ import annotations
@@ -34,12 +40,15 @@ from .errors import ConfigError
 
 @dataclass(frozen=True)
 class Score:
-    """1 試行の多軸スコア。``ground_truth`` が一次、``judge`` は助言のみ。
+    """Multi-axis score for one trial. ``ground_truth`` is primary; ``judge`` is advisory.
 
-    - ``ground_truth`` : test/lint/exit-code 由来の一次信号 (report.md 原則: ground-truth 優先)。
-    - ``components``   : 多様評価の宣言軸 (例: 'correctness' / 'safety' / 'completeness')。
-    - ``judge``       : LLM-as-judge の助言値。**aggregate に含めない** (バイアス源を制御に乗せない)。
-    - ``detail``      : ログ用の説明。
+    - ``ground_truth`` : primary signal from test/lint/exit-code results
+      (report.md principle: ground truth first).
+    - ``components``   : declared axes for diverse evaluation
+      (for example: 'correctness' / 'safety' / 'completeness').
+    - ``judge``       : advisory LLM-as-judge value. **Excluded from aggregate** so a
+      bias source is not placed on the control path.
+    - ``detail``      : explanation for logs.
     """
 
     ground_truth: float
@@ -48,11 +57,13 @@ class Score:
     detail: str = ""
 
     def aggregate(self, declared_keys: tuple[str, ...]) -> float:
-        """宣言された全軸の **最小値** を集約値とする (多様評価; 欠落軸は 0.0)。
+        """Use the **minimum** across all declared axes as the aggregate.
 
-        ``ground_truth`` と ``declared_keys`` 各軸の min を取るので、1 軸だけ高い「単一スカラ
-        gaming」は集約を押し上げられない。宣言キーが ``components`` に無ければ 0.0 として
-        扱い、報告軸を間引いて threshold を超える抜け道を塞ぐ。``judge`` は意図的に除外する。
+        This is diverse evaluation with missing axes treated as 0.0. Taking the minimum
+        across ``ground_truth`` and every ``declared_keys`` axis prevents single-scalar
+        gaming, where only one axis is raised, from raising the aggregate. Declared keys
+        absent from ``components`` are treated as 0.0, closing the loophole of omitting
+        reported axes to cross a threshold. ``judge`` is intentionally excluded.
         """
         values = [self.ground_truth]
         for key in declared_keys:
@@ -62,13 +73,18 @@ class Score:
 
 @dataclass(frozen=True)
 class GroundTruthSignal:
-    """episode の一次信号。内側 verify (test/lint/exit-code) に由来する権威ある成否。
+    """Primary episode signal: authoritative success/failure from inner verification.
 
-    - ``succeeded``           : 内側 :class:`~loop_agent.loop.LoopResult` の成否。
-    - ``score``               : ``ground_truth`` 軸が verify から埋まった :class:`Score`。
-    - ``ground_truth_backed`` : test/lint 等の実信号が存在したか。``False`` の episode は
-      収束判定 (:class:`~loop_agent.convergence.RubricThreshold`) に算入しない
-      (緩い評価器が一次信号を捏造して収束を宣言するのを防ぐ)。
+    This comes from inner verification such as tests, lint, and exit codes.
+
+    - ``succeeded``           : success/failure from the inner
+      :class:`~loop_agent.loop.LoopResult`.
+    - ``score``               : :class:`Score` whose ``ground_truth`` axis was filled
+      from verification.
+    - ``ground_truth_backed`` : whether a real test/lint signal existed. Episodes with
+      ``False`` are excluded from convergence decisions
+      (:class:`~loop_agent.convergence.RubricThreshold`) to prevent a lax evaluator from
+      fabricating a primary signal and declaring convergence.
     """
 
     succeeded: bool
@@ -76,28 +92,35 @@ class GroundTruthSignal:
     ground_truth_backed: bool = True
 
 
-# 注入される採点関数。outcome (EpisodeOutcome view; ``.history`` 等) -> Score。純関数想定。
+# Injected scoring function. outcome (EpisodeOutcome view; ``.history``, etc.) -> Score.
+# Expected to be a pure function.
 ScoreFn = Callable[[Any], Score]
-# 一次信号源。outcome -> GroundTruthSignal。**評価器ではなく内側 verify** に由来させる。
+# Primary signal source. outcome -> GroundTruthSignal. It must come from **inner
+# verification, not from the evaluator**.
 GroundTruthFn = Callable[[Any], GroundTruthSignal]
 
 
 def _scorer_identity(score: ScoreFn) -> str:
-    """採点関数の **再現可能な** 同一性キー (audit/version 用)。
+    """**Reproducible** identity key for a scoring function, used for audit/versioning.
 
-    ``__qualname__`` だけだと別ソース位置の lambda が同名 (``<lambda>``) で衝突し、振る舞いの
-    違う評価器が同じ version になって epoch-freeze の監査証跡を壊す。``__code__`` があれば
-    **定義ソース位置** (filename:firstlineno) に加え、**実装そのもの** ― バイトコード
-    ``co_code`` + 定数 ``co_consts`` + 参照名 ``co_names`` + **既定引数** ``__defaults__`` /
-    ``__kwdefaults__`` ― のハッシュを足す。これにより定義位置を動かさず本体を書き換えた
-    (例: ``0.5`` を ``1.0`` に) 評価器も、既定引数で振る舞いを変える factory
-    (``def score(o, bias=bias): ...``) も別 version になり、resume/audit が振る舞い変更を
-    silently 受理しない。同一ソース・同一既定引数なら同じ version になる (プロセスを跨いで再現)。
+    ``__qualname__`` alone would make lambdas at different source locations collide under
+    the same name (``<lambda>``), causing evaluators with different behavior to share a
+    version and breaking the epoch-freeze audit trail. When ``__code__`` is available, we
+    include the **definition source location** (filename:firstlineno) and add a hash of
+    the **implementation itself**: bytecode ``co_code``, constants ``co_consts``,
+    referenced names ``co_names``, and **default arguments** ``__defaults__`` /
+    ``__kwdefaults__``. This gives different versions to evaluators whose bodies are
+    changed in place without moving their definition, such as changing ``0.5`` to
+    ``1.0``, and to factories that change behavior through default arguments
+    (``def score(o, bias=bias): ...``). Resume/audit therefore will not silently accept a
+    behavior change. The same source and same defaults produce the same version,
+    reproducibly across processes.
 
-    **境界**: free 変数を ``__closure__`` cell で capture した closure (同一 code object・
-    既定引数なし・cell 値だけ違う) はなお衝突しうる。cell 内容は任意オブジェクトで安定ハッシュ
-    できないため、本関数は意図的にそこまで踏み込まない。そのような parameterized scorer は
-    振る舞いが違うなら明示 ``version`` を渡すこと (docstring 参照)。
+    **Boundary**: closures that capture free variables in ``__closure__`` cells can still
+    collide when they share the same code object, have no defaults, and differ only in
+    cell values. Cell contents can be arbitrary objects without stable hashes, so this
+    function intentionally does not inspect them. Such parameterized scorers should pass
+    an explicit ``version`` when their behavior differs; see the docstring.
     """
     qual = getattr(score, "__qualname__", repr(score))
     code = getattr(score, "__code__", None)
@@ -119,7 +142,10 @@ def _scorer_identity(score: ScoreFn) -> str:
 
 
 def _content_version(score: ScoreFn, rubric: tuple[str, ...], name: str) -> str:
-    """評価器の固定基準キー (content-hash)。同じ署名/ソース位置なら同じ version になる。"""
+    """Fixed-criteria key for the evaluator (content hash).
+
+    The same signature/source location produces the same version.
+    """
     import hashlib
 
     payload = f"{name}|{_scorer_identity(score)}|{'/'.join(rubric)}"
@@ -128,14 +154,18 @@ def _content_version(score: ScoreFn, rubric: tuple[str, ...], name: str) -> str:
 
 @dataclass(frozen=True)
 class Evaluator:
-    """epoch 内で **固定** される rubric 評価器。``score`` は注入された純関数。
+    """Rubric evaluator that is **fixed** within an epoch.
 
-    ``version`` は固定基準の同一性キー (content-hash)。明示しなければ ``score`` の同一性
-    (qualname + 定義ソース位置) / ``rubric`` / ``name`` から導出する (:func:`_scorer_identity`)。
-    **同じ code object を共有する closure** (同一ソース位置で capture 変数だけ違う) は version が
-    衝突しうるので、振る舞いが違うなら ``version`` を明示すること (audit 証跡の忠実性のため)。
-    epoch をまたぐ昇格 (:func:`admit_evaluator`) のときだけ別 version の評価器に置き換わる。``score`` の出力 (reward 信号) は Reflexion の verbal reinforcement
-    としてのみ使い、収束/採用判定には載せない (それは :class:`GroundTruthSignal` の役目)。
+    ``score`` is an injected pure function. ``version`` is the fixed-criteria identity key
+    (content hash). If omitted, it is derived from ``score`` identity (qualname +
+    definition source location), ``rubric``, and ``name`` (:func:`_scorer_identity`).
+    **Closures sharing the same code object** can collide when they have the same source
+    location and differ only in captured variables, so pass an explicit ``version`` when
+    behavior differs to preserve audit-trail fidelity. An evaluator is replaced by a
+    different version only during cross-epoch promotion (:func:`admit_evaluator`).
+    ``score`` output, the reward signal, is used only as verbal reinforcement for
+    Reflexion and is not placed on convergence/admission decisions; that is the role of
+    :class:`GroundTruthSignal`.
     """
 
     score: ScoreFn
@@ -152,13 +182,19 @@ class Evaluator:
 
 @dataclass(frozen=True)
 class Probe:
-    """held-out 測定用の事前収録ケース。``gold_label`` は評価器と独立な外部 ground truth。
+    """Pre-recorded case for held-out measurement.
 
-    - ``case_id``    : 一意 ID (production task と **素な** 名前空間であることを driver が検証)。
-    - ``outcome``    : 評価器が採点する事前収録 outcome (live act しない = dual-component 分離)。
-    - ``gold_label`` : 固定された正解値。評価器が生成した値では **ない**。
-    - ``fold``       : held-out の分割。境界ごとに回転して adaptive overfit を抑える。
-    - ``critical``   : ここでの後退は決して許さない (危険ケースの dominance ガード)。
+    ``gold_label`` is external ground truth independent of the evaluator.
+
+    - ``case_id``    : unique ID. The driver verifies that its namespace is **disjoint**
+      from production tasks.
+    - ``outcome``    : pre-recorded outcome scored by the evaluator; no live act is
+      performed, preserving dual-component separation.
+    - ``gold_label`` : fixed correct value. It is **not** generated by the evaluator.
+    - ``fold``       : held-out partition. Rotated at each boundary to reduce adaptive
+      overfit.
+    - ``critical``   : regressions here are never allowed; this is the dominance guard
+      for dangerous cases.
     """
 
     case_id: str
@@ -170,7 +206,7 @@ class Probe:
 
 @dataclass(frozen=True)
 class HeldOut:
-    """固定 gold ラベル付き probe の集合 (評価器昇格の測定基盤)。"""
+    """Collection of probes with fixed gold labels for evaluator-promotion measurement."""
 
     probes: tuple[Probe, ...]
 
@@ -186,10 +222,11 @@ class HeldOut:
         return tuple(sorted({p.fold for p in self.probes}))
 
     def fold(self, k: int) -> "HeldOut":
-        """境界 ``k`` で使う fold を回転選択した部分集合を返す (anti adaptive-overfit)。
+        """Return the fold subset selected by rotation for boundary ``k``.
 
-        fold が 1 つしか無ければ全体を返す。複数あれば ``k`` で循環選択し、毎境界で同じ
-        固定 probe 集合を hill-climb されるのを防ぐ。
+        This is an anti-adaptive-overfit measure. If only one fold exists, the whole set
+        is returned. With multiple folds, ``k`` selects cyclically so the same fixed probe
+        set cannot be hill-climbed at every boundary.
         """
         folds = self.folds
         if len(folds) <= 1:
@@ -199,12 +236,15 @@ class HeldOut:
 
 
 def agreement(evaluator: Evaluator, held_out: HeldOut) -> float:
-    """評価器の ``ground_truth`` 出力と固定 gold ラベルの **一致度** (校正; 高いほど良い)。
+    """**Agreement** between evaluator ``ground_truth`` output and fixed gold labels.
 
-    各 probe で ``evaluator.score(probe.outcome).ground_truth`` と ``probe.gold_label`` の
-    二乗誤差を取り、**負の平均二乗誤差** を返す (0 が完全一致、負へ行くほど乖離)。gold は
-    評価器と独立なので、「全部高く返す」緩い評価器は varied な gold に対して誤差が大きく
-    一致度が低くなる (= 昇格できない)。これが meta-reward-hacking ガードの肝。
+    This is calibration, where higher is better. For each probe, it computes the squared
+    error between ``evaluator.score(probe.outcome).ground_truth`` and
+    ``probe.gold_label``, then returns the **negative mean squared error**. A value of 0
+    is a perfect match, and larger negative values indicate greater divergence. Because
+    gold labels are independent of the evaluator, a lax evaluator that returns high values
+    for everything has large error against varied gold labels, low agreement, and cannot
+    be promoted. This is the core meta-reward-hacking guard.
     """
     probes = held_out.probes
     total = 0.0
@@ -217,11 +257,12 @@ def agreement(evaluator: Evaluator, held_out: HeldOut) -> float:
 
 @dataclass(frozen=True)
 class AdmissionResult:
-    """:func:`admit_evaluator` の結果: 採用された評価器と両者の一致度。
+    """Result of :func:`admit_evaluator`: chosen evaluator and both agreement scores.
 
-    ``promoted`` は **候補が実際に採用されたか** を表す明示フラグ。version 比較ではなく
-    採用判定そのものを持つので、候補と incumbent が (明示 version 指定や衝突で) 同 version
-    でも、却下されたなら ``False`` を正しく返す。
+    ``promoted`` is an explicit flag for whether the **candidate was actually admitted**.
+    It stores the admission decision itself, not a version comparison, so it correctly
+    returns ``False`` for a rejected candidate even when the candidate and incumbent have
+    the same version due to an explicit version or collision.
     """
 
     chosen: Evaluator
@@ -244,31 +285,41 @@ def admit_evaluator(
     delta: float = 0.0,
     measure_fold: Optional[HeldOut] = None,
 ) -> AdmissionResult:
-    """epsilon-best-belief + dominance で評価器昇格を判定する (RQGM 安全ゲート)。
+    """Decide evaluator promotion with epsilon-best-belief + dominance.
 
-    候補を採用する条件 (すべて満たすときのみ。さもなくば incumbent 据え置き):
+    This is the RQGM safety gate. The candidate is admitted only when all conditions are
+    met; otherwise the incumbent remains in place:
 
-    1. **集約一致度の厳格な改善**: ``agreement(candidate) > agreement(incumbent) + epsilon``。
-       ``epsilon`` は churn 防止の安全余白で **正** を要求する (``<= 0`` は拒否)。この集約ゲート
-       のみ ``measure_fold`` (= 回転選択した held-out 部分集合) で測ってよい (anti adaptive-overfit:
-       毎境界で同じ固定集合を hill-climb させない)。``None`` なら ``held_out`` 全体で測る。
-    2. **fold 単位で後退しない**: **``held_out`` 全 fold** で候補の一致度が incumbent から
-       ``delta`` 超で下がらない (集約だけ上げて特定 fold を犠牲にする gaming を弾く)。回転選択
-       した fold だけでなく **全 fold** を見る (選ばれなかった fold での後退も弾く)。
-    3. **critical probe で後退しない**: ``held_out`` 全体の ``critical=True`` probe で候補の
-       二乗誤差が incumbent を超えない (危険ケースを犠牲にする昇格を弾く)。回転で選ばれなかった
-       fold にある critical probe も必ずチェックする。
+    1. **Strict improvement in aggregate agreement**:
+       ``agreement(candidate) > agreement(incumbent) + epsilon``. ``epsilon`` is the
+       anti-churn safety margin and must be **positive**; ``<= 0`` is rejected. Only this
+       aggregate gate may be measured on ``measure_fold``, the held-out subset selected
+       by rotation. This avoids adaptive overfit by preventing hill-climbing against the
+       same fixed set at every boundary. When ``None``, the whole ``held_out`` set is
+       measured.
+    2. **No fold-level regression**: across **all folds in ``held_out``**, the candidate's
+       agreement must not fall below the incumbent by more than ``delta``. This blocks
+       gaming that improves aggregate score while sacrificing a specific fold. It checks
+       **all folds**, not only the rotated fold, so regressions in unselected folds are
+       also blocked.
+    3. **No critical-probe regression**: across all ``critical=True`` probes in
+       ``held_out``, the candidate's squared error must not exceed the incumbent's. This
+       blocks promotions that sacrifice dangerous cases. Critical probes in folds not
+       selected by rotation are always checked.
 
-    gold ラベルは評価器と独立なので、候補が自分を高く採点しても一致度は上がらない。
+    Gold labels are independent of the evaluator, so a candidate does not improve
+    agreement by scoring itself highly.
 
-    安全上の要点: 集約ゲート (1) は anti-overfit のため部分集合で測ってよいが、後退チェック
-    (2)(3) は **常に held-out 全体** を見る。これにより「選ばれた fold だけ改善し、別 fold の
-    critical probe を犠牲にする」昇格を構造的に弾く。
+    Key safety point: aggregate gate (1) may be measured on a subset for anti-overfit
+    purposes, but regression checks (2)(3) **always inspect the full held-out set**. This
+    structurally blocks promotions that improve only the selected fold while sacrificing
+    critical probes in another fold.
     """
     if epsilon <= 0:
         raise ConfigError("admit_evaluator epsilon must be > 0 (anti-churn margin)")
 
-    # 集約ゲートの測定対象 (回転 fold があればそれ、無ければ全体)。後退チェックは常に全体。
+    # Measurement target for the aggregate gate: rotated fold if supplied, else all.
+    # Regression checks always inspect the full set.
     measure = measure_fold if measure_fold is not None else held_out
     inc_agree = agreement(incumbent, measure)
     cand_agree = agreement(candidate, measure)
@@ -281,17 +332,18 @@ def admit_evaluator(
             promoted=False,
         )
 
-    # (1) 集約一致度の厳格改善 (anti-overfit のため measure 上で評価)。
+    # (1) Strict aggregate-agreement improvement, evaluated on measure for anti-overfit.
     if not (cand_agree > inc_agree + epsilon):
         return keep()
 
-    # (2) fold 単位の後退チェック (held-out 全 fold を見る)。
+    # (2) Fold-level regression check across all held-out folds.
     for f in held_out.folds:
         sub = HeldOut(tuple(p for p in held_out.probes if p.fold == f))
         if agreement(candidate, sub) < agreement(incumbent, sub) - delta:
             return keep()
 
-    # (3) critical probe の後退チェック (held-out 全体。二乗誤差が増えていないこと)。
+    # (3) Critical-probe regression check across all held-out probes.
+    # Squared error must not increase.
     for p in held_out.probes:
         if p.critical and _probe_squared_error(candidate, p) > _probe_squared_error(
             incumbent, p

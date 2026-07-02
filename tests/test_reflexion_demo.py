@@ -1,8 +1,9 @@
-"""外側 Reflexion デモの実走検証 (Issue #22 / Phase 3 成功条件 a)。
+"""Runtime verification for the outer Reflexion demo (Issue #22 / Phase 3 success condition a).
 
-``examples/reflexion_demo.py`` のシナリオ「そのもの」を import して回すので、出荷する
-デモと検証対象が一致する。命題: 失敗 episode から抽出した言語的指針が次 episode の
-context に配線され、ground-truth (内側 verify の成否) が実際に改善する。
+This imports and runs the exact scenario from ``examples/reflexion_demo.py``, so the
+shipped demo and the verification target match. Proposition: linguistic guidance
+extracted from a failed episode is wired into the next episode's context, and
+ground truth (whether the inner verify succeeds) actually improves.
 """
 
 from __future__ import annotations
@@ -22,21 +23,21 @@ def test_lesson_wiring_lifts_next_episode_ground_truth():
     result = demo.run()
     history = result.state.gt_aggregate_history
 
-    # ep0: memory 空で失敗 (off-by-one バグが残る)。
+    # ep0: Fails with empty memory (the off-by-one bug remains).
     assert history[0] < 0.3
-    # ep1: 配線された学びで成功 -> ground-truth が跳ね上がる。
+    # ep1: Succeeds with the wired-in lesson -> ground truth jumps.
     assert history[1] > 0.9
 
-    # 学びは memory に取り込まれ、次 context へ配線されている。
+    # The lesson is admitted into memory and wired into the next context.
     assert any(rec.admitted for rec in result.state.episodes)
     assert demo.LESSON_HINT in result.state.memory.render()
 
-    # 一次信号 (ground-truth) が収束を駆動し、成功で終わる。
+    # The primary signal (ground truth) drives convergence and ends in success.
     assert result.succeeded is True
 
 
 def test_demo_runs_as_script():
-    """出荷デモが端末から実走でき、cp932 でも print がクラッシュしないこと。"""
+    """The shipped demo runs from a terminal, and print does not crash under cp932."""
     proc = subprocess.run(
         [sys.executable, str(EXAMPLES_DIR / "reflexion_demo.py")],
         capture_output=True,

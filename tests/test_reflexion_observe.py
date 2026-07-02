@@ -1,15 +1,18 @@
-"""外側 Reflexion 観測 (ReflexionObserver + run_observed_reflexion) のテスト (Issue #30)。
+"""Tests for outer Reflexion observation (ReflexionObserver + run_observed_reflexion) (Issue #30).
 
-押さえる面:
+Covered surfaces:
 
-- **遷移の網羅**: episode 開始/終了・epoch 開始/境界・lesson 採用/拒否・採点係昇格/拒否・
-  収束理由が、構造化イベント (sink) と OTel span event に残ること。
-- **metric 一貫性**: emit したイベント個数と最終集計 (reflexion_end / span 属性) が
-  権威ある ``result.state`` と整合すること。
-- **optional degrade**: OTel 無効/未導入で no-op に倒れ、event sink 側は機能すること。
-- **best-effort**: sink / tracer / 観測フックが例外を投げても外側 driver が落ちないこと。
-- **判断ロジック不変**: 観測の有無で ``run_reflexion`` の結果が一致すること (安全核を壊さない)。
-- **core hook**: ``run_reflexion(on_epoch=...)`` が epoch 境界で正しく発火すること。
+- **transition coverage**: episode begin/end, epoch start/boundary, lesson admission/rejection,
+  evaluator promotion/rejection, and convergence reasons are recorded in structured events
+  (sink) and OTel span events.
+- **metric consistency**: emitted event counts and final aggregates (reflexion_end / span
+  attributes) align with the authoritative ``result.state``.
+- **optional degrade**: OTel disabled/unavailable falls back to no-op while the event sink
+  side continues to work.
+- **best-effort**: sink / tracer / observation hook exceptions do not crash the outer driver.
+- **decision logic invariant**: ``run_reflexion`` results match with and without observation
+  (the safety core remains unchanged).
+- **core hook**: ``run_reflexion(on_epoch=...)`` fires correctly at epoch boundaries.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ from loop_agent.reflexion_observe import (
 from loop_agent.state import LoopState, StepRecord
 
 
-# -- 共通スタブ (test_reflexion.py と同じ作法) -------------------------------
+# -- Shared stubs (same style as test_reflexion.py) ----------------------------
 
 DECLARED = ("primary",)
 
@@ -147,21 +150,21 @@ def kinds(sink: ListSink) -> list[str]:
 
 
 # ==============================================================================
-# 遷移の網羅 (event sink)
+# Transition coverage (event sink)
 # ==============================================================================
 
 
 def test_lifecycle_events_emitted_in_order():
-    """begin → (episode_begin/end)* → end の順で最小ライフサイクルが残る。"""
+    """The minimal lifecycle is recorded as begin -> (episode_begin/end)* -> end."""
     sink = ListSink()
     run_observed_reflexion(**_base_kwargs(sinks=[sink], otel=False))
     ks = kinds(sink)
     assert ks[0] == REFLEXION_BEGIN
     assert ks[-1] == REFLEXION_END
-    # 2 episode (MaxEpisodes(2)) ぶんの begin/end が残る。
+    # begin/end remains for 2 episodes (MaxEpisodes(2)).
     assert ks.count(EPISODE_BEGIN) == 2
     assert ks.count(EPISODE_END) == 2
-    # 各 episode は begin が end より先。
+    # Each episode has begin before end.
     begins = [i for i, e in enumerate(sink.events) if e.kind == EPISODE_BEGIN]
     ends = [i for i, e in enumerate(sink.events) if e.kind == EPISODE_END]
     assert begins[0] < ends[0] < begins[1] < ends[1]
@@ -199,14 +202,14 @@ def test_episode_end_carries_primary_signal_and_reward():
                        ground_truth=gt_from_success(hi=0.9, lo=0.2))
     )
     end = sink.of_kind(EPISODE_END)[0]
-    assert end.payload["gt_aggregate"] == 0.2  # 失敗 episode の一次集約
-    assert end.payload["reward"] == 0.5        # FLAT 評価器の reward (reflect 専用)
+    assert end.payload["gt_aggregate"] == 0.2  # Primary aggregate for the failed episode
+    assert end.payload["reward"] == 0.5        # Reward from the FLAT evaluator (reflect only)
     assert end.payload["succeeded"] is False
     assert end.payload["ground_truth_backed"] is True
 
 
 # ==============================================================================
-# lesson 採用 / 拒否
+# Lesson admission / rejection
 # ==============================================================================
 
 
@@ -220,7 +223,7 @@ def test_lesson_adopted_emits_decision_event():
     assert len(decisions) == 1
     assert decisions[0].payload["admitted"] is True
     assert decisions[0].payload["text"] == "use-the-fix"
-    # episode_end 側も整合する。
+    # The episode_end side is also consistent.
     assert sink.of_kind(EPISODE_END)[0].payload["lesson_admitted"] is True
 
 
@@ -245,12 +248,12 @@ def test_no_lesson_means_no_decision_event():
 
 
 # ==============================================================================
-# epoch 境界 + 採点係昇格 / 拒否
+# Epoch boundary + evaluator promotion / rejection
 # ==============================================================================
 
 
 def _promote_setup(candidate, *, sink, convergence, golds=(0.2, 0.8)):
-    """incumbent=FLAT から候補を提案する epoch 境界 1 回ぶんの最小構成。"""
+    """Minimal setup for one epoch boundary that proposes a candidate from incumbent=FLAT."""
     return run_observed_reflexion(
         episode=lambda ctx: make_result(False),
         ground_truth=gt_from_success(),
@@ -269,7 +272,7 @@ def _promote_setup(candidate, *, sink, convergence, golds=(0.2, 0.8)):
 
 
 def test_epoch_boundary_promotion_event():
-    """honest 候補は held-out 一致度で FLAT を ε 超で上回り昇格する。"""
+    """The honest candidate beats FLAT on held-out agreement by more than epsilon and is promoted."""
     sink = ListSink()
     _promote_setup(HONEST, sink=sink, convergence=[MaxEpisodes(4)])
     boundaries = sink.of_kind(EPOCH_BOUNDARY)
@@ -284,7 +287,7 @@ def test_epoch_boundary_promotion_event():
 
 
 def test_epoch_boundary_rejection_event():
-    """lenient (全部 1.0) 候補は varied gold に乖離し却下される。"""
+    """The lenient (all 1.0) candidate diverges from varied gold labels and is rejected."""
     sink = ListSink()
     lenient = Evaluator(score=lambda o: Score(ground_truth=1.0), name="lenient")
     _promote_setup(lenient, sink=sink, convergence=[MaxEpisodes(4)])
@@ -292,12 +295,12 @@ def test_epoch_boundary_rejection_event():
     assert b.payload["evaluator_decision"] == "rejected"
     assert b.payload["promoted"] is False
     assert b.payload["proposed"] is True
-    # 却下なので version は据え置き。
+    # Rejected, so the version stays unchanged.
     assert b.payload["evaluator_version"] == FLAT.version
 
 
 def test_epoch_boundary_unchanged_when_no_candidate():
-    """propose_evaluator が無ければ境界は unchanged で記録される。"""
+    """Without propose_evaluator, the boundary is recorded as unchanged."""
     sink = ListSink()
     run_observed_reflexion(
         **_base_kwargs(sinks=[sink], otel=False, epoch_len=2,
@@ -309,7 +312,7 @@ def test_epoch_boundary_unchanged_when_no_candidate():
 
 
 def test_no_boundary_event_when_converged_before_epoch_end():
-    """終端 run では境界で昇格しない設計に合わせ、境界イベントも出ない。"""
+    """Terminal runs do not promote at the boundary, so no boundary event is emitted."""
     sink = ListSink()
     run_observed_reflexion(
         **_base_kwargs(sinks=[sink], otel=False, epoch_len=2,
@@ -319,7 +322,7 @@ def test_no_boundary_event_when_converged_before_epoch_end():
 
 
 # ==============================================================================
-# 収束理由 + metric 一貫性
+# Convergence reason + metric consistency
 # ==============================================================================
 
 
@@ -346,7 +349,7 @@ def test_end_event_carries_convergence_reason():
 
 
 def test_metric_consistency_event_counts_match_state():
-    """episode_end 個数 = result.episodes、end 集計 = result.state (権威) と整合。"""
+    """episode_end count = result.episodes, and end aggregates match result.state (authority)."""
     sink = ListSink()
     result = run_observed_reflexion(
         **_base_kwargs(sinks=[sink], otel=False, reflect=true_reflect,
@@ -357,12 +360,12 @@ def test_metric_consistency_event_counts_match_state():
     assert end.payload["reflections"] == result.state.reflections
     assert end.payload["best_gt_aggregate"] == result.best_score
     assert end.payload["evaluator_updates"] == result.state.evaluator_updates
-    # lesson_decision 個数 = admit された lesson の数 (admit_all なので全 fail episode)。
+    # lesson_decision count = admitted lesson count (every failed episode because admit_all).
     assert kinds(sink).count(LESSON_DECISION) == 3
 
 
 def test_best_gt_aggregate_omitted_when_no_grounded_episode():
-    """ground_truth_backed=False のみの run では best が -inf になり payload に載せない。"""
+    """Runs with only ground_truth_backed=False have best=-inf, so it is omitted from payloads."""
     sink = ListSink()
     run_observed_reflexion(
         **_base_kwargs(sinks=[sink], otel=False,
@@ -370,13 +373,13 @@ def test_best_gt_aggregate_omitted_when_no_grounded_episode():
     )
     end = sink.of_kind(REFLEXION_END)[0]
     assert "best_gt_aggregate" not in end.payload
-    # 個々の episode_end にも -inf を載せない (run-end と同じ規約; 仕様外 JSON 値を出さない)。
+    # Individual episode_end events also omit -inf (same convention as run-end; no invalid JSON values).
     for ev in sink.of_kind(EPISODE_END):
         assert "best_gt_aggregate" not in ev.payload
 
 
 def test_episode_end_never_emits_negative_infinity_in_jsonl(tmp_path):
-    """非 ground-truth-backed の先行 episode が -Infinity (仕様外 JSON) を書かないこと。"""
+    """Leading non-ground-truth-backed episodes do not write -Infinity (invalid JSON)."""
     from loop_agent import JsonlEventSink
 
     path = tmp_path / "reflexion.jsonl"
@@ -385,13 +388,13 @@ def test_episode_end_never_emits_negative_infinity_in_jsonl(tmp_path):
                        ground_truth=gt_from_success(backed=False))
     )
     raw = path.read_text(encoding="utf-8")
-    # json.dumps は -inf を仕様外の literal `-Infinity` として書く。これが残っていないこと。
+    # json.dumps writes -inf as the non-standard literal `-Infinity`; ensure it is absent.
     assert "-Infinity" not in raw
     assert "Infinity" not in raw
 
 
 def test_episode_event_omits_best_on_span_when_ungrounded(otel_tracer):
-    """span の episode event も -inf を属性化しない (OTel に -inf を載せない)。"""
+    """The span's episode events also avoid attributes for -inf (do not put -inf in OTel)."""
     tracer, exporter = otel_tracer
     run_observed_reflexion(
         **_base_kwargs(tracer=tracer, ground_truth=gt_from_success(backed=False))
@@ -402,13 +405,13 @@ def test_episode_event_omits_best_on_span_when_ungrounded(otel_tracer):
 
 
 def test_error_after_promoting_boundary_reports_evaluator_updates():
-    """境界で昇格 → 次 episode が例外、の error 終了で evaluator_updates が不足しない。"""
+    """Promotion at the boundary followed by an episode error still reports evaluator_updates."""
     sink = ListSink()
     calls = {"n": 0}
 
     def episode(ctx):
         calls["n"] += 1
-        if calls["n"] >= 3:  # 境界 (episode 2 完了後) を越えた 3 回目で落とす
+        if calls["n"] >= 3:  # Fail on the 3rd call, after the boundary (after episode 2 completes)
             raise RuntimeError("kaboom")
         return make_result(False)
 
@@ -423,7 +426,7 @@ def test_error_after_promoting_boundary_reports_evaluator_updates():
             production_tasks=["task-a"],
             held_out=held_out_matching(0.2, 0.8),
             epoch_len=2,
-            propose_evaluator=lambda outer, inc: HONEST,  # 境界で昇格
+            propose_evaluator=lambda outer, inc: HONEST,  # Promote at the boundary
             sinks=[sink],
             otel=False,
         )
@@ -431,18 +434,18 @@ def test_error_after_promoting_boundary_reports_evaluator_updates():
     assert boundary.payload["evaluator_decision"] == "promoted"
     end = sink.of_kind(REFLEXION_END)[0]
     assert end.payload["status"] == "error"
-    # 昇格を 1 回観測したので、error 終了の集計でも 1 が残る (境界後の取りこぼし無し)。
+    # One promotion was observed, so the error-end aggregate keeps 1 (no loss after the boundary).
     assert end.payload["evaluator_updates"] == 1
     assert end.payload["evaluator_version"] == HONEST.version
 
 
 # ==============================================================================
-# 判断ロジック不変 (安全核を壊さない)
+# Decision logic invariant (do not break the safety core)
 # ==============================================================================
 
 
 def test_observation_does_not_change_decisions():
-    """観測ありと素の run_reflexion で結果が一致する (観測は側チャネル)。"""
+    """Observed and bare run_reflexion results match (observation is a side channel)."""
     def episode(ctx):
         has = "use-the-fix" in ctx.memory_block
         return make_result(has)
@@ -469,7 +472,7 @@ def test_observation_does_not_change_decisions():
 
 
 # ==============================================================================
-# best-effort degrade (観測の失敗で driver を殺さない)
+# Best-effort degrade (observation failures do not kill the driver)
 # ==============================================================================
 
 
@@ -485,7 +488,7 @@ def test_flaky_sink_does_not_kill_driver():
         result = run_observed_reflexion(
             **_base_kwargs(sinks=[FlakySink(), good], otel=False)
         )
-    # driver は完走し、健全な sink には全イベントが届く。
+    # The driver completes, and the healthy sink receives every event.
     assert result.episodes == 2
     assert kinds(good)[0] == REFLEXION_BEGIN
     assert kinds(good)[-1] == REFLEXION_END
@@ -493,10 +496,10 @@ def test_flaky_sink_does_not_kill_driver():
 
 
 def test_observer_hook_swallows_internal_errors(monkeypatch):
-    """観測フック内部 (span など) の例外も握り、driver を落とさない。"""
+    """Internal observation hook exceptions (such as span errors) are swallowed and do not crash the driver."""
     obs = ReflexionObserver(otel=False)
 
-    # span を例外を投げるダミーに差し替えて、フック本体が握ることを確認する。
+    # Replace span with a dummy that raises and confirm the hook body swallows it.
     class BoomSpan:
         def add_episode_begin(self, **_k):
             raise RuntimeError("span boom")
@@ -512,7 +515,7 @@ def test_observer_hook_swallows_internal_errors(monkeypatch):
 
 
 def test_error_in_episode_records_error_end():
-    """episode が例外で抜けたら status=error の reflexion_end を残して再送出する。"""
+    """If an episode exits with an exception, record status=error reflexion_end and re-raise."""
     sink = ListSink()
 
     def boom(ctx):
@@ -526,12 +529,12 @@ def test_error_in_episode_records_error_end():
 
 
 # ==============================================================================
-# paused 伝播
+# Paused propagation
 # ==============================================================================
 
 
 def test_resume_error_end_preserves_prior_state_metrics():
-    """外側 resume 中に最初の episode 前で例外 → error end が復元 state の集計を保つ。"""
+    """Exception before the first episode during outer resume preserves restored state aggregates."""
     from loop_agent import ReflexionState
 
     sink = ListSink()
@@ -542,7 +545,7 @@ def test_resume_error_end_preserves_prior_state_metrics():
     )
 
     def boom(ctx):
-        raise RuntimeError("kaboom")  # 最初の episode で即落 (on_episode 未呼び出し)
+        raise RuntimeError("kaboom")  # Fail immediately in the first episode (on_episode not called)
 
     with pytest.raises(RuntimeError, match="kaboom"):
         run_observed_reflexion(
@@ -560,7 +563,7 @@ def test_resume_error_end_preserves_prior_state_metrics():
         )
     end = sink.of_kind(REFLEXION_END)[0]
     assert end.payload["status"] == "error"
-    # 復元 state の確定済み集計を 0 に潰さない。
+    # Do not zero out confirmed aggregates from the restored state.
     assert end.payload["episodes"] == 3
     assert end.payload["epochs"] == 1
     assert end.payload["reflections"] == 2
@@ -578,13 +581,13 @@ def test_paused_inner_episode_records_paused_end():
     assert result.paused is True
     end = sink.of_kind(REFLEXION_END)[0]
     assert end.payload["status"] == "paused"
-    # pause した episode は確定しないので episode_end は出ない (begin のみ)。
+    # The paused episode is not confirmed, so episode_end is not emitted (begin only).
     assert sink.of_kind(EPISODE_END) == []
     assert len(sink.of_kind(EPISODE_BEGIN)) == 1
 
 
 # ==============================================================================
-# EpochRecord の意味論
+# EpochRecord semantics
 # ==============================================================================
 
 
@@ -615,15 +618,16 @@ def test_on_epoch_hook_fires_at_boundary():
         **_base_kwargs(epoch_len=2, convergence=[MaxEpisodes(4)],
                        on_epoch=seen.append)
     )
-    # 4 episode / epoch_len 2 → 境界 2 回 (episode 2 と 4 の後)。だが episode 4 後は
-    # MaxEpisodes(4) が既に発火しているので昇格はしない設計 → 境界は episode 2 後の 1 回。
+    # 4 episodes / epoch_len 2 -> 2 boundaries (after episodes 2 and 4). However, after
+    # episode 4, MaxEpisodes(4) has already fired, so promotion is not attempted by design
+    # -> only the boundary after episode 2 remains.
     assert [r.epoch for r in seen] == [1]
     assert seen[0].boundary_episode == 2
     assert seen[0].decision == "unchanged"
 
 
 def test_on_epoch_hook_composes_with_user_on_episode():
-    """run_observed_reflexion は利用者の on_episode を観測と合成して両方呼ぶ。"""
+    """run_observed_reflexion composes the user's on_episode with observation and calls both."""
     user_seen: list[int] = []
     sink = ListSink()
     run_observed_reflexion(
@@ -635,7 +639,7 @@ def test_on_epoch_hook_composes_with_user_on_episode():
 
 
 # ==============================================================================
-# OTel degrade path (otel=False / 未導入)
+# OTel degrade path (otel=False / unavailable)
 # ==============================================================================
 
 
@@ -643,7 +647,7 @@ def test_reflexion_span_noop_when_disabled():
     span = ReflexionSpan(enabled=False)
     span.start(declared_keys=("a",), evaluator_version="v", epoch_len=2, epsilon=0.02)
     assert span.recording is False
-    # no-op でも全メソッドが例外なく呼べる。
+    # Even as a no-op, every method can be called without raising.
     span.add_episode_begin(episode=0, epoch=0, evaluator_version="v")
     span.add_episode(episode=0, epoch=0, evaluator_version="v", gt_aggregate=0.1,
                      reward=0.5, succeeded=False, ground_truth_backed=True,
@@ -678,7 +682,7 @@ def test_observed_reflexion_runs_with_otel_disabled():
 
 
 # ==============================================================================
-# OTel active path (in-memory exporter で span を実検査)
+# OTel active path (inspect the span with an in-memory exporter)
 # ==============================================================================
 
 otel_sdk = pytest.importorskip("opentelemetry.sdk.trace")
@@ -758,9 +762,9 @@ def test_transitions_are_span_events(otel_tracer):
     names = Counter(e.name for e in span.events)
     assert names["episode_begin"] == 4
     assert names["episode"] == 4
-    assert names["lesson_decision"] == 4   # 全 fail episode で grounded lesson 採用
+    assert names["lesson_decision"] == 4   # Grounded lesson admitted for every failed episode
     assert names["epoch_boundary"] >= 1
-    # epoch_boundary event に昇格判定が載る。
+    # The epoch_boundary event carries the promotion decision.
     boundary = [e for e in span.events if e.name == "epoch_boundary"][0]
     assert boundary.attributes["evaluator_decision"] == "promoted"
 
@@ -824,7 +828,7 @@ def test_misbehaving_tracer_does_not_crash_reflexion(monkeypatch):
 
 
 def test_metric_consistency_span_events_match_attributes(otel_tracer):
-    """span の episode event 個数 = 終了属性 episodes と一致する (metric 一貫性)。"""
+    """Span episode event count matches the final episodes attribute (metric consistency)."""
     tracer, exporter = otel_tracer
     result = run_observed_reflexion(
         **_base_kwargs(tracer=tracer, reflect=true_reflect, admit_lesson=accept_all,

@@ -1,38 +1,46 @@
-"""sync/async シーム共用の小さなユーティリティ (Issue #40)。
+"""Small utility shared by sync and async seams (Issue #40).
 
-:func:`maybe_await` は「値が awaitable なら await し、そうでなければそのまま返す」
-だけの薄いアダプタである。これにより ``gather`` / ``act`` / ``verify`` /
-``conditions`` / ``gate`` の各フックを **同期 callable のまま受けつつ**、同一の
-呼び出し地点で **非同期 (acallable) も await できる**。
+:func:`maybe_await` is a thin adapter that only says: if the value is
+awaitable, await it; otherwise, return it as-is. This lets ``gather`` /
+``act`` / ``verify`` / ``conditions`` / ``gate`` hooks be **accepted as
+synchronous callables** while **asynchronous callables can also be awaited** at
+the same call site.
 
-使い方の規約: フックを **呼び出した結果** を渡す (フック自体ではない)。
+Usage convention: pass the **result of calling** the hook (not the hook itself).
 
-    outcome = await maybe_await(act(context))   # act が sync でも async でも可
+    outcome = await maybe_await(act(context))   # act may be sync or async
 
-同期フックは普通の値を返すので :func:`inspect.isawaitable` が ``False`` となり、
-追加コストはほぼゼロ (coroutine を生成しない) で即座に値が返る。非同期フックは
-coroutine / future を返すので、その場で await される。
+Synchronous hooks return ordinary values, so :func:`inspect.isawaitable` is
+``False`` and the value is returned immediately with almost no extra cost (no
+coroutine is created). Asynchronous hooks return a coroutine / future, so they
+are awaited in place.
 
-これは :func:`loop_agent.loop.async_run_loop` が単一の制御フローで sync/async 双方を
-駆動するための土台で、``review``、``conditions`` (各 ``check``) と ``gate.review`` も同じ規約で
-sync/async どちらでも受けられる。
+This is the foundation that lets :func:`loop_agent.loop.async_run_loop` drive
+both sync and async paths with a single control flow. ``review``,
+``conditions`` (each ``check``), and ``gate.review`` follow the same convention
+and accept either sync or async implementations.
 
-**strict-sync モード (run_loop 用)**: 同期 API :func:`loop_agent.run_loop` は共有
-コルーチンを *呼び出し側のコンテキストで一度に* 駆動する -- イベントループを作らず、
-``coro.send(None)`` で手動ステップする。run_loop は :func:`loop_agent.async_run_loop` を
-``_strict_sync=True`` で呼び、async_run_loop が自身の実行範囲だけ :data:`reject_awaitables`
-を ``True`` にする。strict-sync 下で :func:`maybe_await` が awaitable を受け取ったら、
-await せず :exc:`AsyncSeamInSyncLoop` を送出する。これにより「非同期フックが内部で実際に
-suspend するか否か」に依存せず、**どの非同期シームでも一貫して** 「run_loop に async シーム
-が渡された」ことを早期に・確実に弾ける (suspend するものだけ弾けて、suspend しないものは
-黙って実行されてしまう不整合を防ぐ)。非同期シームには :func:`loop_agent.async_run_loop` を
-使うこと。
+**strict-sync mode (for run_loop)**: the synchronous API
+:func:`loop_agent.run_loop` drives the shared coroutine *all at once in the
+caller's context* -- without creating an event loop, manually stepping it with
+``coro.send(None)``. run_loop calls :func:`loop_agent.async_run_loop` with
+``_strict_sync=True``, and async_run_loop sets :data:`reject_awaitables` to
+``True`` only for its own execution scope. If :func:`maybe_await` receives an
+awaitable under strict-sync, it raises :exc:`AsyncSeamInSyncLoop` without
+awaiting it. This consistently and reliably rejects "an async seam was passed
+to run_loop" early for **any async seam**, without depending on whether the
+async hook actually suspends internally (preventing the inconsistent case where
+only suspending hooks are rejected while non-suspending hooks run silently).
+Use :func:`loop_agent.async_run_loop` for async seams.
 
-フラグは async_run_loop が **入口で自分のモードに明示セット** する (継承値を上書き) ため、
-ネストにも、ambient なイベントループの有無にも依存しない: 同期 ``run_loop`` のフックが内部で
-``asyncio.run(async_run_loop(...))`` を回しても、その内側は ``_strict_sync=False`` で入るので
-strict 扱いにならず内側の正当な非同期シームは await される。逆に ``run_loop`` を実行中ループ
-内から呼んでも ``_strict_sync=True`` が効き、非同期シームは正しく拒否される。
+async_run_loop **explicitly sets the flag to its own mode at entry** (overriding
+the inherited value), so behavior does not depend on nesting or the presence of
+an ambient event loop: even if a synchronous ``run_loop`` hook internally runs
+``asyncio.run(async_run_loop(...))``, the inner call enters with
+``_strict_sync=False``, so it is not treated as strict and its valid inner async
+seams are awaited. Conversely, if ``run_loop`` is called from inside a running
+loop, ``_strict_sync=True`` still takes effect and async seams are correctly
+rejected.
 """
 
 from __future__ import annotations
@@ -41,55 +49,63 @@ import contextvars
 import inspect
 from typing import Awaitable, TypeVar, Union
 
-# AsyncSeamInSyncLoop の正準定義は loop_agent.errors にある (Issue #43 で統一階層に再配置)。
-# 後方互換のためここから re-export する: 既存の `from loop_agent._async import
-# AsyncSeamInSyncLoop` / `loop_agent._async.AsyncSeamInSyncLoop` 参照を壊さない。
+# The canonical definition of AsyncSeamInSyncLoop lives in loop_agent.errors
+# (moved into the unified hierarchy in Issue #43).
+# Re-export it here for backward compatibility: do not break existing
+# `from loop_agent._async import AsyncSeamInSyncLoop` /
+# `loop_agent._async.AsyncSeamInSyncLoop` references.
 from .errors import AsyncSeamInSyncLoop
 
 T = TypeVar("T")
 
 __all__ = ["AsyncSeamInSyncLoop", "reject_awaitables", "driven_synchronously", "maybe_await"]
 
-# async_run_loop が自身の実行範囲だけ True にする (run_loop 駆動なら _strict_sync=True)。
-# True の間 maybe_await / afirst_triggered は awaitable を AsyncSeamInSyncLoop で拒否する。
-# 入口で明示セットするので継承値 (copy_context) を上書きし、ネストや ambient ループに漏れない。
+# async_run_loop sets this to True only for its own execution scope
+# (_strict_sync=True when driven by run_loop).
+# While True, maybe_await / afirst_triggered reject awaitables with
+# AsyncSeamInSyncLoop.
+# It is explicitly set at entry, so it overrides inherited values
+# (copy_context) and does not leak across nesting or ambient loops.
 reject_awaitables: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "loop_agent_reject_awaitables", default=False
 )
 
 
 def driven_synchronously() -> bool:
-    """strict-sync (= ``run_loop`` 駆動中) なら ``True``。
+    """Return ``True`` in strict-sync mode (= while driven by ``run_loop``).
 
-    :func:`loop_agent.async_run_loop` が ``_strict_sync`` に応じて入口でセットする
-    :data:`reject_awaitables` を読む。ambient なイベントループの有無ではなく、driver が
-    明示した値で判定するため、実行中ループ内からの ``run_loop`` 呼び出しでも、ネストした
-    ``asyncio.run(async_run_loop(...))`` でも正しく分かれる。
+    Reads :data:`reject_awaitables`, which :func:`loop_agent.async_run_loop`
+    sets at entry according to ``_strict_sync``. The decision is based on the
+    value explicitly provided by the driver, not on whether an ambient event
+    loop exists, so calls to ``run_loop`` from inside a running loop and nested
+    ``asyncio.run(async_run_loop(...))`` calls are distinguished correctly.
     """
     return reject_awaitables.get()
 
 
 async def maybe_await(value: Union[T, Awaitable[T]]) -> T:
-    """``value`` が awaitable ならば await した結果を、そうでなければ ``value`` を返す。
+    """Await ``value`` if it is awaitable; otherwise return ``value``.
 
-    フック呼び出しの戻り値を渡すこと (フック関数そのものではない)。同期フックの
-    戻り値は awaitable でないため、何も待たずに即座に返る。
+    Pass the return value from calling a hook (not the hook function itself).
+    Since synchronous hooks return non-awaitable values, they are returned
+    immediately without waiting.
 
-    strict-sync (= :func:`driven_synchronously` が ``True``。同期 ``run_loop`` が
-    手動ドライブ中) のときに awaitable を受け取った場合は、await せず
-    :exc:`AsyncSeamInSyncLoop` を送出する (未 await 警告を出さないよう awaitable は
-    ``close`` する)。
+    If an awaitable is received in strict-sync mode (=
+    :func:`driven_synchronously` is ``True`` while synchronous ``run_loop`` is
+    manually driving), raise :exc:`AsyncSeamInSyncLoop` without awaiting it (and
+    ``close`` the awaitable to avoid unawaited warnings).
     """
     if inspect.isawaitable(value):
         if driven_synchronously():
-            # 未 await の coroutine 警告を避けるため閉じてから弾く (future 等 close を
-            # 持たないものは getattr ガードでスキップ)。
+            # Close before rejecting to avoid unawaited coroutine warnings
+            # (future-like objects without close are skipped by the getattr
+            # guard).
             close = getattr(value, "close", None)
             if close is not None:
                 close()
             raise AsyncSeamInSyncLoop(
                 "run_loop() received an async (awaitable) seam "
-                "(act/verify/gather/condition/gate/on_step/on_complete); "
+                "(act/review/verify/gather/condition/gate/on_step/on_complete); "
                 "use `await async_run_loop(...)` for async seams"
             )
         return await value  # type: ignore[no-any-return]

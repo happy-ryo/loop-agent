@@ -77,16 +77,27 @@ where irreversible operations are allowed.
 
 ## What To Ignore At First
 
-Do not start with Reflexion, transport, operations dashboards, notifier backends,
-or custom evaluator APIs unless the harness already needs them. They are stable
-surfaces for advanced composition, not prerequisites for a first loop.
+Do not start with transport, operations dashboards, notifier backends, or custom
+evaluator APIs unless the harness already needs them. They are stable surfaces
+for advanced composition, not prerequisites for a first loop. For unattended
+LLM-backed work, however, keep persistence, progress events, review feedback, and
+a repeated-failure cutoff in place from the scaffold.
+
+Reflexion comes after that baseline, not before it. A beginner-safe rule is:
+first make the loop save what happened and prove success with `verify`; then add
+Reflexion only if the saved history shows the same kind of failure repeating. If
+the verifier or prompt is still vague, Reflexion may preserve that noise as a
+"lesson" and make the next run worse.
 
 The upgrade path is:
 
 1. `run_loop` with a mechanical cap.
 2. A sharp `verify` based on a command, test, AST check, or regex.
 3. Persistence with `DBProgressLog` if the run can outlive one process.
-4. A gate or work-list scheduler only when the domain demands it.
+4. A `review` seam when an LLM edits artifacts that tests cannot fully judge.
+5. Reflexion when the same failure repeats and a reusable lesson can improve the
+   next episode.
+6. A gate or work-list scheduler only when the domain demands it.
 
 This keeps the first decision path small while preserving the full public API for
 larger applications.

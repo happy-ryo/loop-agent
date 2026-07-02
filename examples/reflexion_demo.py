@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""外側 Reflexion ループのデモ: 失敗からの学びが次 episode を改善する (Issue #22)。
+"""Demo of the outer Reflexion loop: lessons from failure improve the next episode (Issue #22).
 
-内側 ReAct ループ (``run_loop``) を 1 episode として包み、episode 境界で失敗軌跡から
-言語的指針を抽出して episodic memory に取り込み、次 episode の context に配線する。
-ground-truth 一次信号 (内側 verify) が収束を駆動し、epoch 内で固定された rubric 評価器は
-reflect 用の reward だけを出す (二信号モデル)。評価器の更新は epoch 境界で held-out 固定
-gold に勝ったときのみ (RQGM)。
+The inner ReAct loop (``run_loop``) is wrapped as one episode. At episode boundaries,
+linguistic guidance is extracted from failed trajectories, admitted into episodic memory,
+and wired into the next episode's context. The primary ground-truth signal (inner verify)
+drives convergence, while the rubric evaluator fixed within each epoch only emits the
+reward for reflection (two-signal model). The evaluator is updated only at epoch boundaries
+when the candidate beats the incumbent on agreement with fixed held-out gold labels (RQGM).
 
-CLI 出力は ASCII のみ (cp932 端末での --help / print クラッシュ回避)。
+CLI output is ASCII-only (to avoid --help / print crashes on cp932 terminals).
 
-実行:
+Run:
 
     python3 examples/reflexion_demo.py
 """
@@ -38,7 +39,7 @@ LESSON_HINT = "increment the index by 1"
 
 
 def make_episode():
-    """production 経路: 1 episode = 内側 run_loop を 1 回。memory の学びで成否が変わる。"""
+    """Production path: one episode is one inner run_loop; memory lessons affect success."""
 
     def episode(ctx):
         has_lesson = LESSON_HINT in ctx.memory_block
@@ -50,14 +51,14 @@ def make_episode():
         def verify(outcome):
             return VerifyOutcome(goal_met="fixed" in outcome.observation)
 
-        # 内側 ReAct ループ。verify が goal_met を返せば自然終了する。
+        # Inner ReAct loop. It exits naturally when verify returns goal_met.
         return run_loop(act=act, verify=verify, conditions=[MaxIterations(2)])
 
     return episode
 
 
 def ground_truth(outcome):
-    """一次信号: 内側 verify の成否 (test/lint 相当) から作る。評価器ではない。"""
+    """Primary signal: derived from inner verify success (like tests/lint), not the evaluator."""
     val = 0.95 if outcome.succeeded else 0.2
     return GroundTruthSignal(
         succeeded=outcome.succeeded,
@@ -66,7 +67,7 @@ def ground_truth(outcome):
 
 
 def reflect(history, signal, reward):
-    """失敗軌跡から grounded な言語的指針を抽出する。"""
+    """Extract grounded linguistic guidance from a failed trajectory."""
     if signal.succeeded or not history:
         return None
     return Lesson(
@@ -78,7 +79,7 @@ def reflect(history, signal, reward):
 
 
 def build_evaluator() -> Evaluator:
-    """rubric 評価器 (epoch 内で固定。reflect 用 reward を出すだけ)。"""
+    """Rubric evaluator fixed within an epoch; it only emits the reward for reflection."""
 
     def score(o):
         truth = (1.0 if o.succeeded else 0.0) if hasattr(o, "succeeded") else o["truth"]
@@ -88,7 +89,7 @@ def build_evaluator() -> Evaluator:
 
 
 def build_held_out() -> HeldOut:
-    """評価器昇格の測定基盤 (固定 gold ラベル。production task と素な名前空間)。"""
+    """Measurement substrate for evaluator promotion: fixed gold labels and raw production-task names."""
     return HeldOut(
         (
             Probe("hold-fail", {"truth": 0.0}, gold_label=0.0),
@@ -98,7 +99,7 @@ def build_held_out() -> HeldOut:
 
 
 def run() -> object:
-    """デモ本体。Reflexion 結果を返す (テストから検証できるよう副作用は print のみ)。"""
+    """Demo body. Returns the Reflexion result; print is the only side effect for tests."""
     return run_reflexion(
         episode=make_episode(),
         ground_truth=ground_truth,

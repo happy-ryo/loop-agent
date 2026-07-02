@@ -1,12 +1,10 @@
-# 永続化と再開 (progress file / state.db SoT / resume)
+# Persistence and Resume (progress file / state.db SoT / resume)
 
-LoopAgent はループ状態を外部に永続化し、中断したループを状態欠落なく途中から再開できる。最小の進捗ファイル (JSONL) から、MVP の Single Source of Truth である `state.db` (SQLite)、そして resume (#14) までを段階的に解説する。
+LoopAgent persists loop state externally and can resume an interrupted loop from the middle without losing state. This guide explains the progression from a minimal progress file (JSONL), to `state.db` (SQLite) as the MVP Single Source of Truth, and then to resume (#14).
 
-## 最小状態（進捗ファイル）
+## Minimal State (Progress File)
 
-各反復の記録を JSON Lines で外部ファイルに追記する最小の永続状態。`ProgressLog.on_step`
-を `run_loop` の `on_step` に渡し、終了後に終了理由を 1 行追記するだけ。1 行 = 1 反復の完結した
-レコードなので、途中でクラッシュしても直前までの反復は読み戻せる（state.db SoT の最小の前身）。
+The minimal persistent state appends one JSON Lines record per iteration to an external file. Pass `ProgressLog.on_step` to `run_loop` as `on_step`, then append one final line with the termination reason after the loop finishes. Because each line is a complete record for one iteration, iterations up to the last completed one can be read back even if the process crashes midway. This is the smallest predecessor of the state.db SoT.
 
 ```python
 from loop_agent import run_loop, ProgressLog, read_progress
@@ -14,95 +12,73 @@ from loop_agent import run_loop, ProgressLog, read_progress
 progress = ProgressLog("progress.jsonl")
 result = run_loop(act=act, verify=verify, conditions=[MaxIterations(5)],
                   on_step=progress.on_step)
-progress.record_result(result)               # 終了理由（"result" 行）を追記
+progress.record_result(result)               # Append the termination reason (a "result" line)
 
-records = read_progress("progress.jsonl")     # 反復ごとの "step" 行 + 末尾 "result" 行
+records = read_progress("progress.jsonl")     # Per-iteration "step" lines + final "result" line
 ```
 
-## ループ状態の SoT（state.db）
+## Loop State SoT (state.db)
 
-MVP（report.md §3.4 / §4.6 / §5 Phase 2）では、ループ状態を **SQLite の単一 SoT** に外出しする。
-loop 用の**最小スキーマ**（`run` / `step` / `event` / `stop_reason` の 4 テーブルだけ）を `connect`
-で生成し、各 step を **`transaction` で atomic に永続化**する。claude-org-ja の `tools/state_db` を
-adapt 元にしたが、org 本体（projects / workstreams / snapshotter 等）には**一切依存しない自己完結
-スキーマ**として切り出している（疎結合 = report.md §6）。
+In the MVP (report.md §3.4 / §4.6 / §5 Phase 2), loop state is externalized into a **single SQLite SoT**. `connect` creates the **minimal schema** for loops, consisting of only four tables (`run` / `step` / `event` / `stop_reason`), and each step is **persisted atomically with `transaction`**. This was adapted from claude-org-ja `tools/state_db`, but is extracted as a **self-contained schema** with no dependency on the org system itself (projects / workstreams / snapshotter, etc.). This keeps it loosely coupled, as described in report.md §6.
 
-`DBProgressLog` は JSONL の `ProgressLog` と**同じ `on_step` / `record_result` シグネチャ**を持つ
-drop-in なので、観測フックの差し替えだけで SoT を DB に移せる（`run_loop` のシグネチャは不変）。
+`DBProgressLog` has the **same `on_step` / `record_result` signatures** as the JSONL `ProgressLog`, so it is a drop-in replacement. The SoT can be moved to the DB by only replacing the observation hook; the `run_loop` signature is unchanged.
 
 ```python
 from loop_agent import run_loop, DBProgressLog, MaxIterations
 
-with DBProgressLog("state.db", run_id="my-run") as db:   # run 行 + loop_begin を確保
+with DBProgressLog("state.db", run_id="my-run") as db:   # Reserve the run row + loop_begin
     result = run_loop(act=act, verify=verify,
                       conditions=[MaxIterations(5)],
-                      on_step=db.on_step)                 # 各反復を atomic 永続化
-    db.record_result(result)                             # 終了状態 + stop_reason を確定
+                      on_step=db.on_step)                 # Atomically persist each iteration
+    db.record_result(result)                             # Finalize termination state + stop_reason
 ```
 
-低レベル API:
+Low-level API:
 
 ```python
 from loop_agent import connect, LoopStore
 
 store = LoopStore(connect("state.db"))
-state = store.load_or_init("my-run")     # 新規は空 LoopState、既存は step から復元
-store.read_steps("my-run")               # 反復ごとの step 行（observation 復号済み）
-store.read_events("my-run")              # journal（loop_begin / loop_step / loop_end）
-store.get_stop_reason("my-run")          # 発火した停止条件 or goal 達成
+state = store.load_or_init("my-run")     # New runs get an empty LoopState; existing runs are restored from steps
+store.read_steps("my-run")               # Per-iteration step rows (with observation decoded)
+store.read_events("my-run")              # Journal (loop_begin / loop_step / loop_end)
+store.get_stop_reason("my-run")          # Triggered stop condition or achieved goal
 ```
 
-**中断 → 再開（resume, #14）**。永続化済み step から復元した `LoopState` を
-`run_loop(initial_state=…)` に渡すと、中断したループを状態欠落なく途中から継続できる
-（iteration カウンタ・コスト累積・`elapsed`・history が引き継がれ、`elapsed` は永続化値から
-継続加算される）。`DBProgressLog.state` がその復元結果（新規 run なら空 = fresh start と同義）
-なので、新規・再開で同じ配線にできる:
+**Interrupt → resume (resume, #14)**. Pass a `LoopState` restored from persisted steps to `run_loop(initial_state=...)` to continue an interrupted loop from the middle without losing state. The iteration counter, accumulated cost, `elapsed`, and history are carried forward, and `elapsed` continues accumulating from the persisted value. `DBProgressLog.state` is that restored result (for a new run, it is empty, which is equivalent to a fresh start), so new and resumed runs can use the same wiring:
 
 ```python
-db = DBProgressLog("state.db", "my-run")   # 既存 run なら state を step から復元
+db = DBProgressLog("state.db", "my-run")   # For an existing run, restore state from steps
 result = run_loop(act=act, verify=verify, conditions=[GoalMet(verifier), MaxIterations(100)],
-                  initial_state=db.state,   # 中断地点から継続（新規 run は空 state）
+                  initial_state=db.state,   # Continue from the interruption point (new runs use empty state)
                   on_step=db.on_step)
 db.record_result(result)
 ```
 
-resume は**状態ベースの停止条件**（`GoalMet` など state から判定するフック）と組み合わせて
-意味を持つ。プロセスをまたぐと act/verify フックは作り直されるが、その内部のコール回数
-カウンタは復元されない — 判定を（gather された）state から導けば、新プロセスでも同じ判断を
-再現でき、再開結果が通し実行と一致する。
+Resume is meaningful when combined with **state-based stop conditions**, such as hooks that decide from state (`GoalMet`, for example). Across processes, the act/verify hooks are recreated and their internal call counters are not restored. If the decision is derived from the gathered state, the same judgment can be reproduced in the new process and the resumed result will match a continuous run.
 
-> **observation の型忠実度（resume の限界）**。state.db から復元した `history` の
-> `observation` は保存時の JSON を round-trip した値になる（`tuple→list` / dict の
-> int キー→str / set・カスタム型・NaN→repr 文字列）。raw な `observation` を直接
-> *キー*にする条件（特に `NoProgress` の既定 key）は再開境界で値が変わりうる
-> （`tuple` は unhashable な `list` になる）。完全一致で再開したい場合は JSON 安定な
-> observation を使うか、`NoProgress(key=…)` に JSON 安定な signature への射影を渡す。
+> **Observation type fidelity (a resume limitation)**. The `observation` values in `history` restored from state.db are JSON round-tripped values from the time they were saved (`tuple→list` / int keys in dicts → str / set, custom types, and NaN → repr strings). Conditions that use raw `observation` values directly as *keys* (especially the default key for `NoProgress`) may see values change across a resume boundary (`tuple` becomes an unhashable `list`). If you need exact resume equivalence, use JSON-stable observations or pass `NoProgress(key=...)` a projection to a JSON-stable signature.
 
-**JSONL と DB は併存**する。`ProgressLog`（JSONL）は依存ゼロで読める PoC アーティファクトとして残し、
-`DBProgressLog`（state.db）が MVP 以降の状態 SoT になる。両者は同じ観測フック規約を共有する。
+**JSONL and DB coexist**. `ProgressLog` (JSONL) remains as a zero-dependency PoC artifact that can be read easily, while `DBProgressLog` (state.db) becomes the state SoT from the MVP onward. Both share the same observation hook convention.
 
-各 step の永続化は「`step` 行 + `run` 集計 + `loop_step` event」を**1 トランザクションに束ねる**ので、
-commit 前にプロセスが死んでも半端な行は残らない（クラッシュ耐性）。`UNIQUE(run_id, iteration)` により
-同一反復の再永続化は冪等（再開時の replay 安全性）。
+Persistence for each step bundles the "`step` row + `run` aggregate + `loop_step` event" into **one transaction**, so no partial rows remain if the process dies before commit. `UNIQUE(run_id, iteration)` makes re-persisting the same iteration idempotent, which keeps replay safe during resume.
 
-なお、**複数プロセスから同一 run を同時に再開する**ケース（in-progress lease による排他、#21）は、
-HumanGate の pause/resume と同じ安全境界の話として [safety.md](./safety.md) で扱う。
+The case where **multiple processes resume the same run at the same time** (mutual exclusion through an in-progress lease, #21) is covered in [safety.md](./safety.md) as the same kind of safety boundary as HumanGate pause/resume.
 
-## state.db 互換性契約
+## state.db Compatibility Contract
 
-`1.0.0` 以降、state.db は loop-agent の安定した永続化形式である。互換性の単位は公開 API
-（`connect` / `LoopStore` / `DBProgressLog` / `ReflexionStore` / `DBReflexionLog`）から観測できる動作であり、内部 SQL の細部ではない。
+From `1.0.0` onward, state.db is loop-agent's stable persistence format. The unit of compatibility is behavior observable through the public APIs (`connect` / `LoopStore` / `DBProgressLog` / `ReflexionStore` / `DBReflexionLog`), not the internal details of the SQL.
 
-- **patch release**: 既存 DB を非破壊に読み書きできる bug fix、index 追加、read-only query の改善。
-- **minor release**: additive なテーブル・列・event kind の追加。既存 DB は migration で読み続けられること。
-- **major release**: 既存 DB を migration なしに読めない schema 変更、既存列の意味変更、resume 契約の非互換変更。
+- **patch release**: Bug fixes, index additions, and read-only query improvements that can read and write existing DBs without destructive changes.
+- **minor release**: Additive table, column, and event kind additions. Existing DBs must remain readable through migration.
+- **major release**: Schema changes that make existing DBs unreadable without migration, semantic changes to existing columns, or incompatible changes to the resume contract.
 
-`PRAGMA user_version` は schema 世代を示す。migration は実 schema を検査して冪等に行い、既存 step / event / pending decision を破壊しない。`observation` は JSON round-trip するため、型忠実度の限界（tuple→list など）は安定した仕様として扱う。完全一致の resume 判定が必要な場合は JSON 安定な observation、または `NoProgress(key=...)` の安定 signature を使う。
+`PRAGMA user_version` indicates the schema generation. Migrations inspect the actual schema and run idempotently without destroying existing steps, events, or pending decisions. Because `observation` is JSON round-tripped, type fidelity limits such as `tuple→list` are treated as stable specification. If exact-match resume decisions are required, use JSON-stable observations or a stable signature for `NoProgress(key=...)`.
 
-## 関連
+## Related
 
-- [README](../README.md) — 全体像と動線
-- [transport.md](./transport.md) — SQLite / Redis backend と state.db の格納先
-- [observability.md](./observability.md) — loop_begin / loop_step / loop_end イベントと OTel span
-- [safety.md](./safety.md) — HumanGate と複数プロセス同時 resume（in-progress lease, #21）
-- [stability.md](./stability.md) — `1.0.0` の安定契約
+- [README](../README.md) — Overview and navigation
+- [transport.md](./transport.md) — SQLite / Redis backends and state.db storage location
+- [observability.md](./observability.md) — loop_begin / loop_step / loop_end events and OTel spans
+- [safety.md](./safety.md) — HumanGate and simultaneous multi-process resume (in-progress lease, #21)
+- [stability.md](./stability.md) — The `1.0.0` stability contract

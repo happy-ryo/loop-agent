@@ -1,8 +1,9 @@
-"""イベントモデルと sink のテスト（report.md S4.5「観測性」）。
+"""Tests for event models and sinks (report.md S4.5 "Observability").
 
-LoopEvent の畳み込み、ListSink / CallableSink / JsonlEventSink の振る舞い、
-JSONL の round-trip（journal 風 sink の耐久性: クラッシュ末尾の許容・Unicode）、
-best-effort な fan-out（sink 例外でループを殺さない）を押さえる。
+These cover LoopEvent flattening, ListSink / CallableSink / JsonlEventSink
+behavior, JSONL round-trips (journal-style sink durability: accepting a
+crash-truncated tail and preserving Unicode), and best-effort fan-out
+(sink exceptions do not kill the loop).
 """
 
 from __future__ import annotations
@@ -100,7 +101,7 @@ def test_jsonl_sink_creates_missing_parent_directory(tmp_path):
 
 
 def test_jsonl_sink_flushes_each_event(tmp_path):
-    # 各 emit の直後にファイルへ反映されている（バッファ溜め込みでない）こと。
+    # Each emit is reflected in the file immediately, without buffering.
     path = tmp_path / "events.jsonl"
     sink = JsonlEventSink(path)
     sink.emit(LoopEvent(kind=LOOP_BEGIN, iteration=0, elapsed=0.0))
@@ -115,7 +116,7 @@ def test_read_events_tolerates_truncated_final_line(tmp_path):
     sink.emit(LoopEvent(kind=LOOP_BEGIN, iteration=0, elapsed=0.0))
     sink.emit(LoopEvent(kind=LOOP_STEP, iteration=0, elapsed=0.1))
     with path.open("a", encoding="utf-8") as fh:
-        fh.write('{"kind": "loop_step", "iteration": 1')  # 改行なしの部分行
+        fh.write('{"kind": "loop_step", "iteration": 1')  # Partial line without a newline
 
     records = read_events(path)
     assert [r["kind"] for r in records] == [LOOP_BEGIN, LOOP_STEP]
@@ -126,7 +127,7 @@ def test_read_events_raises_on_corrupt_complete_final_line(tmp_path):
     sink = JsonlEventSink(path)
     sink.emit(LoopEvent(kind=LOOP_BEGIN, iteration=0, elapsed=0.0))
     with path.open("a", encoding="utf-8") as fh:
-        fh.write("{corrupt but terminated}\n")  # 改行終端された壊れ行は本物の破損
+        fh.write("{corrupt but terminated}\n")  # A corrupt newline-terminated line is real corruption
 
     with pytest.raises(json.JSONDecodeError):
         read_events(path)
@@ -139,15 +140,15 @@ def test_read_events_missing_file_returns_empty(tmp_path):
 def test_jsonl_unicode_round_trips_as_utf8(tmp_path):
     path = tmp_path / "events.jsonl"
     JsonlEventSink(path).emit(
-        LoopEvent(kind=LOOP_END, iteration=1, elapsed=0.0, payload={"reason": "収束しました"})
+        LoopEvent(kind=LOOP_END, iteration=1, elapsed=0.0, payload={"reason": "Converged ✓"})
     )
     raw = path.read_text(encoding="utf-8")
-    assert "収束しました" in raw  # ASCII エスケープされない
-    assert read_events(path)[0]["reason"] == "収束しました"
+    assert "Converged ✓" in raw  # Not ASCII-escaped
+    assert read_events(path)[0]["reason"] == "Converged ✓"
 
 
 def test_jsonl_unicode_line_separators_do_not_split_a_record(tmp_path):
-    # U+2028/U+2029/U+0085 は値中にそのまま出るが record の framing ではない。
+    # U+2028/U+2029/U+0085 appear directly in values but are not record framing.
     path = tmp_path / "events.jsonl"
     nasty = "stuck here andthere"
     sink = JsonlEventSink(path)
@@ -156,7 +157,7 @@ def test_jsonl_unicode_line_separators_do_not_split_a_record(tmp_path):
 
     records = read_events(path)
     assert records[0]["detail"] == nasty
-    assert len(records) == 2  # 末尾 record は裂けず無事
+    assert len(records) == 2  # The final record remains intact and unsplit
 
 
 def test_jsonl_sink_writes_strict_json_for_non_finite_floats(tmp_path):
@@ -190,7 +191,7 @@ def test_jsonable_coerces_non_serializable_to_repr():
     assert _jsonable(Widget()) == "Widget(x)"
     assert _jsonable([1, Widget()]) == [1, "Widget(x)"]
     assert _jsonable({"k": Widget()}) == {"k": "Widget(x)"}
-    assert _jsonable({1: "v"}) == {"1": "v"}  # 非 str キーは str 化
+    assert _jsonable({1: "v"}) == {"1": "v"}  # Non-string keys are converted to strings
 
 
 # -- best-effort fan-out ----------------------------------------------------
@@ -206,7 +207,7 @@ def test_fan_out_isolates_a_failing_sink_with_a_warning():
     ev = LoopEvent(kind=LOOP_BEGIN, iteration=0, elapsed=0.0)
     with pytest.warns(RuntimeWarning, match="failed to emit"):
         fan_out((Boom(), good), ev)
-    # 壊れた sink があっても後続 sink には届く。
+    # Later sinks still receive the event even if one sink is broken.
     assert good.events == [ev]
 
 

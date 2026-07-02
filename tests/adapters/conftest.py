@@ -1,13 +1,15 @@
-"""全 act アダプタ共通の契約テストハーネス(Issue #52)。
+"""Shared contract test harness for all act adapters (Issue #52).
 
-ここでは、個々のアダプタ(:class:`ClaudeCodeAct` / :class:`CodexAct` と将来の追加
-アダプタ)が **`act` シームの 4 か条** と **`ActResult` の形** を満たすことを、1 つの
-parametrize 群で横断検証するための :class:`AdapterSpec` と fixture を定義する。
-具体的な共通ケースは ``test_contract.py``。
+This defines :class:`AdapterSpec` and fixtures so one parametrized suite can
+verify across adapters that each adapter (:class:`ClaudeCodeAct` /
+:class:`CodexAct`, plus future additions) satisfies the **four act seam rules**
+and the **`ActResult` shape**. Concrete shared cases live in
+``test_contract.py``.
 
-新しいアダプタを足したら :data:`ADAPTER_SPECS` に 1 行登録するだけで、結果の形 /
-``failed`` セマンティクス / timeout graceful / 起動失敗 graceful / **token 二重計上
-ガード** / 予算計上 / Mock 契約 / auth 環境継承 / stdin 安全性 が自動で適用される。
+After adding a new adapter, registering one row in :data:`ADAPTER_SPECS`
+automatically applies result shape / ``failed`` semantics / graceful timeout /
+graceful startup failure / **token double-counting guard** / budget accounting /
+Mock contract / auth environment inheritance / stdin safety checks.
 """
 
 from __future__ import annotations
@@ -27,21 +29,23 @@ from loop_agent.adapters import (
     MockCodexAct,
 )
 
-# parse_tokens は **アダプタごとに意味論が違う**(claude は input+output+cache_creation
-# を計上し cache_read を除外、codex は input+output のみで部分集合を除外)ため、共通 __init__ の再公開ではなく
-# 各サブモジュールから直接取る。token 二重計上ガードはこの差を固定する。
+# parse_tokens has **adapter-specific semantics**: claude counts
+# input+output+cache_creation and excludes cache_read, while codex counts only
+# input+output and excludes subset fields. Import directly from each submodule
+# instead of a shared __init__ re-export. The token double-counting guard locks
+# in this difference.
 from loop_agent.adapters.claude_code import parse_tokens as claude_parse_tokens
 from loop_agent.adapters.codex import parse_tokens as codex_parse_tokens
 
 
-# -- フェイク runner: subprocess.run を差し替えてコマンド/出力を制御する --------
+# -- Fake runner: replace subprocess.run to control commands/output --------
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
-    """``subprocess.run`` 互換の戻り値(CompletedProcess)を返す runner を作る。
+    """Create a runner that returns a ``subprocess.run``-compatible CompletedProcess.
 
-    呼び出しごとの ``(command, kwargs)`` を ``.calls`` に記録するので、テストは
-    渡されたコマンド/環境/stdin を検証できる。
+    It records each call's ``(command, kwargs)`` in ``.calls`` so tests can
+    verify the passed command/environment/stdin.
     """
 
     def _runner(command, **kwargs):
@@ -55,7 +59,7 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
 
 
 def _timeout_runner(timeout_value: float = 600.0):
-    """常に :class:`subprocess.TimeoutExpired` を送出する runner を作る。"""
+    """Create a runner that always raises :class:`subprocess.TimeoutExpired`."""
 
     def _runner(command, **kwargs):
         raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_value)
@@ -63,30 +67,40 @@ def _timeout_runner(timeout_value: float = 600.0):
     return _runner
 
 
-# -- アダプタ仕様: 共通ハーネスが各アダプタを駆動するのに必要な最小情報 --------
+# -- Adapter spec: minimal data the shared harness needs to drive adapters --------
 
 
 @dataclass(frozen=True)
 class AdapterSpec:
-    """1 つの act アダプタを共通契約テストに載せるための記述。
+    """Description for adding one act adapter to the shared contract tests.
 
     Attributes:
-        name: parametrize の id(``"claude_code"`` など)。
-        act_cls: アダプタ本体(``runner=`` と ``<bin>_bin=`` を受ける ``@dataclass``)。
-        result_cls: 観測オブジェクトの型(``ActResultBase`` を継承し ``ActResult`` 適合)。
-        mock_cls: subprocess を使わない Mock(``responses=`` を受ける)。
-        parse_tokens: そのアダプタの token 解析関数(意味論はアダプタ固有)。
-        bin_kwarg: 実行ファイルを差し替える引数名(``"claude_bin"`` / ``"codex_bin"``)。
-        success_stdout: 成功時の生 stdout サンプル(本文 ``success_text`` を含む)。
-        success_text: ``success_stdout`` から取り出されるべき応答本文。
-        success_tokens: ``success_stdout`` から計上されるべきトークン総数。
-        token_guard_stdout: **素朴な合算なら過大計上されうる** usage サンプル
-            (codex は部分集合キー cached/reasoning を含み、claude は除外対象の
-            cache_read を巨大値で含む。アダプタごとに「足し方を間違えると総量がずれる」形)。
-        token_guard_expected: そのアダプタの意味論で正しいトークン総数
-            (二重計上していたら不一致になる; Issue #55 の bug class を catch)。
-        expects_devnull: ``__call__`` が ``stdin=DEVNULL`` を渡すべきか
-            (対話入力を読む CLI のハング防止)。
+        name: Parametrize id (such as ``"claude_code"``).
+        act_cls: Adapter implementation (a ``@dataclass`` accepting ``runner=``
+            and ``<bin>_bin=``).
+        result_cls: Observed object type (inherits ``ActResultBase`` and
+            conforms to ``ActResult``).
+        mock_cls: Mock that does not use subprocess (accepts ``responses=``).
+        parse_tokens: Token parser for that adapter (semantics are
+            adapter-specific).
+        bin_kwarg: Argument name for replacing the executable
+            (``"claude_bin"`` / ``"codex_bin"``).
+        success_stdout: Raw stdout sample for success (contains
+            ``success_text`` in the body).
+        success_text: Response body that should be extracted from
+            ``success_stdout``.
+        success_tokens: Total token count that should be accounted from
+            ``success_stdout``.
+        token_guard_stdout: Usage sample that **could be over-counted by naive
+            summation** (codex includes subset keys cached/reasoning, while
+            claude includes the excluded cache_read field with a huge value.
+            Each adapter's sample is shaped so an incorrect summation changes
+            the total).
+        token_guard_expected: Correct total token count under that adapter's
+            semantics (double-counting makes this mismatch; catches the Issue
+            #55 bug class).
+        expects_devnull: Whether ``__call__`` should pass ``stdin=DEVNULL``
+            (prevents CLIs that read interactive input from hanging).
     """
 
     name: str
@@ -103,13 +117,13 @@ class AdapterSpec:
     expects_devnull: bool
 
     def make_act(self, **kwargs: Any):
-        """テスト用にアダプタを生成する小ヘルパ(``runner`` 等をそのまま渡す)。"""
+        """Small test helper that creates an adapter, passing ``runner`` etc. through."""
         return self.act_cls(**kwargs)
 
 
-# Claude Code: usage の input/output/cache_creation は計上するが cache_read は
-# token-cost ポリシで **除外** する(コストが軽く累積で膨らむ; Issue #55)。
-# success の総量は 100+40+10=150(cache_read=5 は計上しない)。
+# Claude Code: count usage input/output/cache_creation but **exclude** cache_read
+# by token-cost policy (low cost but grows cumulatively; Issue #55). The success
+# total is 100+40+10=150 (cache_read=5 is not counted).
 _CLAUDE_SUCCESS = (
     '{"type": "result", "subtype": "success", "is_error": false, '
     '"result": "done fixing", '
@@ -117,9 +131,9 @@ _CLAUDE_SUCCESS = (
     '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 5}}'
 )
 
-# token_guard: cache_read を **わざと巨大(999999)** にして、誤って合算したら
-# 150 に絶対一致しないようにする(Issue #55 の cache_read 累積 bug を強く検出する。
-# codex が部分集合キーを 9999/8888 にするのと同じ狙い)。
+# token_guard: make cache_read **intentionally huge (999999)** so an incorrect
+# summation can never match 150. This strongly detects the Issue #55 cumulative
+# cache_read bug, with the same intent as codex using 9999/8888 for subset keys.
 _CLAUDE_TOKEN_GUARD = (
     '{"type": "result", "subtype": "success", "is_error": false, '
     '"result": "done fixing", '
@@ -127,10 +141,10 @@ _CLAUDE_TOKEN_GUARD = (
     '"cache_creation_input_tokens": 10, "cache_read_input_tokens": 999999}}'
 )
 
-# Codex: cached_input_tokens は input の、reasoning_output_tokens は output の
-# 部分集合。総量は input+output のみ(100+40=140)。token_guard では部分集合を
-# わざと巨大(9999/8888)にして、合算してしまえば 140 に決して一致しないようにする
-# (= 二重計上の回帰を強く検出する)。
+# Codex: cached_input_tokens is a subset of input, and reasoning_output_tokens is
+# a subset of output. The total is only input+output (100+40=140). In
+# token_guard, make the subset values intentionally huge (9999/8888) so summing
+# them can never match 140 (= strongly detects double-counting regressions).
 _CODEX_SUCCESS = "\n".join(
     [
         '{"type":"thread.started","thread_id":"abc"}',
@@ -158,8 +172,8 @@ ADAPTER_SPECS = [
         success_text="done fixing",
         success_tokens=150,
         token_guard_stdout=_CLAUDE_TOKEN_GUARD,
-        token_guard_expected=150,  # cache_read(=999999)は計上しない(cost ポリシ)。
-        expects_devnull=False,  # claude は stdin を明示せず継承する。
+        token_guard_expected=150,  # cache_read(=999999) is not counted (cost policy).
+        expects_devnull=False,  # claude inherits stdin without setting it explicitly.
     ),
     AdapterSpec(
         name="codex",
@@ -172,25 +186,25 @@ ADAPTER_SPECS = [
         success_text="done fixing",
         success_tokens=140,
         token_guard_stdout=_CODEX_TOKEN_GUARD,
-        token_guard_expected=140,  # 部分集合(cached/reasoning)を除外する。
-        expects_devnull=True,  # codex は stdin=DEVNULL で誤読/ハングを防ぐ。
+        token_guard_expected=140,  # exclude subset fields (cached/reasoning).
+        expects_devnull=True,  # codex uses stdin=DEVNULL to prevent misreads/hangs.
     ),
 ]
 
 
 @pytest.fixture(params=ADAPTER_SPECS, ids=lambda spec: spec.name)
 def adapter_spec(request) -> AdapterSpec:
-    """登録済み全アダプタを横断 parametrize する fixture。"""
+    """Fixture that parametrizes across all registered adapters."""
     return request.param
 
 
 @pytest.fixture
 def make_runner() -> Callable[..., Any]:
-    """``CompletedProcess`` を返すフェイク runner のファクトリ(``.calls`` 記録付き)。"""
+    """Factory for fake runners that return ``CompletedProcess`` and record ``.calls``."""
     return _completed
 
 
 @pytest.fixture
 def make_timeout_runner() -> Callable[..., Any]:
-    """``TimeoutExpired`` を送出するフェイク runner のファクトリ。"""
+    """Factory for fake runners that raise ``TimeoutExpired``."""
     return _timeout_runner

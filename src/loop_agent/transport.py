@@ -1,36 +1,56 @@
-"""wake 配送の transport 層: push 一次 / pull fallback / at-most-once (Issue #23)。
+"""Transport layer for wake delivery: push first / pull fallback / at-most-once (Issue #23).
 
-report.md S3.3 / S4.6 / S5 Phase3。ループの **完了 / 次反復 / 判断要求** を別ループや
-窓口 (受信側) に届ける wake 配送の実体をここに新設する。claude-org runtime の broker
-sidecar は runtime 所属で直接再利用できない[^pattern-only]ため、**パターンだけ抽出** して
-loop-agent 側に依存ゼロ (stdlib のみ) で実装する。
+report.md S3.3 / S4.6 / S5 Phase3. This module adds the concrete wake delivery
+mechanism that sends loop **completion / next iteration / decision request** events
+to another loop or a gateway (receiver). The claude-org runtime broker sidecar
+belongs to that runtime and cannot be reused directly[^pattern-only], so this
+implementation extracts only the **pattern** and keeps loop-agent dependency-free
+(stdlib only).
 
-抽出したパターン (出典 ``knowledge/curated/broker-transport.md`` / backend 契約):
+[^pattern-only]: The runtime-specific broker implementation is not imported or
+    wrapped here; only its delivery pattern is mirrored in this module.
 
-- **push 一次 / pull fallback** (report.md S3.3)。push (in-band 注入) は *即応 accelerator*、
-  pull poll が *正準配送路* (backend 中立・割り込み hazard 無し)。push が失効/不通でも
-  受信側が役割 cadence で能動 poll すれば配送は途切れない。本層はこの非対称を素直に写し、
-  「backend 不通でも pull fallback で配送継続」(report.md S5 Phase3 成功条件 b) を成立させる。
-- **三状態 claim-then-confirm による at-most-once** (broker lost-message-window 知見)。
-  単一の ``delivered`` boolean は「配達済みフラグは立つが受信側に届いていない」喪失窓を持つ。
-  これを ``UNDELIVERED -> CLAIMED(lease, owner) -> DELIVERED`` の daemon 所有三状態 +
-  claim-then-confirm で塞ぐ: claim で行を lease 占有して返し、受信側が処理し切ってから confirm で
-  DELIVERED 化する。confirm 前に lease が失効した行は UNDELIVERED へ戻す (再 eligible)。
-  確定 (DELIVERED) は ``owner`` 一致 + lease 未失効を要求する fencing で守られ、確定済みは
-  二度と再配達しない (at-most-once)。同一 recipient を複数 worker で並行 poll する場合は
-  worker ごとに distinct な ``owner`` を渡すこと (owner fencing が二重確定を弾く前提)。
-- **role 別 cadence** (broker pull-first 知見)。push が失効する pull 環境では「待機」は idle 待機
-  ではなく *能動 poll* に翻訳する。受信契機を役割別に非対称設計する (dispatcher 3m / worker
-  bounded / secretary turn-prologue)。:data:`CADENCE_SECONDS` / :func:`due_to_poll` がその最小形。
+Extracted patterns (source: ``knowledge/curated/broker-transport.md`` / backend
+contract):
 
-設計の境界 (report.md S6「transport の runtime 依存」):
+- **push first / pull fallback** (report.md S3.3). push (in-band injection) is a
+  *low-latency accelerator*, while pull polling is the *canonical delivery path*
+  (backend-neutral and free of interruption hazards). Even if push expires or is
+  unavailable, delivery continues as long as the receiver actively polls at its
+  role cadence. This layer directly models that asymmetry and satisfies "delivery
+  continues through pull fallback even when the backend is unavailable" (report.md
+  S5 Phase3 success criterion b).
+- **at-most-once through three-state claim-then-confirm** (broker
+  lost-message-window finding). A single ``delivered`` boolean has a loss window
+  where the "delivered" flag is set even though the receiver never got the wake.
+  The daemon-owned three-state model
+  ``UNDELIVERED -> CLAIMED(lease, owner) -> DELIVERED`` plus claim-then-confirm
+  closes that window: claim returns a row while holding it by lease, and the
+  receiver confirms it as DELIVERED only after processing finishes. Rows whose
+  lease expires before confirm return to UNDELIVERED (eligible again). Finalization
+  (DELIVERED) is protected by fencing that requires matching ``owner`` and an
+  unexpired lease, and finalized rows are never redelivered (at-most-once). When
+  polling the same recipient concurrently with multiple workers, pass a distinct
+  ``owner`` per worker (owner fencing assumes this to reject double finalization).
+- **role-specific cadence** (broker pull-first finding). In pull environments
+  where push can expire, "waiting" is translated into *active polling* rather than
+  idle waiting. Receive triggers are designed asymmetrically by role (dispatcher
+  3m / worker bounded / secretary turn-prologue). :data:`CADENCE_SECONDS` /
+  :func:`due_to_poll` is the minimal form of that pattern.
 
-- runtime 非依存・自己完結。``pane`` / ``tmux`` / ``renga`` / ``broker`` CLI に一切依存しない。
-  push backend は :class:`PushBackend` Protocol の注入で差し替え可能にし (best-effort ``bool``
-  契約は ``tools/peer_notify.py`` から踏襲)、配送の正本 (queue) は backend と独立に持つ。
-- 受信側は **idempotent handler 前提**。wake は :attr:`Wake.id` で同一性を持ち、二重 enqueue は
-  no-op、push/pull の継ぎ目で稀に二重配送が起きても受信側は id で de-dup できる (report.md の
-  「残余窓は at-least-once + 冪等表示で許容、idle-wake では喪失 > 重複表示」方針)。
+Design boundaries (report.md S6 "runtime dependency of transport"):
+
+- Runtime-independent and self-contained. This module does not depend on ``pane``,
+  ``tmux``, ``renga``, or the ``broker`` CLI. The push backend is replaceable by
+  injecting the :class:`PushBackend` Protocol (following the best-effort ``bool``
+  contract from ``tools/peer_notify.py``), while the source of truth for delivery
+  (the queue) is owned independently from the backend.
+- Receivers are assumed to use **idempotent handlers**. A wake is identified by
+  :attr:`Wake.id`; duplicate enqueue is a no-op, and even if a rare duplicate
+  delivery occurs at the push/pull boundary, the receiver can de-dup by id
+  (following report.md's policy that the remaining window is acceptable as
+  at-least-once + idempotent display, and for idle-wake loss is worse than
+  duplicate display).
 """
 
 from __future__ import annotations
@@ -46,16 +66,16 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protoco
 
 from .errors import ConfigError
 
-# -- wake 種別 (report.md S5 Phase3「ループの完了/次反復/判断要求の wake を配送」) ---------
+# -- wake kinds (report.md S5 Phase3 "deliver wakes for loop completion/next iteration/decision request") ---------
 #
-# 読み手が文字列リテラルを散在させずに filter / dispatch できるよう定数化する。
-WAKE_LOOP_DONE = "loop_done"  # ループが終了した (goal_met / stopped)。
-WAKE_NEXT_ITERATION = "next_iteration"  # 次反復へ進む / 次タスクを起こす。
-WAKE_DECISION_REQUEST = "decision_request"  # 不可逆 action の人間判断を要求 (人間ゲート)。
+# Constants let readers filter / dispatch without scattering string literals.
+WAKE_LOOP_DONE = "loop_done"  # The loop ended (goal_met / stopped).
+WAKE_NEXT_ITERATION = "next_iteration"  # Advance to the next iteration / wake the next task.
+WAKE_DECISION_REQUEST = "decision_request"  # Request human judgment for an irreversible action (human gate).
 
 WAKE_KINDS = (WAKE_LOOP_DONE, WAKE_NEXT_ITERATION, WAKE_DECISION_REQUEST)
 
-# 受信側の配送状態 (三状態)。daemon (= 本 queue) が所有する。
+# Receiver-side delivery states (three states). Owned by the daemon (= this queue).
 UNDELIVERED = "undelivered"
 CLAIMED = "claimed"
 DELIVERED = "delivered"
@@ -63,13 +83,14 @@ DELIVERED = "delivered"
 
 @dataclass(frozen=True)
 class Wake:
-    """配送する 1 件の wake。
+    """One wake to deliver.
 
-    ``id`` は **配送の同一性** であり at-most-once / de-dup の鍵。ループ wake では
-    ``f"{run_id}:{kind}:{iteration}"`` のような決定的 id を与えると、resume での再配送や
-    push/pull の継ぎ目での二重配送を受信側が id で de-dup できる (同一 id の二重 enqueue は
-    no-op になる)。``recipient`` は宛先 (role 名や peer id)。``payload`` は kind 固有の
-    補足情報 (終了理由・gate_key 等)。
+    ``id`` is the **delivery identity** and the key for at-most-once / de-dup.
+    For loop wakes, using a deterministic id such as
+    ``f"{run_id}:{kind}:{iteration}"`` lets receivers de-dup resume redelivery or
+    push/pull boundary duplicates by id (duplicate enqueue of the same id is a
+    no-op). ``recipient`` is the destination (role name or peer id). ``payload``
+    carries kind-specific supplemental information (finish reason, gate_key, etc.).
     """
 
     id: str
@@ -79,13 +100,15 @@ class Wake:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON 化しやすいフラットな dict へ畳む (sink / backend のシリアライズ用)。
+        """Flatten into a dict that is easy to encode as JSON (for sink / backend serialization).
 
-        ``payload`` を先に展開し、正準フィールド (``id`` / ``kind`` / ``recipient`` /
-        ``run_id``) を **後勝ち** で上書きする。これにより payload に同名キーが紛れ込んでも、
-        de-dup / routing の正本である正準フィールドが必ず保たれる (payload 由来の ``id`` が
-        queue の de-dup 鍵と食い違って別宛先へ送られる、といった事故を防ぐ)。同名 payload キーは
-        正準値に隠れる (予約名は正準が勝つ、という契約)。
+        ``payload`` is expanded first, then canonical fields (``id`` / ``kind`` /
+        ``recipient`` / ``run_id``) overwrite it with **last value wins** semantics.
+        This guarantees canonical fields, the source of truth for de-dup / routing,
+        are preserved even if payload contains the same keys (preventing cases such
+        as a payload-derived ``id`` disagreeing with the queue de-dup key and being
+        sent to another destination). Same-name payload keys are hidden by canonical
+        values (the contract is that canonical fields win for reserved names).
         """
         return {
             **dict(self.payload),
@@ -98,13 +121,15 @@ class Wake:
 
 @runtime_checkable
 class PushBackend(Protocol):
-    """push (一次・即応 accelerator) の最小の口。
+    """Minimal interface for push (primary low-latency accelerator).
 
-    ``push(wake) -> bool`` は **best-effort** (``tools/peer_notify.py`` の bool 契約を踏襲):
-    確定配送できたときだけ ``True``、それ以外 (backend 不通・タイムアウト・宛先不在 等) は
-    ``False`` を返す。例外を投げてもよい (:class:`Transport` が握って ``False`` 扱いにする) が、
-    理想的には投げず ``False`` を返すこと。``True`` を返せなかった wake は queue に残り、
-    受信側の pull poll が拾う (= pull fallback)。
+    ``push(wake) -> bool`` is **best-effort** (following the bool contract from
+    ``tools/peer_notify.py``): return ``True`` only when delivery is finalized;
+    return ``False`` for anything else (backend unavailable, timeout, missing
+    recipient, etc.). Implementations may raise (:class:`Transport` catches that
+    and treats it as ``False``), but ideally should return ``False`` instead. Wakes
+    that do not return ``True`` remain in the queue and are picked up by the
+    receiver's pull poll (= pull fallback).
     """
 
     def push(self, wake: Wake) -> bool:
@@ -112,7 +137,7 @@ class PushBackend(Protocol):
 
 
 class CallablePushBackend:
-    """任意の ``callable(Wake) -> bool`` を :class:`PushBackend` に適合させる薄いアダプタ。"""
+    """Thin adapter that makes any ``callable(Wake) -> bool`` fit :class:`PushBackend`."""
 
     def __init__(self, fn: Callable[[Wake], bool]) -> None:
         self._fn = fn
@@ -122,11 +147,12 @@ class CallablePushBackend:
 
 
 class NullPushBackend:
-    """常に push 失敗する backend (= backend 不通の明示モデル)。
+    """Backend that always fails push (= explicit model of an unavailable backend).
 
-    push 一次を持たない / backend がダウンしている構成を表す。すべての wake は queue に
-    残り pull fallback だけで配送される。「backend 不通でも pull fallback で配送継続」の
-    既定構成であり、テストの基準にもなる。
+    Represents configurations with no primary push path or a down backend. All
+    wakes remain in the queue and are delivered only through pull fallback. This is
+    the default configuration for "delivery continues through pull fallback even
+    when the backend is unavailable" and also serves as the test baseline.
     """
 
     def push(self, wake: Wake) -> bool:
@@ -135,7 +161,7 @@ class NullPushBackend:
 
 @dataclass
 class _Entry:
-    """queue 内の 1 wake の配送状態 (三状態 + lease 所有権)。"""
+    """Delivery state for one wake in the queue (three states + lease ownership)."""
 
     wake: Wake
     seq: int
@@ -146,11 +172,12 @@ class _Entry:
 
 @runtime_checkable
 class WakeQueue(Protocol):
-    """配送の正本 (durable spine)。三状態 claim-then-confirm を提供する。
+    """Source of truth for delivery (durable spine). Provides three-state claim-then-confirm.
 
-    :class:`Transport` は backend (push) とは独立にこの queue を正本として持つ。push が
-    確定配送できなくても wake は queue に残り、受信側の :meth:`claim` -> :meth:`confirm` で
-    pull 配送される。
+    :class:`Transport` owns this queue as the source of truth independently from
+    the backend (push). Even if push cannot finalize delivery, the wake remains in
+    the queue and is delivered by the receiver's :meth:`claim` -> :meth:`confirm`
+    pull path.
     """
 
     def enqueue(self, wake: Wake) -> bool:
@@ -178,43 +205,56 @@ class WakeQueue(Protocol):
 
 
 class InMemoryWakeQueue:
-    """:class:`WakeQueue` のインメモリ実装 (三状態 claim-then-confirm)。
+    """:class:`WakeQueue` in-memory implementation (three-state claim-then-confirm).
 
-    ループ自身のプロセス内で wake を保持する既定の queue。``state.db`` 永続化を別途
-    被せたいときは同じ :class:`WakeQueue` Protocol を SQLite で実装すればよい (本 PoC は
-    インメモリで at-most-once / fallback のセマンティクスを実証する)。
+    The default queue that keeps wakes inside the loop process itself. If separate
+    ``state.db`` persistence is needed, implement the same :class:`WakeQueue`
+    Protocol with SQLite (this PoC demonstrates the at-most-once / fallback
+    semantics in memory).
 
-    状態遷移 (daemon 所有・行レベル所有権で single-drainer 性を担保):
+    State transitions (daemon-owned, row-level ownership preserves single-drainer
+    behavior):
 
-    - ``enqueue`` : 同一 ``id`` が既にあれば no-op (二重 enqueue 冪等 = de-dup の土台)。
-    - ``claim``   : 期限切れ lease を回収してから、宛先の ``UNDELIVERED`` を seq 順に
-      ``CLAIMED`` (owner + lease_expiry) にして返す。
-    - ``confirm`` : ``CLAIMED`` かつ **owner が claim 時のまま** で、かつ lease 未失効なら
-      ``DELIVERED`` (terminal) にする。lease 失効後に別 owner が再 claim した行への stale な
-      confirm は owner 不一致で弾く (fencing) ので、喪失窓で「届いていないのに DELIVERED」化
-      しない (前提: 並行 poll は distinct owner を使う。:meth:`~loop_agent.transport.Transport.poll` 参照)。
-    - ``release_expired`` : lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻す (再 eligible)。
-    - ``mark_delivered`` : push が確定配送した wake を直接 ``DELIVERED`` (terminal) にする。
-      任意の非 terminal 状態から冪等に遷移できる (push と pull の継ぎ目を吸収)。
+    - ``enqueue`` : no-op if the same ``id`` already exists (idempotent duplicate
+      enqueue = foundation for de-dup).
+    - ``claim``   : reclaim expired leases, then return destination-matching
+      ``UNDELIVERED`` rows in seq order after marking them ``CLAIMED`` (owner +
+      lease_expiry).
+    - ``confirm`` : if the row is ``CLAIMED``, **owner is still the claim-time
+      owner**, and the lease has not expired, mark it ``DELIVERED`` (terminal).
+      A stale confirm for a row that another owner re-claimed after lease expiry is
+      rejected by owner mismatch (fencing), so the loss window cannot mark a wake
+      "DELIVERED even though it was not received" (assumption: concurrent pollers
+      use distinct owners; see :meth:`~loop_agent.transport.Transport.poll`).
+    - ``release_expired`` : return expired ``CLAIMED`` rows to ``UNDELIVERED``
+      (eligible again).
+    - ``mark_delivered`` : directly mark a wake whose push was finalized as
+      ``DELIVERED`` (terminal). It transitions only from ``UNDELIVERED`` and
+      returns ``False`` for ``CLAIMED`` so it does not steal an active pull claim
+      (absorbing the push/pull boundary without breaking lease recovery).
 
-    **スレッド安全**: 同一 recipient を複数 worker (スレッド) で並行 poll しても二重 claim が
-    起きないよう、状態を変える操作 (enqueue/claim/confirm/release_expired/mark_delivered) と
-    読み出しを 1 つの再入可能ロックで直列化する (check-and-set を atomic にする)。``claim`` は
-    内部で ``release_expired`` を呼ぶため :class:`threading.RLock` (再入可) を使う。これにより
-    並行 poller の owner fencing と at-most-once claim が実際に成立する。
+    **Thread safety**: To prevent double claim when multiple workers (threads) poll
+    the same recipient concurrently, all state-changing operations
+    (enqueue/claim/confirm/release_expired/mark_delivered) and reads are serialized
+    with one reentrant lock (making check-and-set atomic). ``claim`` uses
+    :class:`threading.RLock` (reentrant) because it calls ``release_expired``
+    internally. This makes concurrent poller owner fencing and at-most-once claim
+    hold in practice.
     """
 
     def __init__(self) -> None:
         self._entries: dict[str, _Entry] = {}
         self._seq = 0
-        # 状態遷移を直列化する再入可能ロック (claim -> release_expired の再入のため RLock)。
+        # Reentrant lock that serializes state transitions (RLock for claim -> release_expired reentry).
         self._lock = threading.RLock()
 
     def enqueue(self, wake: Wake) -> bool:
-        """wake を ``UNDELIVERED`` で登録する。同一 ``id`` が既にあれば no-op で ``False``。
+        """Register a wake as ``UNDELIVERED``. If the same ``id`` already exists, no-op and return ``False``.
 
-        二重 enqueue を冪等にすることで、deliver の再試行や resume での再配送指示が
-        既存行 (進行中の claim や DELIVERED) を壊さない (= 人間/受信側に二重に届けない土台)。
+        Making duplicate enqueue idempotent means deliver retries or resume
+        redelivery requests do not disturb existing rows (in-progress claims or
+        DELIVERED rows), which is the foundation for avoiding duplicate delivery to
+        humans / receivers.
         """
         if not wake.id:
             raise ConfigError("enqueue: Wake.id must be a non-empty string")
@@ -226,12 +266,13 @@ class InMemoryWakeQueue:
             return True
 
     def release_expired(self, *, now: float) -> int:
-        """lease 失効した ``CLAIMED`` を ``UNDELIVERED`` へ戻し、戻した件数を返す。
+        """Return expired ``CLAIMED`` rows to ``UNDELIVERED`` and return the count.
 
-        confirm 前に受信側が死ぬ (claim と confirm の間で crash) と CLAIMED のまま滞留する。
-        lease 失効でこれを再 eligible に戻すことで、配送は止まらず再 claim される
-        (at-least-once 側に倒す: idle-wake では喪失 > 重複)。``owner`` を ``None`` に戻し、
-        古い owner の遅延 confirm を確実に弾く。
+        If the receiver dies before confirm (crashes between claim and confirm),
+        the wake remains CLAIMED. Lease expiry makes it eligible again, so delivery
+        does not stop and it can be re-claimed (falling back toward at-least-once:
+        for idle-wake, loss is worse than duplication). ``owner`` is reset to
+        ``None`` to reliably reject delayed confirms from the old owner.
         """
         with self._lock:
             released = 0
@@ -251,12 +292,13 @@ class InMemoryWakeQueue:
         owner: str,
         limit: Optional[int] = None,
     ) -> list[Wake]:
-        """``recipient`` 宛の ``UNDELIVERED`` wake を lease 占有して返す (pull の claim)。
+        """Claim ``UNDELIVERED`` wakes for ``recipient`` by lease and return them (pull claim).
 
-        まず期限切れ lease を回収 (:meth:`release_expired`) してから、宛先一致の
-        ``UNDELIVERED`` を **登録順 (seq)** に最大 ``limit`` 件 ``CLAIMED`` にする。各行に
-        ``owner`` と ``now + lease`` の期限を刻む。返した wake は呼び出し側が処理し切ってから
-        :meth:`confirm` で確定する (claim-then-confirm)。
+        First reclaim expired leases (:meth:`release_expired`), then mark up to
+        ``limit`` destination-matching ``UNDELIVERED`` rows as ``CLAIMED`` in
+        **registration order (seq)**. Each row records ``owner`` and the
+        ``now + lease`` deadline. The caller finalizes returned wakes with
+        :meth:`confirm` only after processing them fully (claim-then-confirm).
         """
         if lease <= 0:
             raise ConfigError("claim: lease must be > 0")
@@ -274,12 +316,14 @@ class InMemoryWakeQueue:
             return out
 
     def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
-        """claim 済み wake を ``DELIVERED`` (terminal) に確定する。
+        """Finalize a claimed wake as ``DELIVERED`` (terminal).
 
-        ``CLAIMED`` かつ現在の ``owner`` が claim 時の owner と一致し、かつ lease 未失効の
-        ときだけ確定して ``True`` を返す。それ以外 (既に DELIVERED / owner 不一致 = lease
-        失効後に別者が再 claim / lease 失効済み / 不在) は ``False``。この owner + 失効チェックが
-        fencing として効き、喪失窓で stale な claim 者が誤って DELIVERED 化するのを防ぐ。
+        Finalizes and returns ``True`` only if the wake is ``CLAIMED``, the current
+        ``owner`` matches the owner from claim time, and the lease has not expired.
+        Everything else (already DELIVERED / owner mismatch = another party
+        re-claimed after lease expiry / lease expired / missing) returns ``False``.
+        This owner + expiry check acts as fencing and prevents a stale claimant
+        from incorrectly marking a wake DELIVERED in the loss window.
         """
         with self._lock:
             e = self._entries.get(wake_id)
@@ -290,41 +334,46 @@ class InMemoryWakeQueue:
             if e.owner != owner:
                 return False
             if e.lease_expiry <= now:
-                # lease 失効: この claim はもう有効でない。release_expired で UNDELIVERED へ
-                # 戻る (まだ戻っていなくても) ので、ここで DELIVERED 化はしない。
+                # Lease expired: this claim is no longer valid. release_expired will
+                # return it to UNDELIVERED (even if it has not yet), so do not mark
+                # it DELIVERED here.
                 return False
             e.state = DELIVERED
             e.owner = None
             return True
 
     def mark_delivered(self, wake_id: str) -> bool:
-        """``UNDELIVERED`` の wake を直接 ``DELIVERED`` (terminal) にする (push 確定配送の確定)。
+        """Directly mark an ``UNDELIVERED`` wake as ``DELIVERED`` (terminal) for finalized push delivery.
 
-        push backend が ``True`` (確定配送) を返したときに使う。**``UNDELIVERED`` のときだけ**
-        遷移し、遷移できたら ``True``、それ以外 (既に ``DELIVERED`` / ``CLAIMED`` / 不在) は
-        ``False`` を返す。
+        Used when the push backend returns ``True`` (finalized delivery). It
+        transitions **only from ``UNDELIVERED``** and returns ``True`` if it could
+        transition; otherwise (already ``DELIVERED`` / ``CLAIMED`` / missing) it
+        returns ``False``.
 
-        ``CLAIMED`` を **奪わない** のが要点: push の I/O 中 (queue ロック外) に別の poller が
-        同じ wake を claim しうる。そこで無条件に DELIVERED 化すると active claim の owner を
-        消し、その poller が confirm 前にクラッシュしても lease 失効で再 eligible に戻れず
-        **wake を喪失** する (claim-then-confirm の crash recovery 破壊)。push と pull が同じ
-        wake を競合した場合は **pull claim を配送の主体** とし、push 側は既配送の重複として
-        受信側の id de-dup に委ねる (at-least-once。喪失 > 重複の方針)。push が DELIVERED 化
-        できた行は UNDELIVERED でないため pull は claim しない (継ぎ目を吸収)。
+        The key point is **not stealing ``CLAIMED``**: another poller can claim the
+        same wake while push I/O is running (outside the queue lock). If this
+        unconditionally marked it DELIVERED, it would clear the active claim's
+        owner, and if that poller crashed before confirm, lease expiry could not
+        make it eligible again, **losing the wake** (breaking claim-then-confirm
+        crash recovery). When push and pull race for the same wake, the **pull
+        claim is the delivery owner** and the push side is treated as a possible
+        duplicate that receiver id de-dup handles (at-least-once; loss > duplicate).
+        Rows push successfully marks DELIVERED are no longer UNDELIVERED, so pull
+        will not claim them (absorbing the boundary).
         """
         with self._lock:
             e = self._entries.get(wake_id)
             if e is None:
                 return False
             if e.state != UNDELIVERED:
-                # 既に DELIVERED、または別 poller が claim 済み (CLAIMED)。claim は奪わない。
+                # Already DELIVERED, or already claimed by another poller (CLAIMED). Do not steal the claim.
                 return False
             e.state = DELIVERED
             e.owner = None
             return True
 
     def pending(self, recipient: Optional[str] = None) -> list[Wake]:
-        """未確定 (``UNDELIVERED`` / ``CLAIMED``) の wake を登録順に返す (任意で宛先で絞る)。"""
+        """Return unfinalized (``UNDELIVERED`` / ``CLAIMED``) wakes in registration order, optionally filtered by recipient."""
         with self._lock:
             out: list[Wake] = []
             for e in sorted(self._entries.values(), key=lambda x: x.seq):
@@ -336,41 +385,43 @@ class InMemoryWakeQueue:
             return out
 
     def state_of(self, wake_id: str) -> Optional[str]:
-        """``wake_id`` の現在の配送状態を返す (無ければ ``None``)。テスト/内省用。"""
+        """Return the current delivery state for ``wake_id`` (or ``None`` if missing). For tests/introspection."""
         with self._lock:
             e = self._entries.get(wake_id)
             return e.state if e is not None else None
 
 
-# 役割別 poll cadence (秒)。report.md S3.2 / broker pull-first 知見の非対称設計。
-# push が失効する pull 環境では「待機」を idle 待機ではなく能動 poll に翻訳する。
+# Role-specific poll cadence (seconds). Asymmetric design from report.md S3.2 /
+# broker pull-first findings.
+# In pull environments where push can expire, "waiting" is translated into active
+# polling rather than idle waiting.
 #
-# - dispatcher : 監視 /loop 3m 相当 = 180s 間隔で能動 poll。
-# - worker     : 完了報告後の bounded review-watch 相当 = 短間隔 poll。
-# - secretary  : 人間対話主体で blocking poll 不可 -> ターン冒頭で毎回 poll (0 = 常に due)。
+# - dispatcher : monitoring /loop 3m equivalent = active poll every 180s.
+# - worker     : bounded review-watch after completion report = short-interval poll.
+# - secretary  : human-dialogue-centered, cannot block poll -> poll at every turn prologue (0 = always due).
 CADENCE_SECONDS: dict[str, float] = {
     "dispatcher": 180.0,
     "worker": 60.0,
     "secretary": 0.0,
 }
 
-# 未知 role の既定 cadence (保守的に worker 相当)。
+# Default cadence for unknown roles (conservatively worker-equivalent).
 DEFAULT_CADENCE_SECONDS = 60.0
 
 
 def cadence_for(role: str) -> float:
-    """``role`` の poll 間隔 (秒) を返す。未知 role は :data:`DEFAULT_CADENCE_SECONDS`。"""
+    """Return the poll interval (seconds) for ``role``. Unknown roles use :data:`DEFAULT_CADENCE_SECONDS`."""
     return CADENCE_SECONDS.get(role, DEFAULT_CADENCE_SECONDS)
 
 
 def due_to_poll(role: str, last_poll: Optional[float], now: float) -> bool:
-    """``role`` が ``now`` 時点で能動 poll すべきかを返す。
+    """Return whether ``role`` should actively poll at ``now``.
 
-    ``last_poll`` が ``None`` (一度も poll していない) なら常に due。それ以外は
-    ``now - last_poll >= cadence_for(role)`` で判定する。cadence が ``0`` (secretary:
-    ターン冒頭で毎回 poll) の role は常に due になる。受信側の poll ループが「自分の番か」を
-    判断する最小ヘルパで、idle 待機を能動 poll に翻訳するパターンの核 (報告 prose の「待機」を
-    pull 環境で能動 poll ループへ写す)。
+    If ``last_poll`` is ``None`` (never polled), it is always due. Otherwise this
+    checks ``now - last_poll >= cadence_for(role)``. Roles with cadence ``0``
+    (secretary: poll at every turn prologue) are always due. This is the minimal
+    helper for receiver poll loops to decide "is it my turn?", and it is the core
+    pattern that translates idle waiting into active polling in pull environments.
     """
     if last_poll is None:
         return True
@@ -378,17 +429,19 @@ def due_to_poll(role: str, last_poll: Optional[float], now: float) -> bool:
 
 
 class Transport:
-    """push 一次 / pull fallback の wake 配送オーケストレータ。
+    """Wake delivery orchestrator for push first / pull fallback.
 
-    1 つの :class:`WakeQueue` (配送の正本) と任意の :class:`PushBackend` (一次・即応
-    accelerator) を束ねる。:meth:`deliver` は **まず queue に durable に積んでから** push を
-    試み、push が確定配送できたら DELIVERED 化、できなければ ``UNDELIVERED`` のまま残して
-    pull fallback に委ねる。受信側は :meth:`poll` で自分宛の wake を claim-then-confirm で
-    引き取る。
+    Binds one :class:`WakeQueue` (delivery source of truth) with an optional
+    :class:`PushBackend` (primary low-latency accelerator). :meth:`deliver`
+    **first durably enqueues into the queue**, then tries push. If push finalizes
+    delivery it marks the wake DELIVERED; otherwise it leaves the wake
+    ``UNDELIVERED`` and delegates to pull fallback. Receivers use :meth:`poll` to
+    take wakes addressed to them with claim-then-confirm.
 
-    この「正本は queue・push は accelerator」構造により、backend 不通でも
-    (:class:`NullPushBackend` でも push が常時失敗でも) 配送は pull で継続する
-    (report.md S5 Phase3 成功条件 b)。
+    This "queue is source of truth, push is accelerator" structure keeps delivery
+    going through pull even when the backend is unavailable (or
+    :class:`NullPushBackend` makes push always fail), satisfying report.md S5
+    Phase3 success criterion b.
     """
 
     def __init__(
@@ -410,50 +463,56 @@ class Transport:
             time_fn = time.monotonic
         self._time_fn = time_fn
 
-    # -- 送信側 (deliver) ----------------------------------------------------
+    # -- Sender side (deliver) ----------------------------------------------
 
     def deliver(self, wake: Wake) -> str:
-        """1 件の wake を配送する。``"push"`` (一次で確定) か ``"queued"`` (pull 待ち) を返す。
+        """Deliver one wake. Return ``"push"`` (finalized by primary path) or ``"queued"`` (waiting for pull).
 
-        手順 (正本優先): まず queue へ durable に enqueue する (push が落ちても喪失しない)。
-        backend があれば push を best-effort で試み、確定配送 (``True``) なら DELIVERED 化して
-        ``"push"`` を返す。backend 不在 / push 失敗 / push 例外なら ``UNDELIVERED`` のまま残し
-        ``"queued"`` を返す — 受信側の :meth:`poll` が pull で拾う (= fallback)。
+        Procedure (source of truth first): durably enqueue into the queue first
+        (so push failure cannot lose the wake). If a backend exists, try push
+        best-effort; if delivery is finalized (``True``), mark it DELIVERED and
+        return ``"push"``. If the backend is absent, push fails, or push raises,
+        leave it ``UNDELIVERED`` and return ``"queued"`` -- the receiver's
+        :meth:`poll` will pick it up by pull (= fallback).
 
-        同一 ``id`` の再 deliver は enqueue が no-op になり、**進行中の配送を乱さない**。
-        push を (再) 試行するのは「今回新規に積まれた」か「まだ ``UNDELIVERED`` (誰も claim
-        していない)」wake に限る:
+        Re-delivering the same ``id`` makes enqueue a no-op and **does not disturb
+        in-progress delivery**. Push is (re)tried only for wakes that were newly
+        enqueued this time or are still ``UNDELIVERED`` (not claimed by anyone):
 
-        - 既に ``DELIVERED``: 配送確定済み。push も pull も重ねない (``"push"`` を返す)。
-        - 既に ``CLAIMED``: 受信側が pull で claim 済み (confirm 待ち)。ここで push を重ねて
-          :meth:`~WakeQueue.mark_delivered` すると、owner の lease を奪って claim-then-confirm の
-          **失効再配送保護を壊す** (owner が confirm 前にクラッシュした wake が再 eligible に
-          戻らなくなる)。active claim はそのまま尊重し、配送は pull に委ねる (``"queued"``)。
-        - ``UNDELIVERED`` / 内省不可 queue の ``None``: active claim が無いので push 再試行は
-          安全 (backend 復旧後に ``queued`` から ``push`` へ昇格できる)。
+        - Already ``DELIVERED``: delivery is finalized. Do not add another push or
+          pull delivery (return ``"push"``).
+        - Already ``CLAIMED``: the receiver has claimed it by pull (waiting for
+          confirm). Adding push and then calling :meth:`~WakeQueue.mark_delivered`
+          here would steal the owner's lease and **break expiry redelivery
+          protection** in claim-then-confirm (a wake whose owner crashed before
+          confirm would not become eligible again). Respect the active claim and
+          delegate delivery to pull (``"queued"``).
+        - ``UNDELIVERED`` / ``None`` for queues that cannot be introspected: there
+          is no active claim, so retrying push is safe (after backend recovery,
+          ``queued`` can be promoted to ``push``).
         """
         newly = self.queue.enqueue(wake)
         if not newly:
             state = _state_of(self.queue, wake.id)
             if state == DELIVERED:
-                return "push"  # 既に配送確定。再送しない。
+                return "push"  # Delivery is already finalized. Do not resend.
             if state == CLAIMED:
-                # 進行中の pull claim を尊重する (push で横取り確定しない)。
+                # Respect the in-progress pull claim (do not steal finalization by push).
                 return "queued"
-            # state は UNDELIVERED か None: active claim 無し。push 再試行は安全。
+            # state is UNDELIVERED or None: no active claim, so push retry is safe.
         if self.backend is not None and self._try_push(wake):
             self.queue.mark_delivered(wake.id)
             return "push"
         return "queued"
 
     def _try_push(self, wake: Wake) -> bool:
-        """backend.push を best-effort で呼ぶ。例外は握って ``False`` (= 未配送) 扱い。"""
+        """Call backend.push best-effort. Catch exceptions and treat them as ``False`` (= not delivered)."""
         try:
             return bool(self.backend.push(wake))  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001 - push は best-effort。失敗は pull fallback に委ねる。
+        except Exception:  # noqa: BLE001 - push is best-effort. Failures are delegated to pull fallback.
             return False
 
-    # -- 受信側 (poll) -------------------------------------------------------
+    # -- Receiver side (poll) ------------------------------------------------
 
     def poll(
         self,
@@ -463,24 +522,31 @@ class Transport:
         limit: Optional[int] = None,
         confirm: bool = False,
     ) -> list[Wake]:
-        """``recipient`` 宛の未配送 wake を pull で claim する (claim-then-confirm の claim)。
+        """Claim undelivered wakes for ``recipient`` by pull (claim step of claim-then-confirm).
 
-        ``UNDELIVERED`` な wake を lease 占有 (claim) して返す。**確定はしない** (既定
-        ``confirm=False``): 呼び出し側が wake を **処理し切ってから** :meth:`confirm_wakes` を
-        呼んで ``DELIVERED`` 化する責務を負う。処理中にクラッシュした (= confirm 前に死んだ) 場合は
-        lease 失効でその wake が再 eligible に戻り再配送される (at-least-once: idle-wake では
-        喪失 > 重複)。この claim-then-confirm が crash recovery の肝なので **既定は確定しない**。
-        確定漏れを避けたい一般ケースは :meth:`poll_and_handle` (handler 成功後に wake 単位で
-        confirm する crash-safe な受信ループ) を使うのが推奨。
+        Claims ``UNDELIVERED`` wakes by lease and returns them. It **does not
+        finalize** by default (``confirm=False``): the caller is responsible for
+        calling :meth:`confirm_wakes` to mark wakes ``DELIVERED`` **after fully
+        processing them**. If processing crashes (= dies before confirm), lease
+        expiry makes that wake eligible again and it is redelivered
+        (at-least-once: for idle-wake, loss is worse than duplication). This
+        claim-then-confirm path is the key to crash recovery, so the default is
+        **not to confirm**. For the common case that wants to avoid missed confirms,
+        prefer :meth:`poll_and_handle`, a crash-safe receive loop that confirms
+        each wake after handler success.
 
-        ``confirm=True`` を明示すると、claim した wake を **返す前に即 confirm** する (戻り値の
-        受領 = 配送完了とみなせる、handler が決して失敗しない / プロセス内自己完結な単純ケース
-        専用)。この場合 poll が返った後に処理がクラッシュしても wake は既に ``DELIVERED`` で
-        再配送されない (= その経路だけ at-most-once で喪失しうる) ことに注意。
+        If ``confirm=True`` is explicit, claimed wakes are **confirmed immediately
+        before being returned** (receiving the return value can be treated as
+        delivery complete; intended only for simple cases where the handler never
+        fails / processing is self-contained in-process). In this mode, if
+        processing crashes after poll returns, the wake is already ``DELIVERED`` and
+        will not be redelivered (= only that path can lose wakes while remaining
+        at-most-once).
 
-        ``owner`` は claim の所有者識別 (省略時は ``recipient``)。同一受信者を複数 worker で
-        並行 poll する場合は worker ごとに **distinct な owner** を渡すこと。三状態の owner
-        fencing が「lease 失効後に別 worker が再 claim した wake への stale な confirm」を弾く。
+        ``owner`` identifies the claim owner (defaults to ``recipient``). If
+        multiple workers poll concurrently for the same receiver, pass a **distinct
+        owner** per worker. The three-state owner fencing rejects "stale confirms
+        for wakes another worker re-claimed after lease expiry."
         """
         own = owner if owner is not None else recipient
         now = self._time_fn()
@@ -500,19 +566,24 @@ class Transport:
         owner: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> list[Wake]:
-        """claim -> handler(wake) -> confirm を wake 単位で行う crash-safe な受信ループ (推奨)。
+        """Crash-safe receive loop that runs claim -> handler(wake) -> confirm per wake (recommended).
 
-        各 wake を claim し、``handler(wake)`` が **例外なく返ったものだけ** confirm して
-        ``DELIVERED`` 化する。これにより「受信したが処理前に死んだ」喪失窓が無い: handler が
-        raise した wake (および以降の未処理 wake) は confirm されず、lease 失効後に再配送される
-        (at-least-once。受信側は :attr:`Wake.id` で de-dup する idempotent handler 前提)。
+        Claims each wake and confirms it as ``DELIVERED`` **only if**
+        ``handler(wake)`` returns without exception. This removes the "received but
+        died before processing" loss window: wakes whose handler raises (and later
+        unprocessed wakes) are not confirmed and are redelivered after lease expiry
+        (at-least-once; assumes the receiver uses an idempotent handler that
+        de-dups by :attr:`Wake.id`).
 
-        正常に処理・確定できた wake の list を返す。``handler`` の例外は **握り潰さず伝播** する
-        (呼び出し側が失敗を観測できる。未確定 wake は再配送で拾われる)。confirm は handler 成功
-        *後* の現在時刻で行うので、handler が lease を超えて長引いた wake は fencing で弾かれ
-        (確定されず) 再配送に回る — 長い処理には十分大きい ``lease`` を設定すること。
+        Returns the list of wakes that were processed and finalized successfully.
+        ``handler`` exceptions are **not swallowed** and propagate (the caller can
+        observe failure; unfinalized wakes are picked up by redelivery). Confirm is
+        performed at the current time *after* handler success, so wakes whose
+        handler runs longer than the lease are rejected by fencing (not finalized)
+        and redelivered -- use a large enough ``lease`` for long processing.
 
-        ``owner`` / ``limit`` の意味は :meth:`poll` と同じ (省略時 owner=recipient)。
+        ``owner`` / ``limit`` have the same meaning as :meth:`poll` (default
+        owner=recipient).
         """
         own = owner if owner is not None else recipient
         claimed = self.queue.claim(
@@ -520,17 +591,18 @@ class Transport:
         )
         handled: list[Wake] = []
         for w in claimed:
-            handler(w)  # raise すれば未 confirm のまま伝播 -> lease 失効で再配送。
+            handler(w)  # If this raises, it propagates unconfirmed -> redelivery after lease expiry.
             if self.queue.confirm(w.id, owner=own, now=self._time_fn()):
                 handled.append(w)
         return handled
 
     def confirm_wakes(self, wakes: Iterable[Wake], *, owner: str) -> int:
-        """claim 済み wake 群を確定する (:meth:`poll` を ``confirm=False`` で使ったときの確定 API)。
+        """Finalize claimed wakes (confirmation API for using :meth:`poll` with ``confirm=False``).
 
-        確定できた (この ``owner`` が lease を保持していた) 件数を返す。``owner`` は claim 時に
-        渡した値と同じものを渡すこと (省略時 owner=recipient で poll したなら recipient)。
-        lease 失効後に呼ぶと owner/失効 fencing で弾かれ、その wake は再配送対象として queue に残る。
+        Returns the count that could be finalized (this ``owner`` held the lease).
+        Pass the same ``owner`` that was used at claim time (if poll defaulted to
+        owner=recipient, pass recipient). Calls after lease expiry are rejected by
+        owner/expiry fencing, and that wake remains in the queue for redelivery.
         """
         now = self._time_fn()
         confirmed = 0
@@ -540,16 +612,18 @@ class Transport:
         return confirmed
 
     def pending(self, recipient: Optional[str] = None) -> list[Wake]:
-        """未確定 (未配送) の wake を返す (queue へ委譲)。テスト/監視用。"""
+        """Return unfinalized (undelivered) wakes by delegating to the queue. For tests/monitoring."""
         return self.queue.pending(recipient)
 
 
 def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
-    """queue の配送状態を引く (``state_of`` は :class:`WakeQueue` Protocol の一員)。
+    """Read queue delivery state (``state_of`` is part of the :class:`WakeQueue` Protocol).
 
-    Protocol は構造的で実行時強制されないため、``state_of`` を欠く非準拠 queue でも
-    :meth:`Transport.deliver` を落とさないよう getattr で防御する (欠落時は ``None`` =
-    「状態不明」扱いにし、push 重複防止の早期 return を諦めるだけで配送自体は継続する)。
+    Protocols are structural and not enforced at runtime, so use getattr to keep
+    :meth:`Transport.deliver` from failing even with a non-conforming queue that
+    lacks ``state_of`` (missing means ``None`` = "state unknown"; this only gives
+    up the early return that prevents duplicate push, while delivery itself
+    continues).
     """
     fn = getattr(queue, "state_of", None)
     if fn is None:
@@ -558,40 +632,47 @@ def _state_of(queue: WakeQueue, wake_id: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# クロスプロセス backend (Issue #41)
+# Cross-process backends (Issue #41)
 #
-# :class:`InMemoryWakeQueue` は単一プロセス内でしか正本を共有できない。別プロセスの
-# ループ / 窓口へ wake を配送するには queue の正本を **プロセス外の永続ストア** に置く必要が
-# ある。:class:`WakeQueue` Protocol は backend 中立なので、同じ三状態 claim-then-confirm
-# セマンティクスを SQLite (stdlib のみ) / Redis (optional dep) で実装すれば、:class:`Transport`
-# の Public API を一切変えずに backend を差し替えられる (in-memory が既定、明示で SQLite/Redis)。
+# :class:`InMemoryWakeQueue` can share the source of truth only inside one
+# process. To deliver wakes to loops / gateways in other processes, the queue's
+# source of truth must live in an **out-of-process durable store**. Because the
+# :class:`WakeQueue` Protocol is backend-neutral, implementing the same three-state
+# claim-then-confirm semantics in SQLite (stdlib only) / Redis (optional dep) lets
+# backends be swapped without changing the :class:`Transport` public API (in-memory
+# by default, SQLite/Redis when explicit).
 #
-# 設計判断:
+# Design decisions:
 #
-# - **serialization = JSON** (pickle ではない)。``payload`` は JSON 形 (:meth:`Wake.to_dict`
-#   が前提) で、JSON はプロセス/言語横断で安全・任意コード実行の risk が無い。``payload`` は
-#   JSON 化可能な値のみ (非対応の値は enqueue で ``ConfigError``)。
-# - **key namespace 規約**。Redis は ``{namespace}:wake:{id}`` / ``{namespace}:recipient:{r}``
-#   等で他用途のキーと衝突を避ける (namespace 既定 ``"loop_agent"``)。SQLite は table 名で
-#   分離する (既定 ``wakes``)。
-# - **TTL / cleanup**。long-running ループでは DELIVERED レコードが残留する。Redis は確定時に
-#   ``EXPIRE`` で自動失効 (``delivered_ttl``)、SQLite は :meth:`SqliteWakeQueue.purge_delivered`
-#   で明示回収する (monotonic clock では wall-clock TTL を当てにできないため、SQLite は明示回収を
-#   既定とする)。
+# - **serialization = JSON** (not pickle). ``payload`` is JSON-shaped (as assumed
+#   by :meth:`Wake.to_dict`), and JSON is safe across processes/languages without
+#   arbitrary-code-execution risk. ``payload`` may contain only JSON-serializable
+#   values (unsupported values raise ``ConfigError`` during enqueue).
+# - **key namespace convention**. Redis uses keys such as ``{namespace}:wake:{id}``
+#   / ``{namespace}:recipient:{r}`` to avoid collisions with other uses (default
+#   namespace ``"loop_agent"``). SQLite separates by table name (default
+#   ``wakes``).
+# - **TTL / cleanup**. DELIVERED records remain in long-running loops. Redis sets
+#   ``EXPIRE`` on finalization (``delivered_ttl``), while SQLite is explicitly
+#   reclaimed by :meth:`SqliteWakeQueue.purge_delivered` (because monotonic clocks
+#   cannot be used for wall-clock TTL, explicit cleanup is the SQLite default).
 #
-# **クロスプロセスの時計に関する重要注意**: lease 失効判定は :class:`Transport` が渡す ``now``
-# (既定 ``time.monotonic``) を共有 backend 上で突き合わせる。``time.monotonic`` は **プロセス毎に
-# 原点が異なる** ため、同一 SQLite/Redis backend を複数プロセスで共有する構成では、各プロセスの
-# :class:`Transport` に **wall-clock (``time_fn=time.time``) を渡して時計を揃える** こと。さもないと
-# あるプロセスが書いた ``lease_expiry`` を別プロセスの monotonic と比較して lease 判定が壊れる。
+# **Important cross-process clock note**: lease expiry compares ``now`` supplied by
+# :class:`Transport` (default ``time.monotonic``) against the shared backend.
+# ``time.monotonic`` has a **different origin per process**, so configurations that
+# share the same SQLite/Redis backend across multiple processes must pass a
+# **wall-clock (``time_fn=time.time``) to each process's :class:`Transport` to align
+# clocks**. Otherwise, comparing a ``lease_expiry`` written by one process against
+# another process's monotonic clock breaks lease decisions.
 
 
 def _dumps_payload(payload: Mapping[str, Any]) -> str:
-    """``payload`` を JSON 文字列へ畳む (backend 永続化用)。
+    """Collapse ``payload`` into a JSON string (for backend persistence).
 
-    JSON 化不能な値は ``TypeError`` を ``ConfigError`` に翻訳して、enqueue の入力検証として
-    呼び出し側に分かりやすく返す (pickle を使わない = 任意コード実行 risk を持ち込まない)。
-    元の ``TypeError`` は ``__cause__`` に保全する (``raise ... from exc``)。
+    Non-JSON-serializable values translate ``TypeError`` into ``ConfigError`` so
+    callers get a clear enqueue input-validation error (not using pickle = not
+    introducing arbitrary-code-execution risk). The original ``TypeError`` is
+    preserved as ``__cause__`` (``raise ... from exc``).
     """
     try:
         return json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
@@ -600,7 +681,7 @@ def _dumps_payload(payload: Mapping[str, Any]) -> str:
 
 
 def _make_wake(id: str, kind: str, recipient: str, run_id: str, payload_json: str) -> Wake:
-    """backend から読んだフィールドを :class:`Wake` へ復元する。"""
+    """Restore fields read from a backend into :class:`Wake`."""
     return Wake(
         id=id,
         kind=kind,
@@ -614,29 +695,34 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _validate_identifier(name: str, *, what: str) -> str:
-    """SQL 識別子 (table 名) を検証する (SQL injection 防止: table 名は bind できないため)。"""
+    """Validate an SQL identifier (table name) to prevent SQL injection; table names cannot be bound."""
     if not _IDENT_RE.match(name):
         raise ConfigError(f"{what} must match {_IDENT_RE.pattern!r}, got {name!r}")
     return name
 
 
 class SqliteWakeQueue:
-    """:class:`WakeQueue` の SQLite 実装 (stdlib ``sqlite3`` のみ・プロセス外永続)。
+    """:class:`WakeQueue` SQLite implementation (stdlib ``sqlite3`` only, out-of-process durability).
 
-    三状態 claim-then-confirm / owner fencing のセマンティクスは :class:`InMemoryWakeQueue` と
-    **完全に等価** で、正本を SQLite ファイル (または ``:memory:``) に置くことでプロセスを跨いだ
-    配送を可能にする。``path`` にファイルパスを渡せば複数プロセスが同じ正本を共有でき、
-    ``":memory:"`` (既定) は単一プロセス内の永続テスト用。
+    The three-state claim-then-confirm / owner fencing semantics are **fully
+    equivalent** to :class:`InMemoryWakeQueue`, and placing the source of truth in a
+    SQLite file (or ``:memory:``) enables delivery across processes. Passing a file
+    path to ``path`` lets multiple processes share the same source of truth;
+    ``":memory:"`` (default) is for durable tests inside a single process.
 
-    **原子性**: 状態を変える操作 (enqueue/claim/confirm/release_expired/mark_delivered) は
-    ``BEGIN IMMEDIATE`` で write lock を取って 1 トランザクションに収め、check-and-set を
-    atomic にする。プロセス内の並行 poller はプロセス内 :class:`threading.RLock` で直列化し、
-    プロセス間は SQLite のファイルロック + ``busy_timeout`` で待ち合わせる (``WAL`` で読み書きの
-    並行性を上げる)。これにより複数プロセス/スレッドが並行 poll しても二重 claim しない。
+    **Atomicity**: State-changing operations
+    (enqueue/claim/confirm/release_expired/mark_delivered) take a write lock with
+    ``BEGIN IMMEDIATE`` and fit check-and-set into one transaction. Concurrent
+    pollers inside a process are serialized with an in-process
+    :class:`threading.RLock`; cross-process access waits on SQLite file locks plus
+    ``busy_timeout`` (``WAL`` improves read/write concurrency). This prevents double
+    claim even when multiple processes/threads poll concurrently.
 
-    **接続**: 1 接続を ``check_same_thread=False`` で開き、上記ロックで保護する (``:memory:`` は
-    接続毎に別 DB になるため単一接続が必須)。``isolation_level=None`` (autocommit) でトランザクションを
-    明示制御する。使い終わったら :meth:`close` するか ``with`` 文で使う。
+    **Connection**: Opens one connection with ``check_same_thread=False`` and
+    protects it with the lock above (``:memory:`` creates a separate DB per
+    connection, so a single connection is required). ``isolation_level=None``
+    (autocommit) is used for explicit transaction control. Call :meth:`close` when
+    finished, or use a ``with`` statement.
     """
 
     def __init__(
@@ -648,12 +734,12 @@ class SqliteWakeQueue:
     ) -> None:
         self._path = path
         self._t = _validate_identifier(table, what="table")
-        # claim は内部で release_expired 相当の SQL を同一 tx で呼ぶ。RLock で再入を許す。
+        # claim calls release_expired-equivalent SQL inside the same tx. RLock allows reentry.
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}")
-        # WAL はファイル DB の読み書き並行性を上げる (:memory: では no-op 相当)。
+        # WAL improves read/write concurrency for file DBs (effectively a no-op for :memory:).
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._init_schema()
 
@@ -674,7 +760,7 @@ class SqliteWakeQueue:
                 )
                 """
             )
-            # claim/pending: 宛先 + 状態を seq 順に引く。release_expired: 状態 + lease で掃く。
+            # claim/pending: fetch destination + state in seq order. release_expired: sweep by state + lease.
             self._conn.execute(
                 f"CREATE INDEX IF NOT EXISTS {self._t}_recipient_state "
                 f"ON {self._t}(recipient, state, seq)"
@@ -686,7 +772,7 @@ class SqliteWakeQueue:
 
     @contextmanager
     def _tx(self) -> Iterator[None]:
-        """``BEGIN IMMEDIATE`` で write lock を取り、commit/rollback まで直列化する。"""
+        """Take a write lock with ``BEGIN IMMEDIATE`` and serialize through commit/rollback."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -708,7 +794,7 @@ class SqliteWakeQueue:
                 "VALUES (?, ?, ?, ?, ?, ?, NULL, 0)",
                 (wake.id, wake.kind, wake.recipient, wake.run_id, payload, UNDELIVERED),
             )
-            return cur.rowcount > 0  # INSERT OR IGNORE: 挿入=1 / 重複 id で無視=0。
+            return cur.rowcount > 0  # INSERT OR IGNORE: inserted=1 / ignored duplicate id=0.
 
     def _release_expired_locked(self, now: float) -> int:
         cur = self._conn.execute(
@@ -757,7 +843,7 @@ class SqliteWakeQueue:
 
     def confirm(self, wake_id: str, *, owner: str, now: float) -> bool:
         with self._tx():
-            # owner 一致 + lease 未失効 (lease_expiry > now) を満たす CLAIMED のみ確定 (fencing)。
+            # Finalize only CLAIMED rows with matching owner + unexpired lease (lease_expiry > now), as fencing.
             cur = self._conn.execute(
                 f"UPDATE {self._t} SET state = ?, owner = NULL "
                 "WHERE id = ? AND state = ? AND owner = ? AND lease_expiry > ?",
@@ -767,7 +853,7 @@ class SqliteWakeQueue:
 
     def mark_delivered(self, wake_id: str) -> bool:
         with self._tx():
-            # UNDELIVERED のときだけ確定 (CLAIMED な active claim を奪わない)。
+            # Finalize only from UNDELIVERED (do not steal an active CLAIMED claim).
             cur = self._conn.execute(
                 f"UPDATE {self._t} SET state = ?, owner = NULL WHERE id = ? AND state = ?",
                 (DELIVERED, wake_id, UNDELIVERED),
@@ -799,10 +885,11 @@ class SqliteWakeQueue:
             return row["state"] if row is not None else None
 
     def purge_delivered(self) -> int:
-        """確定済み (``DELIVERED``) レコードを物理削除し、削除件数を返す (cleanup)。
+        """Physically delete finalized (``DELIVERED``) records and return the deleted count (cleanup).
 
-        long-running ループでは確定済み行が残留するため、保守として定期的に呼んで回収する。
-        非確定 (``UNDELIVERED`` / ``CLAIMED``) は触らないので配送中の wake を喪失しない。
+        Long-running loops leave finalized rows behind, so call this periodically
+        as maintenance to reclaim them. It does not touch unfinalized
+        (``UNDELIVERED`` / ``CLAIMED``) rows, so in-flight wakes are not lost.
         """
         with self._tx():
             cur = self._conn.execute(
@@ -811,7 +898,7 @@ class SqliteWakeQueue:
             return cur.rowcount
 
     def close(self) -> None:
-        """SQLite 接続を閉じる (``:memory:`` では DB ごと破棄される)。"""
+        """Close the SQLite connection (for ``:memory:``, this discards the whole DB)."""
         with self._lock:
             self._conn.close()
 
@@ -823,10 +910,10 @@ class SqliteWakeQueue:
 
 
 def _import_redis() -> Any:
-    """optional dep ``redis`` を import gate 越しに読み込む (未導入なら親切なエラー)。"""
+    """Load optional dependency ``redis`` through an import gate (friendly error if missing)."""
     try:
         import redis  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - 環境依存
+    except ImportError as exc:  # pragma: no cover - environment-dependent
         raise ImportError(
             "RedisWakeQueue requires the optional 'redis' dependency. "
             "Install it with: pip install 'loop-agent[redis]'"
@@ -835,56 +922,71 @@ def _import_redis() -> Any:
 
 
 def _text(value: Any) -> str:
-    """redis-py が返す bytes/str を str へ正規化する (``decode_responses`` 非依存にする)。"""
+    """Normalize bytes/str returned by redis-py to str (independent of ``decode_responses``)."""
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return value
 
 
 class RedisWakeQueue:
-    """:class:`WakeQueue` の Redis 実装 (optional dep ``redis``・プロセス外永続)。
+    """:class:`WakeQueue` Redis implementation (optional dep ``redis``, out-of-process durability).
 
-    三状態 claim-then-confirm / owner fencing のセマンティクスは :class:`InMemoryWakeQueue` /
-    :class:`SqliteWakeQueue` と等価。正本を Redis に置くことで、別ホストのプロセス間でも wake を
-    配送できる。``redis`` 未導入の環境では生成時に親切な :class:`ImportError` を投げる
-    (import gate)。
+    The three-state claim-then-confirm / owner fencing semantics are equivalent to
+    :class:`InMemoryWakeQueue` / :class:`SqliteWakeQueue`. Placing the source of
+    truth in Redis enables wake delivery between processes on different hosts. In
+    environments without ``redis`` installed, construction raises a friendly
+    :class:`ImportError` (import gate).
 
-    **データモデル** (key namespace 規約; ``namespace`` 既定 ``"loop_agent"``):
+    **Data model** (key namespace convention; default ``namespace`` is
+    ``"loop_agent"``):
 
-    - ``{ns}:wake:{id}``        : wake 1 件の hash (kind/recipient/run_id/payload/state/owner/
-      lease_expiry/seq)。
-    - ``{ns}:recipient:{r}``    : 宛先 ``r`` の sorted set (score=seq, member=id)。claim/pending の
-      **seq 順** 走査に使う。確定/配送済みになった id はここから除かれる。
-    - ``{ns}:claimed``          : CLAIMED 行の sorted set (score=lease_expiry, member=id)。
-      :meth:`release_expired` が ``ZRANGEBYSCORE -inf now`` で失効分だけ効率的に掃ける。
-    - ``{ns}:seq``              : 単調増加カウンタ (``INCR``)。
-    - ``{ns}:recipients``       : 既知 recipient の set (``pending(None)`` の全走査用)。
-    - ``{ns}:lock``             : 状態変更を直列化する分散ロック (``SET NX PX``)。
+    - ``{ns}:wake:{id}``        : hash for one wake
+      (kind/recipient/run_id/payload/state/owner/lease_expiry/seq).
+    - ``{ns}:recipient:{r}``    : sorted set for destination ``r`` (score=seq,
+      member=id). Used to scan in **seq order** for claim/pending. Finalized /
+      delivered ids are removed from here.
+    - ``{ns}:claimed``          : sorted set for CLAIMED rows (score=lease_expiry,
+      member=id). :meth:`release_expired` can efficiently sweep expired rows with
+      ``ZRANGEBYSCORE -inf now``.
+    - ``{ns}:seq``              : monotonic counter (``INCR``).
+    - ``{ns}:recipients``       : set of known recipients (for the full scan in
+      ``pending(None)``).
+    - ``{ns}:lock``             : distributed lock that serializes state changes
+      (``SET NX PX``).
 
-    **原子性**: 状態を変える各操作はプロセス内 :class:`threading.RLock` (プロセス内直列化) と
-    Redis 分散ロック ``{ns}:lock`` (``SET NX PX`` + token 照合 **atomic** 解放) で囲み、複数
-    プロセスの check-and-set を直列化する (claim の二重取得を防ぐ)。ロックは ``lock_ttl`` 秒で
-    自動失効するので、ロック保持者がクラッシュしても deadlock しない。解放は server-side Lua の
-    compare-and-delete (:meth:`_release_lock`) で **自 token のときだけ** 行い、失効後に別者が
-    握り直したロックを誤って消さない。
+    **Atomicity**: Each state-changing operation is wrapped in an in-process
+    :class:`threading.RLock` (in-process serialization) and the Redis distributed
+    lock ``{ns}:lock`` (``SET NX PX`` + token-checked **atomic** release),
+    serializing check-and-set across processes (preventing double claim). The lock
+    auto-expires after ``lock_ttl`` seconds, so a crashed lock holder does not
+    deadlock. Release is performed by server-side Lua compare-and-delete
+    (:meth:`_release_lock`) **only when the token is ours**, so it cannot
+    accidentally delete a lock that another party reacquired after expiry.
 
-    **既知の制限 (cross-process の強さ)**: 分散ロックは ``lock_ttl`` の TTL ロックなので、1 操作が
-    ``lock_ttl`` を **超過** すると (STW-GC / ネットワーク遅延 / 巨大 recipient zset の sweep 等)
-    ロックが操作の途中で失効し、別プロセスが同じ wake を二重 claim しうる。この窓では配送は
-    **at-least-once に縮退** する (確定済みが再 CLAIMED に戻る resurrection を含む)。本 transport の
-    契約は元々 at-least-once + 冪等 handler (受信側が :attr:`Wake.id` で de-dup) なので回復可能だが、
-    ``lock_ttl`` は 1 操作が確実に収まる十分大きい値にすること。**厳密な at-most-once が要る
-    cross-process 構成では TTL ロックに依存しない** :class:`SqliteWakeQueue` (``BEGIN IMMEDIATE``
-    は操作途中で失効しない) を推奨する。:class:`InMemoryWakeQueue` / :class:`SqliteWakeQueue` と
-    「等価」なのは **lock_ttl 内に各操作が収まる前提** での話である。
+    **Known limitation (cross-process strength)**: The distributed lock is a TTL
+    lock based on ``lock_ttl``. If one operation **exceeds** ``lock_ttl`` (STW-GC /
+    network delay / sweep of a huge recipient zset, etc.), the lock can expire
+    mid-operation and another process may double-claim the same wake. In that
+    window, delivery degrades to **at-least-once** (including resurrection where a
+    finalized wake returns to CLAIMED). The transport contract is already
+    at-least-once + idempotent handler (the receiver de-dups by :attr:`Wake.id`),
+    so this is recoverable, but ``lock_ttl`` should be large enough to reliably
+    contain one operation. For cross-process configurations that require **strict
+    at-most-once, do not depend on TTL locks**; prefer :class:`SqliteWakeQueue`
+    (``BEGIN IMMEDIATE`` does not expire during an operation). Equivalence with
+    :class:`InMemoryWakeQueue` / :class:`SqliteWakeQueue` assumes each operation
+    finishes within ``lock_ttl``.
 
-    **TTL / cleanup**: 確定 (DELIVERED) 時に wake hash へ ``EXPIRE`` を張り (``delivered_ttl``
-    秒、既定 1 日)、long-running ループでの残留を自動回収する。``delivered_ttl=None`` で無効化。
-    recipient の pending が空になると ``{ns}:recipients`` registry からも除き、registry の無制限
-    増殖を防ぐ (高 cardinality な peer id を宛先にしても leak しない)。
+    **TTL / cleanup**: On finalization (DELIVERED), set ``EXPIRE`` on the wake hash
+    (``delivered_ttl`` seconds, default 1 day) to automatically reclaim remnants
+    from long-running loops. Disable with ``delivered_ttl=None``. When a
+    recipient's pending set becomes empty, remove it from the ``{ns}:recipients``
+    registry too, preventing unbounded registry growth (no leak even with
+    high-cardinality peer ids as destinations).
 
-    テストや DI のため ``client`` に redis-py 互換クライアントを直接注入できる。省略時は ``url``
-    から ``redis.Redis.from_url`` で生成する (どちらも無い場合は ``ConfigError``)。
+    For tests or DI, a redis-py-compatible ``client`` can be injected directly. If
+    omitted, ``redis.Redis.from_url`` is used with ``url`` (if neither is provided,
+    ``ConfigError`` is raised).
     """
 
     def __init__(
@@ -919,28 +1021,30 @@ class RedisWakeQueue:
     def _k_recipient(self, recipient: str) -> str:
         return f"{self._ns}:recipient:{recipient}"
 
-    # 自分が握っているときだけロックを解放する Lua (compare-and-delete; 1 命令で atomic)。
+    # Lua that releases the lock only when we hold it (compare-and-delete; atomic in one command).
     _RELEASE_LOCK_LUA = (
         "if redis.call('get', KEYS[1]) == ARGV[1] then "
         "return redis.call('del', KEYS[1]) else return 0 end"
     )
 
     def _release_lock(self, token: str) -> None:
-        """ロックを **自 token のときだけ** atomic に解放する (他者のロックを消さない)。
+        """Release the lock atomically **only when the token is ours** (do not delete another lock).
 
-        check-then-delete を 2 往復でやると GET と DELETE の間にロックが失効して別プロセスが
-        握り直したロックを誤って消しうる。server-side Lua の compare-and-delete で 1 命令に畳む。
-        ``eval`` 非対応の client では best-effort な check-then-delete に退避する。
+        If check-then-delete takes two round trips, the lock can expire between GET
+        and DELETE and another process can reacquire it, causing us to delete that
+        other lock by mistake. Server-side Lua compare-and-delete collapses this
+        into one command. Clients without ``eval`` support fall back to best-effort
+        check-then-delete.
         """
         try:
             self._r.eval(self._RELEASE_LOCK_LUA, 1, self._k_lock, token)
-        except Exception:  # noqa: BLE001 - eval 非対応 client は best-effort 解放に退避。
+        except Exception:  # noqa: BLE001 - clients without eval support fall back to best-effort release.
             if _text(self._r.get(self._k_lock)) == token:
                 self._r.delete(self._k_lock)
 
     @contextmanager
     def _dlock(self) -> Iterator[None]:
-        """プロセス内 RLock + Redis 分散ロックで状態変更を直列化する。"""
+        """Serialize state changes with an in-process RLock + Redis distributed lock."""
         import time as _time
 
         with self._lock:
@@ -965,14 +1069,15 @@ class RedisWakeQueue:
         return {_text(k): _text(v) for k, v in raw.items()}
 
     def _terminalize(self, wake_id: str, recipient: str) -> None:
-        """wake を DELIVERED (terminal) にし、ordering/claimed index から外す (+TTL)。"""
+        """Mark a wake DELIVERED (terminal) and remove it from ordering/claimed indexes (+TTL)."""
         wkey = self._k_wake(wake_id)
         rkey = self._k_recipient(recipient)
         self._r.hset(wkey, mapping={"state": DELIVERED, "owner": ""})
         self._r.zrem(rkey, wake_id)
         self._r.zrem(self._k_claimed, wake_id)
-        # recipient の pending が尽きたら registry から外す ({ns}:recipients の無制限増殖を防ぐ。
-        # 再 enqueue 時に sadd で復活するので pending(None) の全走査は壊れない)。
+        # Remove recipient from the registry when its pending set is empty (prevents
+        # unbounded growth of {ns}:recipients). Re-enqueue restores it with sadd, so
+        # the full scan in pending(None) remains correct.
         if self._r.zcard(rkey) == 0:
             self._r.srem(self._k_recipients, recipient)
         if self._delivered_ttl is not None:
@@ -985,7 +1090,7 @@ class RedisWakeQueue:
         wkey = self._k_wake(wake.id)
         with self._dlock():
             if self._r.exists(wkey):
-                return False  # 同一 id は no-op (de-dup の土台)。
+                return False  # Same id is a no-op (foundation for de-dup).
             seq = int(self._r.incr(self._k_seq))
             self._r.hset(
                 wkey,
@@ -1040,7 +1145,7 @@ class RedisWakeQueue:
                     break
                 h = self._hgetall(self._k_wake(wid))
                 if not h:
-                    # hash が TTL 等で消えた stale な index member。掃除して飛ばす。
+                    # Stale index member whose hash disappeared by TTL, etc. Clean it up and skip.
                     self._r.zrem(self._k_recipient(recipient), wid)
                     continue
                 if h["state"] != UNDELIVERED:
@@ -1102,7 +1207,7 @@ class RedisWakeQueue:
                             ),
                         )
                     )
-            items.sort(key=lambda t: t[0])  # 全 recipient 横断で seq (= score) 順に整列。
+            items.sort(key=lambda t: t[0])  # Sort by seq (= score) across all recipients.
             return [w for _, w in items]
 
     def state_of(self, wake_id: str) -> Optional[str]:
@@ -1112,14 +1217,14 @@ class RedisWakeQueue:
 
 
 def open_wake_queue(backend: str = "memory", **opts: Any) -> WakeQueue:
-    """backend 名から :class:`WakeQueue` を生成する便宜ファクトリ。
+    """Convenience factory that creates a :class:`WakeQueue` from a backend name.
 
-    - ``"memory"`` (既定) : :class:`InMemoryWakeQueue` (単一プロセス内)。
-    - ``"sqlite"``        : :class:`SqliteWakeQueue` (``path`` / ``table`` 等を ``opts`` で)。
-    - ``"redis"``         : :class:`RedisWakeQueue` (``client`` か ``url`` を ``opts`` で)。
+    - ``"memory"`` (default) : :class:`InMemoryWakeQueue` (inside one process).
+    - ``"sqlite"``          : :class:`SqliteWakeQueue` (``path`` / ``table`` etc. via ``opts``).
+    - ``"redis"``           : :class:`RedisWakeQueue` (``client`` or ``url`` via ``opts``).
 
-    生成した queue を :class:`Transport` に渡せば、Public API を変えずに backend を選べる
-    (in-memory が既定、明示で SQLite/Redis)。
+    Pass the created queue to :class:`Transport` to choose a backend without
+    changing the public API (in-memory by default, SQLite/Redis when explicit).
     """
     if backend == "memory":
         if opts:
@@ -1133,16 +1238,16 @@ def open_wake_queue(backend: str = "memory", **opts: Any) -> WakeQueue:
 
 
 __all__ = [
-    # wake 種別
+    # wake kinds
     "WAKE_LOOP_DONE",
     "WAKE_NEXT_ITERATION",
     "WAKE_DECISION_REQUEST",
     "WAKE_KINDS",
-    # 配送状態
+    # delivery states
     "UNDELIVERED",
     "CLAIMED",
     "DELIVERED",
-    # 型
+    # types
     "Wake",
     "PushBackend",
     "CallablePushBackend",
@@ -1153,7 +1258,7 @@ __all__ = [
     "RedisWakeQueue",
     "open_wake_queue",
     "Transport",
-    # role 別 cadence
+    # role-specific cadence
     "CADENCE_SECONDS",
     "DEFAULT_CADENCE_SECONDS",
     "cadence_for",

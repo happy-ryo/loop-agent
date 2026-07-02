@@ -1,18 +1,19 @@
-"""Codex adapter (``loop_agent.adapters.codex``) の **固有** 検証 (Issue #49)。
+"""Codex adapter (``loop_agent.adapters.codex``) **specific** validation (Issue #49).
 
-``act`` シーム 4 か条と ``ActResult`` の形(成功時の結果形 / ``failed`` セマンティクス /
-timeout・起動失敗の graceful / 予算計上 / Mock 契約 / auth 環境継承 / stdin 安全性)は
-全アダプタ横断の共通ハーネス ``tests/adapters/test_contract.py`` に移譲済み(stdin の
-DEVNULL 固定もそこで ``expects_devnull`` 経由で検証する)。ここには **Codex 固有** の
-挙動だけを残す:
+The four ``act`` seam rules and the shape of ``ActResult`` (successful result shape /
+``failed`` semantics / graceful timeout and startup failure handling / budget accounting /
+Mock contract / auth environment inheritance / stdin safety) have moved to the shared
+cross-adapter harness in ``tests/adapters/test_contract.py`` (fixed stdin DEVNULL is also
+verified there through ``expects_devnull``). Only **Codex-specific** behavior remains here:
 
-1. ``build_command`` のフラグ組み立て(``codex exec`` / ``--json`` / ``-m`` / ``-c`` 等)。
-2. ``--json`` JSONL の応答本文抽出(item.completed / 直接 agent_message / delta /
-   last_agent_message、dotted/snake_case の揺れ)と ``error`` / ``*.failed`` の判定。
-3. token usage 解析(Codex は ``input+output`` のみ。cached/reasoning の部分集合を
-   二重計上しない / ``total_tokens`` フォールバック)。
-4. ``cwd`` の引き渡しと ``render_prompt`` 整形。
-5. 実 subprocess 経路(フェイク codex 実行ファイル)。
+1. ``build_command`` flag assembly (``codex exec`` / ``--json`` / ``-m`` / ``-c``, etc.).
+2. Response body extraction from ``--json`` JSONL (item.completed / direct agent_message /
+   delta / last_agent_message, including dotted/snake_case variants) and ``error`` /
+   ``*.failed`` detection.
+3. Token usage parsing (Codex counts only ``input+output``. Do not double-count the
+   cached/reasoning subsets / ``total_tokens`` fallback).
+4. Passing ``cwd`` and formatting ``render_prompt``.
+5. Real subprocess path (fake codex executable).
 """
 
 from __future__ import annotations
@@ -28,18 +29,18 @@ import pytest
 import loop_agent.adapters.codex as codex_module
 from loop_agent.adapters import CodexAct, MockCodexAct, render_prompt
 
-# parse_tokens は codex サブモジュールから直接取る。``adapters.__init__`` が公開する
-# ``parse_tokens`` は claude_code 由来(input+output+cache_creation を計上し
-# cache_read は除外する意味論)で、Codex の usage(部分集合 cached/reasoning を持ち、
-# cache_creation は無い)とは意味論が違うため、Codex 用はモジュール側を使う。
+# Import parse_tokens directly from the codex submodule. The ``parse_tokens`` exposed by
+# ``adapters.__init__`` comes from claude_code (it counts input+output+cache_creation and
+# excludes cache_read), which has different semantics from Codex usage (it has cached and
+# reasoning subsets but no cache_creation), so the Codex tests use the module-level helper.
 from loop_agent.adapters.codex import parse_tokens
 
 
-# -- フェイク runner: subprocess.run を差し替えてコマンド/出力を制御する --------
+# -- Fake runner: replace subprocess.run and control commands/output --------
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
-    """``subprocess.run`` 互換の戻り値(CompletedProcess)を作る。"""
+    """Create a ``subprocess.run``-compatible return value (CompletedProcess)."""
 
     def _runner(command, **kwargs):
         _runner.calls.append((list(command), kwargs))
@@ -51,8 +52,8 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0):
     return _runner
 
 
-# 実際の ``codex exec --json`` イベント列を模した JSONL。トークンは
-# input(100) + output(40) = 140 のみが総量(cached 60 / reasoning 10 は部分集合)。
+# JSONL modeled after a real ``codex exec --json`` event sequence. Only input(100) +
+# output(40) = 140 count toward the total (cached 60 / reasoning 10 are subsets).
 JSONL_OK = "\n".join(
     [
         '{"type":"thread.started","thread_id":"abc"}',
@@ -64,7 +65,7 @@ JSONL_OK = "\n".join(
 )
 
 
-# -- 1. build_command(Codex 固有フラグ) ------------------------------------
+# -- 1. build_command(Codex-specific flags) ------------------------------------
 
 
 def test_build_command_includes_all_flags():
@@ -85,7 +86,7 @@ def test_build_command_includes_all_flags():
     assert cmd[cmd.index("-c") + 1] == "model_reasoning_effort=high"
     assert cmd[cmd.index("-s") + 1] == "workspace-write"
     assert "--add-dir" in cmd
-    # プロンプトは "--" 区切りの後ろの位置引数(値取りオプションに飲まれないため)。
+    # The prompt is the positional argument after "--" so value-taking options do not eat it.
     assert cmd[-2:] == ["--", "the prompt"]
 
 
@@ -110,7 +111,7 @@ def test_default_codex_bin_falls_back_to_cmd_name_on_windows(monkeypatch):
     assert codex_module._default_codex_bin() == "codex.cmd"
 
 def test_build_command_minimal_omits_optional_flags():
-    # json/skip を切ると付かない。sandbox 未指定なら -s も付かない。
+    # Disabling json/skip omits them. Leaving sandbox unset also omits -s.
     act = CodexAct(json_output=False, skip_git_repo_check=False)
     cmd = act.build_command("p")
     assert "--json" not in cmd
@@ -119,11 +120,11 @@ def test_build_command_minimal_omits_optional_flags():
     assert cmd[-2:] == ["--", "p"]
 
 
-# -- 2. 応答本文抽出(JSONL スキーマの揺れ)と error/*.failed 判定 -----------
+# -- 2. Response body extraction(JSONL schema variants) and error/*.failed detection -----------
 
 
 def test_text_from_direct_agent_message_event():
-    # 旧 --json 形: item.completed ラッパ無しの直接 agent_message イベント。
+    # Old --json shape: direct agent_message event without an item.completed wrapper.
     stream = "\n".join(
         [
             '{"type":"agent_message","message":"hi there"}',
@@ -136,7 +137,7 @@ def test_text_from_direct_agent_message_event():
 
 
 def test_text_from_last_agent_message_field():
-    # 完了イベントが last_agent_message を別フィールドで持つ形。
+    # Shape where the completion event carries last_agent_message as a separate field.
     stream = "\n".join(
         [
             '{"type":"task_complete","last_agent_message":"final answer","usage":{"input_tokens":4,"output_tokens":2}}',
@@ -159,7 +160,7 @@ def test_text_from_streaming_deltas_when_no_consolidated_message():
 
 
 def test_text_from_snake_case_item_completed():
-    # codex のバージョンによっては type が snake_case(item_completed)で出る。
+    # Some codex versions emit type as snake_case(item_completed).
     stream = "\n".join(
         [
             '{"type":"item_completed","item":{"type":"agent_message","text":"snake answer"}}',
@@ -172,7 +173,7 @@ def test_text_from_snake_case_item_completed():
 
 
 def test_text_from_task_complete_last_agent_message():
-    # task_complete(snake_case)が last_agent_message を持つ形。
+    # Shape where task_complete(snake_case) carries last_agent_message.
     stream = '{"type":"task_complete","last_agent_message":"done","usage":{"input_tokens":4,"output_tokens":2}}'
     result = CodexAct(runner=_completed(stdout=stream)).__call__({"prompt": "x"}).observation
     assert result.text == "done"
@@ -180,7 +181,7 @@ def test_text_from_task_complete_last_agent_message():
 
 
 def test_consolidated_message_preferred_over_deltas():
-    # delta と完全本文が両方あれば完全本文(item.completed)を優先する。
+    # Prefer the complete body(item.completed) when both deltas and a complete body exist.
     stream = "\n".join(
         [
             '{"type":"agent_message_content_delta","delta":"partial"}',
@@ -193,7 +194,7 @@ def test_consolidated_message_preferred_over_deltas():
 
 
 def test_snake_case_failed_event_marks_failed():
-    # snake_case の *_failed(turn_failed)もエラーとして拾う。
+    # Also treat snake_case *_failed(turn_failed) as an error.
     stream = "\n".join(
         [
             '{"type":"turn_failed","message":"boom"}',
@@ -217,14 +218,14 @@ def test_error_event_marks_failed_even_on_zero_exit():
 
     result = act({"prompt": "x"}).observation
     assert result.failed is True
-    assert result.returncode == 0  # zero exit でも error イベントで failed になる
+    assert result.returncode == 0  # An error event marks failed even with zero exit.
     assert result.tokens == 3
-    # error 本文は error イベントの message を採り、JSONL 全文を載せない。
+    # Use the error event message as the error body, not the full JSONL stream.
     assert result.error == "stream interrupted"
 
 
 def test_failed_event_type_marks_failed_even_on_zero_exit():
-    # ``error`` 型だけでなく ``*.failed`` 型(turn.failed / step.failed 等)も拾う。
+    # Also catch ``*.failed`` types(turn.failed / step.failed, etc.), not only ``error``.
     stream = "\n".join(
         [
             '{"type":"turn.started"}',
@@ -242,7 +243,7 @@ def test_failed_event_type_marks_failed_even_on_zero_exit():
 
 
 def test_error_message_fallback_to_text_when_stderr_empty():
-    # stderr が空・error イベントも無いが非 0 終了。error は応答本文へフォールバック。
+    # Non-zero exit with empty stderr and no error event. The error falls back to response text.
     runner = _completed(stdout="plain failure detail", stderr="", returncode=1)
     act = CodexAct(runner=runner)
 
@@ -254,7 +255,7 @@ def test_error_message_fallback_to_text_when_stderr_empty():
 
 
 def test_error_message_fallback_to_exit_code_when_all_empty():
-    # stderr / stdout ともに空で非 0 終了。最終フォールバックの exit=<code> を使う。
+    # Non-zero exit with both stderr/stdout empty. Use the final fallback exit=<code>.
     runner = _completed(stdout="", stderr="", returncode=3)
     act = CodexAct(runner=runner)
 
@@ -281,7 +282,7 @@ def test_cwd_is_passed_to_subprocess():
     assert kwargs["cwd"] == "/tmp/work"
 
 
-# -- 3. token usage パース(Codex は input+output のみ; 部分集合を除外) -------
+# -- 3. Token usage parsing(Codex only counts input+output; subsets excluded) -------
 
 
 def test_parse_tokens_from_jsonl_usage():
@@ -295,35 +296,35 @@ def test_parse_tokens_uses_last_usage_event():
             '{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}',
         ]
     )
-    assert parse_tokens(stream) == 10  # 最後の usage を採用
+    assert parse_tokens(stream) == 10  # Use the last usage event.
 
 
 def test_parse_tokens_regex_fallback_from_noisy_text():
-    # JSONL にならない混在出力でも代表キーを拾う。
+    # Pick up representative keys even from mixed output that is not JSONL.
     noisy = 'log line\nusage: "input_tokens": 20, "output_tokens": 5 trailing'
     assert parse_tokens(noisy) == 25
 
 
 def test_parse_tokens_regex_fallback_excludes_subset_keys():
-    # cached_input_tokens / reasoning_output_tokens は先頭引用符アンカーで誤マッチしない。
+    # Leading quote anchors prevent false matches on cached_input_tokens / reasoning_output_tokens.
     noisy = 'x "cached_input_tokens": 999 "reasoning_output_tokens": 888 end'
     assert parse_tokens(noisy) == 0
 
 
 def test_parse_tokens_falls_back_to_total_tokens_when_no_split():
-    # input/output が無く total_tokens だけの usage はそれを使う(0 にしない)。
+    # Usage with only total_tokens and no input/output uses total_tokens instead of 0.
     stream = '{"type":"turn.completed","usage":{"total_tokens":77}}'
     assert parse_tokens(stream) == 77
 
 
 def test_parse_tokens_prefers_split_over_total_tokens():
-    # input/output があれば total_tokens は使わない(二重計上を避ける)。
+    # Prefer input/output over total_tokens to avoid double-counting.
     stream = '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":999}}'
     assert parse_tokens(stream) == 15
 
 
 def test_parse_tokens_regex_fallback_to_total_tokens():
-    # JSONL にならない出力でも total_tokens のみなら拾う。
+    # Pick up total_tokens-only output even when it is not JSONL.
     assert parse_tokens('blah "total_tokens": 42 blah') == 42
 
 
@@ -332,17 +333,17 @@ def test_parse_tokens_returns_zero_when_absent():
 
 
 def test_parse_tokens_fallback_prefers_stdout_and_does_not_sum_across_sources():
-    # 意図的な挙動の固定: stdout にヒットがあれば stderr は見ない(ソース間で合算
-    # しない)。両ソースがトークンを出力した場合の二重計上を避けるため
-    # (ClaudeCodeAct と同じ。codex の usage は --json の stdout に出るのが既定)。
+    # Intentional behavior: if stdout has a hit, do not inspect stderr or sum across sources.
+    # This avoids double-counting when both sources output tokens (same as ClaudeCodeAct;
+    # codex usage is emitted to stdout by default with --json).
     stdout = '"input_tokens": 100'
     stderr = '"output_tokens": 40'
-    assert parse_tokens(stdout, stderr) == 100  # stdout 単独。40 は加えない。
-    # stdout が空なら stderr にフォールバックする。
+    assert parse_tokens(stdout, stderr) == 100  # stdout only. Do not add 40.
+    # Fall back to stderr when stdout is empty.
     assert parse_tokens("", stderr) == 40
 
 
-# -- 4. render_prompt / Mock のプレースホルダ整形 ----------------------------
+# -- 4. render_prompt / Mock placeholder formatting ----------------------------
 
 
 def test_mock_renders_prompt_template():
@@ -356,10 +357,10 @@ def test_render_prompt_missing_field_raises_helpful_error():
         render_prompt("{prompt}", {"iteration": 1})
     msg = str(exc.value)
     assert "prompt" in msg
-    assert "iteration" in msg  # 使えるフィールドを示す
+    assert "iteration" in msg  # Shows the available fields.
 
 
-# -- 5. 実 subprocess 経路(フェイク codex 実行ファイル) -------------------
+# -- 5. Real subprocess path(fake codex executable) -------------------
 
 
 def _write_fake_codex(tmp_path: Path, body: str) -> str:
@@ -397,14 +398,14 @@ def test_real_subprocess_timeout(tmp_path):
     bin_path = _write_fake_codex(tmp_path, body)
     act = CodexAct(codex_bin=bin_path, timeout=0.5)
 
-    outcome = act({"prompt": "x"})  # 0.5s で kill され failed で返るはず
+    outcome = act({"prompt": "x"})  # Should be killed at 0.5s and returned as failed.
     assert outcome.observation.failed is True
     assert "timeout" in outcome.observation.error
 
 
 def test_real_subprocess_inherits_and_overrides_env(tmp_path):
-    # 子は os.environ を継承し(既存 codex セッション / OPENAI_API_KEY 経路)、
-    # env= で渡した値を上書きマージする。
+    # The child inherits os.environ (existing codex session / OPENAI_API_KEY path), and
+    # values passed via env= are merged as overrides.
     body = (
         "import os, json\n"
         "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', "

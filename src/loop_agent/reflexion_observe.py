@@ -1,29 +1,39 @@
-"""外側 Reflexion ループの観測: 構造化イベント + OTel GenAI span (Issue #30)。
+"""Outer Reflexion loop observation: structured events + OTel GenAI span (Issue #30).
 
-内側ループの :class:`~loop_agent.observe.LoopObserver` と同じ作法で、外側
-:func:`~loop_agent.reflexion.run_reflexion` の **試行間ライフサイクル** を観測する。観測層は
-``run_reflexion`` の判断ロジックには一切介入しない ― 既存安全核 (二信号モデル / RQGM epoch
-ゲート) はそのままで、観測フックを **側チャネル** として足すだけである (report.md S4.5 の観測性を
-外側ループへ延伸)。
+Observe the **inter-attempt lifecycle** of the outer
+:func:`~loop_agent.reflexion.run_reflexion` using the same style as the inner
+loop's :class:`~loop_agent.observe.LoopObserver`. The observation layer never
+intervenes in ``run_reflexion`` decision logic; it leaves the existing safety
+core (two-signal model / RQGM epoch gate) unchanged and only adds observation
+hooks as a **side channel** (extending report.md S4.5 observability to the outer
+loop).
 
-emit する構造化イベント (:class:`~loop_agent.events.LoopEvent` を再利用):
+Structured events emitted (reusing :class:`~loop_agent.events.LoopEvent`):
 
-- ``reflexion_begin`` : run 開始 (収束条件名・宣言軸・初期評価器 version・epoch 構成)。
-- ``episode_begin``   : 1 episode 開始 (episode/epoch/task/評価器 version)。
-- ``episode_end``     : 1 episode 確定 (一次集約 / reward / 成否 / lesson 採否 …)。
-- ``lesson_decision`` : lesson が出た episode のみ。採用 (``admitted=True``) / 拒否を独立に残す。
-- ``epoch_boundary``  : epoch 境界 (= 新 epoch 開始) + 評価器昇格/却下/不変の判定。
-- ``reflexion_end``   : run 終了 (収束理由・status・集計。``state`` から導出して整合させる)。
+- ``reflexion_begin`` : run start (convergence condition names, declared axes,
+  initial evaluator version, and epoch configuration).
+- ``episode_begin``   : one episode start (episode/epoch/task/evaluator version).
+- ``episode_end``     : one episode committed (primary aggregate / reward /
+  success / lesson admission, etc.).
+- ``lesson_decision`` : only for episodes that produced a lesson. Records
+  admission (``admitted=True``) / rejection independently.
+- ``epoch_boundary``  : epoch boundary (= new epoch start) plus evaluator
+  promotion/rejection/unchanged decision.
+- ``reflexion_end``   : run end (convergence reason, status, and aggregates,
+  derived from ``state`` for consistency).
 
-同じ run は OTel が入っていれば 1 本の **GenAI span** (:class:`~loop_agent.otel.ReflexionSpan`)
-にもなり、上記遷移が span event としてタイムラインに刻まれる (epoch 番号・評価器 version =
-採点係 id・lesson 由来 provenance を属性化)。OTel は **optional 依存** で、未導入環境では
-no-op に degrade する (MVP #13 と同方針)。
+If OTel is installed, the same run also becomes one **GenAI span**
+(:class:`~loop_agent.otel.ReflexionSpan`), with the transitions above recorded
+as span events on the timeline (epoch number, evaluator version = grader id,
+and lesson provenance become attributes). OTel is an **optional dependency** and
+degrades to no-op when unavailable (same policy as MVP #13).
 
-**best-effort**: sink への配布は :func:`~loop_agent.events.fan_out` 経由で sink 単位に握り、
-span は :class:`~loop_agent.otel.ReflexionSpan` 内で握る。さらに観測フック本体も握るので、
-観測の失敗 (sink/tracer の例外) が外側ループを殺すことはない (``run_reflexion`` の ``on_episode``
-/ ``on_epoch`` は raw 呼び出しのため、self-guard する責務は観測側が負う)。
+**best-effort**: sink delivery is guarded per sink through
+:func:`~loop_agent.events.fan_out`, and the span is guarded inside
+:class:`~loop_agent.otel.ReflexionSpan`. The observation hooks themselves are
+also guarded, so observation failures (sink/tracer exceptions) never kill the
+outer loop (``run_reflexion`` calls ``on_episode`` / ``on_epoch`` raw, so the
+observation layer is responsible for self-guarding).
 """
 
 from __future__ import annotations
@@ -59,7 +69,8 @@ from .reflexion import (
     run_reflexion,
 )
 
-# イベント種別 (discriminator)。読み手が文字列リテラルを散在させずに filter できるよう定数化。
+# Event kinds (discriminators). Constants keep readers from scattering string
+# literals when filtering.
 REFLEXION_BEGIN = "reflexion_begin"
 EPISODE_BEGIN = "episode_begin"
 EPISODE_END = "episode_end"
@@ -67,28 +78,32 @@ LESSON_DECISION = "lesson_decision"
 EPOCH_BOUNDARY = "epoch_boundary"
 REFLEXION_END = "reflexion_end"
 
-# 外側 run の status -> span/イベントの正常 or エラー区分。converged/stopped/paused はいずれも
-# 正常な終了 (打ち切りも「なぜ終わったか」が確定した正常路)。error のみ ERROR。
+# Outer run status -> normal/error classification for spans/events.
+# converged/stopped/paused are all normal endings (even a stop is a normal path
+# once its reason is known). Only error is ERROR.
 _OUTER_STATUSES = ("converged", "stopped", "paused")
 
 
 def _outer_condition_names(conditions: OuterConditions) -> list[str]:
-    """外側停止条件群から名前リストを取り出す (reflexion_begin の文脈用)。"""
+    """Extract names from outer stop conditions for reflexion_begin context."""
     if isinstance(conditions, AnyOf):
         conds: Sequence[StopCondition] = conditions.conditions
     else:
-        conds = conditions  # 列はそのまま
+        conds = conditions  # Keep sequences as-is.
     return [getattr(c, "name", type(c).__name__) for c in conds]
 
 
 class ReflexionObserver:
-    """1 回の外側 Reflexion run を観測し、構造化イベント + OTel span を emit する。
+    """Observe one outer Reflexion run and emit structured events + an OTel span.
 
-    sink へは best-effort で配り (sink の例外で外側ループを殺さない)、span は OTel 不在なら
-    自動で no-op になる (:class:`~loop_agent.otel.ReflexionSpan`)。さらに観測フック本体も握る
-    ので、観測の失敗が ``run_reflexion`` へ伝播しない。
+    Events are delivered to sinks on a best-effort basis (sink exceptions do
+    not kill the outer loop), and the span automatically becomes a no-op when
+    OTel is absent (:class:`~loop_agent.otel.ReflexionSpan`). The observation
+    hooks themselves are also guarded, so observation failures do not propagate
+    to ``run_reflexion``.
 
-    手で配線する場合は context manager として使い、``run_reflexion`` の各観測点へ渡す::
+    For manual wiring, use this as a context manager and pass it to each
+    ``run_reflexion`` observation point::
 
         obs = ReflexionObserver(sinks=[JsonlEventSink(path)], convergence=conds,
                                 declared_keys=keys, evaluator_version=ev.version,
@@ -100,7 +115,8 @@ class ReflexionObserver:
             )
             obs.record_result(result)
 
-    一括の入口は :func:`run_observed_reflexion` (配線をすべて内部で行う。推奨)。
+    The one-shot entry point is :func:`run_observed_reflexion` (recommended; it
+    performs all wiring internally).
     """
 
     def __init__(
@@ -128,11 +144,14 @@ class ReflexionObserver:
         self._span = ReflexionSpan(tracer=tracer, enabled=otel, span_name=span_name)
         self._begun = False
         self._ended = False
-        # 最後に観測した確定累積値。result を得られない終了パス (例外) でも、確定済みの
-        # episode/epoch ぶんを reflexion_end / span に残す (LoopObserver と同方針)。
-        # 外側 resume では、新プロセスが on_episode を 1 度も呼ぶ前に episode/条件で例外を
-        # 投げうるので、復元 state の累積値で seed しておき、error/incomplete の reflexion_end が
-        # 「resume 前に確定済みの episode/epoch ぶん」を 0 に潰さないようにする。
+        # Last observed committed cumulative values. Even on ending paths that
+        # cannot produce a result (exceptions), preserve already committed
+        # episode/epoch counts in reflexion_end / the span (same policy as
+        # LoopObserver).
+        # During outer resume, a new process can raise from an episode/condition
+        # before calling on_episode even once. Seed from the restored state's
+        # cumulative values so error/incomplete reflexion_end does not collapse
+        # episode/epoch counts that were committed before resume back to 0.
         self._last_episode = initial_state.episode if initial_state is not None else 0
         self._last_epoch = initial_state.epoch if initial_state is not None else 0
         self._last_best = (
@@ -146,17 +165,18 @@ class ReflexionObserver:
         self._last_evaluator_updates = (
             initial_state.evaluator_updates if initial_state is not None else 0
         )
-        # version は復元 state を優先 (run_reflexion が supplied evaluator と一致を検証済み)。
+        # Prefer the restored state's version (run_reflexion has already
+        # verified it matches the supplied evaluator).
         self._last_evaluator_version = (
             initial_state.evaluator_version
             if initial_state is not None and initial_state.evaluator_version
             else evaluator_version
         )
 
-    # -- 配線フック --------------------------------------------------------
+    # -- Wiring hooks ------------------------------------------------------
 
     def begin(self) -> None:
-        """``reflexion_begin`` を emit し OTel span を開始する。冪等。"""
+        """Emit ``reflexion_begin`` and start the OTel span. Idempotent."""
         if self._begun:
             return
         self._begun = True
@@ -182,9 +202,10 @@ class ReflexionObserver:
         )
 
     def on_episode_begin(self, ctx: ReflexionContext) -> None:
-        """``episode_begin`` を emit する。``run_reflexion`` の ``episode`` 直前で呼ぶ。
+        """Emit ``episode_begin``. Called just before ``run_reflexion`` episode.
 
-        観測の失敗で外側ループを殺さないよう、フック本体ごと best-effort で握る。
+        The hook body is guarded best-effort so observation failures do not kill
+        the outer loop.
         """
         try:
             self._span.add_episode_begin(
@@ -204,17 +225,18 @@ class ReflexionObserver:
                     },
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("on_episode_begin", exc)
 
     def on_episode(self, record: EpisodeRecord, state: ReflexionState) -> None:
-        """``episode_end`` (+ lesson が出ていれば ``lesson_decision``) を emit する。
+        """Emit ``episode_end`` (+ ``lesson_decision`` when a lesson exists).
 
-        ``run_reflexion`` の ``on_episode`` に一致。観測の失敗で外側ループを殺さないよう、
-        フック本体ごと best-effort で握る。
+        Matches ``run_reflexion`` ``on_episode``. The hook body is guarded
+        best-effort so observation failures do not kill the outer loop.
         """
         try:
-            # 確定累積値を snapshot (state は episode ごとに再利用される可変オブジェクト)。
+            # Snapshot committed cumulative values (state is a mutable object
+            # reused for each episode).
             self._last_episode = state.episode
             self._last_epoch = state.epoch
             self._last_best = state.best_gt_aggregate
@@ -249,8 +271,10 @@ class ReflexionObserver:
                 "lesson_provenance": provenance,
                 "detail": record.detail,
             }
-            # best が -inf (ground-truth-backed episode が 1 つも来ていない) のときは載せない
-            # ( -Infinity は仕様外 JSON。run-end と同じ規約で省く。downstream の数値集計を壊さない)。
+            # Omit best when it is -inf (no ground-truth-backed episode has
+            # arrived). -Infinity is non-standard JSON; use the same convention
+            # as run-end and omit it to avoid breaking downstream numeric
+            # aggregation.
             if state.best_gt_aggregate != float("-inf"):
                 payload["best_gt_aggregate"] = state.best_gt_aggregate
             self._emit(
@@ -261,7 +285,8 @@ class ReflexionObserver:
                     payload=payload,
                 )
             )
-            # lesson が出た episode のみ採否を独立イベントに残す (採用/拒否の filter 容易化)。
+            # For episodes that produced a lesson, record admission as an
+            # independent event (easier admitted/rejected filtering).
             if lesson is not None:
                 self._span.add_lesson(
                     episode=record.episode,
@@ -285,23 +310,27 @@ class ReflexionObserver:
                         },
                     )
                 )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("on_episode", exc)
 
     def on_epoch(self, record: EpochRecord) -> None:
-        """``epoch_boundary`` を emit する。``run_reflexion`` の ``on_epoch`` に一致。
+        """Emit ``epoch_boundary``. Matches ``run_reflexion`` ``on_epoch``.
 
-        評価器の昇格/却下/不変 (``record.decision``) と version 遷移を残す。観測の失敗で外側
-        ループを殺さないよう、フック本体ごと best-effort で握る。
+        Records evaluator promotion/rejection/unchanged (``record.decision``)
+        and version transitions. The hook body is guarded best-effort so
+        observation failures do not kill the outer loop.
         """
         try:
             self._last_epoch = record.epoch
             self._last_evaluator_version = record.evaluator_version
-            # 評価器更新カウンタも境界で同期する。run_reflexion は候補が提案された境界
-            # (= record.proposed) でのみ state.evaluator_updates を 1 増やす (昇格/却下は不問)
-            # ので、観測スナップショットも同じ条件で進める。これをしないと、境界の直後に
-            # 次 episode が例外で抜けた error/incomplete パスで evaluator_updates が 1 不足し、
-            # 既に emit 済みの epoch_boundary (proposed=True) と矛盾する。
+            # Synchronize the evaluator update counter at the boundary too.
+            # run_reflexion increments state.evaluator_updates only at
+            # boundaries where a candidate was proposed (= record.proposed),
+            # regardless of promotion/rejection, so the observation snapshot
+            # advances under the same condition. Without this, an
+            # error/incomplete path where the next episode raises immediately
+            # after the boundary would be short one evaluator_update and would
+            # contradict the already emitted epoch_boundary (proposed=True).
             if record.proposed:
                 self._last_evaluator_updates += 1
             admission = record.admission
@@ -339,14 +368,15 @@ class ReflexionObserver:
                     payload=payload,
                 )
             )
-        except Exception as exc:  # noqa: BLE001 - 観測は best-effort
+        except Exception as exc:  # noqa: BLE001 - observation is best-effort
             self._warn("on_epoch", exc)
 
     def record_result(self, result: ReflexiveResult) -> None:
-        """``reflexion_end`` を emit し、収束理由 + 集計で span を閉じる。
+        """Emit ``reflexion_end`` and close the span with reason + aggregates.
 
-        集計は権威ある ``result.state`` から導出するので、emit 済みの episode/epoch イベント
-        個数と最終集計が常に整合する (metric 一貫性)。
+        Aggregates are derived from authoritative ``result.state``, so the
+        number of emitted episode/epoch events and final aggregates always stay
+        consistent (metric consistency).
         """
         stop_name = result.stop.name if result.stop is not None else None
         state = result.state
@@ -364,9 +394,10 @@ class ReflexionObserver:
         )
 
     def record_error(self, error: BaseException) -> None:
-        """外側ループが例外で抜けたときに ``status="error"`` の reflexion_end を残す。
+        """Record ``status="error"`` reflexion_end when the outer loop raises.
 
-        集計は観測済みの **最後の確定累積値** を載せる (確定済み episode/epoch ぶんを失わない)。
+        Aggregates use the **last observed committed cumulative values** so
+        already committed episode/epoch counts are not lost.
         """
         reason = f"{type(error).__name__}: {error}"
         self._emit_end(
@@ -384,7 +415,7 @@ class ReflexionObserver:
         )
 
     def record_incomplete(self) -> None:
-        """例外なしで result を取りこぼした保険パス用の ``status="incomplete"`` reflexion_end。"""
+        """``status="incomplete"`` reflexion_end for a no-exception missing-result path."""
         self._emit_end(
             status="incomplete",
             stop=None,
@@ -409,9 +440,9 @@ class ReflexionObserver:
             self.record_error(exc)
         elif not self._ended:
             self.record_incomplete()
-        return False  # 例外は握り潰さず伝播させる
+        return False  # Propagate exceptions instead of swallowing them.
 
-    # -- 内部 --------------------------------------------------------------
+    # -- Internals ---------------------------------------------------------
 
     @staticmethod
     def _warn(op: str, exc: BaseException) -> None:
@@ -436,10 +467,11 @@ class ReflexionObserver:
         evaluator_version: str,
         error: Optional[BaseException] = None,
     ) -> None:
-        """全終了パス共通: span を閉じ、対になる ``reflexion_end`` event を emit する。
+        """Common end path: close the span and emit matching ``reflexion_end``.
 
-        span 終了と event emit を必ず対で行い、二重 end は冪等に無視する。これにより OTel 側と
-        event sink 側の終了観測が常に一致する。
+        Span end and event emission are always paired, and duplicate end calls
+        are ignored idempotently. This keeps end observation consistent between
+        OTel and event sinks.
         """
         if self._ended:
             return
@@ -467,7 +499,8 @@ class ReflexionObserver:
             "evaluator_updates": evaluator_updates,
             "evaluator_version": evaluator_version,
         }
-        # best が -inf (ground-truth-backed episode が皆無) のときは JSON 非互換値を載せない。
+        # Omit JSON-incompatible best when it is -inf (no ground-truth-backed
+        # episodes).
         if best_gt_aggregate != float("-inf"):
             payload["best_gt_aggregate"] = best_gt_aggregate
         self._emit(
@@ -509,25 +542,32 @@ def run_observed_reflexion(
     span_name: str = "loop_agent.reflexion",
     on_sink_error: Optional[SinkErrorHandler] = None,
 ) -> ReflexiveResult:
-    """観測を配線して :func:`~loop_agent.reflexion.run_reflexion` を回す一括の入口。
+    """One-shot entry point that wires observation and runs ``run_reflexion``.
 
-    ``run_reflexion`` と同じ引数を取り、観測用に ``sinks`` と OTel 設定を足す。``episode`` は
-    観測ラッパで包んで ``episode_begin`` を出し、``on_episode`` / ``on_epoch`` には観測フックを
-    配線する (利用者の ``on_episode`` があれば合成して両方呼ぶ)。返り値は ``run_reflexion`` の
-    :class:`~loop_agent.reflexion.ReflexiveResult` をそのまま返す (判断ロジックは不変)。
+    Takes the same arguments as ``run_reflexion`` and adds ``sinks`` plus OTel
+    settings for observation. ``episode`` is wrapped to emit ``episode_begin``,
+    and observation hooks are wired to ``on_episode`` / ``on_epoch`` (if the
+    caller supplied ``on_episode``, both hooks are composed and called). The
+    return value is the :class:`~loop_agent.reflexion.ReflexiveResult` from
+    ``run_reflexion`` unchanged (decision logic is unchanged).
 
-    ``persist`` / ``initial_state`` はそのまま ``run_reflexion`` へ素通しするので、外側 Reflexion の
-    **永続化/resume** (Issue #29: :class:`~loop_agent.reflexion_store.DBReflexionLog`) と観測を
-    1 回の呼び出しで両立できる。resume seed (``initial_state``) で再開した run でも、抑止された末尾
-    境界は recovery で取り戻され ``on_epoch`` が emit されるので、観測の epoch 数が DB の settled
-    ``epoch`` と整合する (``persist`` が書く SoT と観測 event が食い違わない)。観測は side-channel
-    なので ``persist`` の永続化順序・内容には一切介入しない。
+    ``persist`` / ``initial_state`` are passed straight through to
+    ``run_reflexion``, so outer Reflexion **persistence/resume** (Issue #29:
+    :class:`~loop_agent.reflexion_store.DBReflexionLog`) and observation can
+    coexist in one call. Even for runs resumed from a resume seed
+    (``initial_state``), a suppressed tail boundary is recovered and emits
+    ``on_epoch``, keeping observed epoch counts consistent with the DB's settled
+    ``epoch`` (the SoT written by ``persist`` does not diverge from observation
+    events). Observation is a side channel and never intervenes in
+    ``persist`` persistence order or content.
 
-    ``reflexion_begin`` (最初の episode 前) → ``episode_begin`` / ``episode_end`` /
-    ``lesson_decision`` / ``epoch_boundary`` × N → ``reflexion_end`` (復帰後) の順で必ず emit
-    される。外側ループ本体の例外は ``status="error"`` の ``reflexion_end`` を残してから再送出する。
-    内側 episode が人間ゲートで pause した場合は ``status="paused"`` の ``reflexion_end`` を残す
-    (``run_reflexion`` の pause 伝播契約をそのまま観測する)。
+    Events are always emitted in this order: ``reflexion_begin`` (before the
+    first episode) -> ``episode_begin`` / ``episode_end`` /
+    ``lesson_decision`` / ``epoch_boundary`` x N -> ``reflexion_end`` (after
+    return). Exceptions from the outer loop body leave a ``status="error"``
+    ``reflexion_end`` before being re-raised. If an inner episode pauses at a
+    human gate, ``status="paused"`` ``reflexion_end`` is recorded (observing
+    ``run_reflexion``'s pause propagation contract as-is).
     """
     observer = ReflexionObserver(
         sinks,

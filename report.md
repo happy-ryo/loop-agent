@@ -1,555 +1,560 @@
-# loop-agent 調査・設計レポート — Loop Engineering と LoopAgent
+# loop-agent Research and Design Report — Loop Engineering and LoopAgent
 
-> 本レポートは loop-agent プロジェクトの **調査・設計フェーズ**の成果物である。実装は行わず、(1) Loop Engineering / LoopAgent の徹底調査、(2) claude-org-ja の資産棚卸しと再利用評価、(3) LoopAgent の設計（複数案比較→推奨1案）と段階ロードマップ、をまとめる。
+> This report is the deliverable for the **research and design phase** of the loop-agent project. It does not implement anything. It summarizes (1) an in-depth investigation of Loop Engineering / LoopAgent, (2) an inventory and reuse assessment of claude-org-ja assets, and (3) the LoopAgent design, including comparison of multiple options, one recommended option, and a phased roadmap.
 >
-> - 版: v1.0（2026-06-27）
-> - 対象リポジトリ: `https://github.com/happy-ryo/loop-agent`
-> - SoT: 本ファイル `report.md`（`report.html` は同内容の閲覧用単一ファイル）
+> - Version: v1.0 (2026-06-27)
+> - Target repository: `https://github.com/happy-ryo/loop-agent`
+> - SoT: this file, `report.md` (`report.html` is a single-file view of the same content)
 
 ---
 
-## 0. エグゼクティブサマリ
+## 0. Executive Summary
 
-**Loop Engineering とは**、「人間がエージェントに一手ずつプロンプトを打つ」のをやめ、**エージェントをプロンプトし・検証し・記憶させ・再実行する“システム（=ループ）そのもの”を設計する実践**を指す（2026年6月、Anthropic の Claude Code 開発責任者 Boris Cherny の発言を起点に実務家コミュニティで急速に普及した概念）[^le-def][^le-origin]。技術スタックとしては **prompt engineering（1ターンの指示）→ context engineering（推論時にモデルが見るトークン全体の構成）→ loop engineering（ターンをまたぐ継続・終了・再実行の制御層）** という3層の最上位に位置し、下2層を置き換えるのではなく **wrap（包む）**[^le-stack]。
+**Loop Engineering** means moving beyond "a human prompts an agent one move at a time" and instead **designing the system, or loop, that prompts, verifies, remembers, and reruns agents**. The concept spread rapidly through practitioner communities in June 2026, sparked by comments from Boris Cherny, Anthropic's head of Claude Code development[^le-def][^le-origin]. In the technical stack, it sits above **prompt engineering (single-turn instructions) -> context engineering (the full token composition visible to the model at inference time) -> loop engineering (the control layer for continuation, termination, and rerun across turns)**. It does not replace the two lower layers; it **wraps** them[^le-stack].
 
-**本レポートの結論（推奨設計）**: loop-agent の LoopAgent は、
+**Conclusion of this report (recommended design)**: the LoopAgent in loop-agent should:
 
-1. **最内ループ**を Anthropic 標準の `gather context → take action → verify → repeat` に揃え（各反復で必ず環境から ground truth を取得）[^anthropic-bea][^agent-sdk-loop]、
-2. その外側に **Reflexion 型の試行間メモリ＋言語的自己反省**層を重ねる二層構造とし[^reflexion]、
-3. 終了条件を **「意味的判定（検証可能ゴール / critic）」と「機械的上限（反復・トークン・時間）」の二重化**として実装し（全フレームワーク共通の業界標準）[^framework-common]、
-4. **状態を context に溜め込まず外部 SoT（`state.db` 相当）に外出し**し[^harness]、
-5. **人間ゲートは「不可逆・影響範囲大」のアクションに限定**する[^hitl][^verify-hitl]、
+1. Align the **innermost loop** with Anthropic's standard `gather context -> take action -> verify -> repeat` pattern, obtaining ground truth from the environment on every iteration[^anthropic-bea][^agent-sdk-loop].
+2. Add an outer two-layer structure with **Reflexion-style cross-attempt memory and linguistic self-reflection**[^reflexion].
+3. Implement termination conditions as a **dual structure of semantic judgment (verifiable goal / critic) and mechanical limits (iterations, tokens, time)**, which is the industry-standard pattern common to major frameworks[^framework-common].
+4. **Keep state out of context and externalize it into an external SoT equivalent to `state.db`**[^harness].
+5. **Limit human gates to irreversible, high-blast-radius actions**[^hitl][^verify-hitl].
 
-という **「単一制御層 + 共有状態機械 + 段階的な org 資産組込」型（後述の案C）** を推奨する。
+Therefore, this report recommends the **"single control layer + shared state machine + phased integration of org assets" design (Option C below)**.
 
-**claude-org-ja の資産再利用**: 調査の結果、loop-agent が必要とする要素の大半は claude-org-ja に既製の高品質実装が存在する。特に以下は再利用価値が高い:
+**Reuse of claude-org-ja assets**: the investigation found that most elements required by loop-agent already exist in high-quality implementations in claude-org-ja. The following are especially valuable for reuse:
 
-| 要素 | claude-org-ja 資産 | 判定 |
+| Element | claude-org-ja asset | Assessment |
 |---|---|---|
-| ループ状態の永続化（SoT） | `tools/state_db/`（SQLite + StateWriter transaction + post-commit snapshot） | reuse-as-is / adapt |
-| ループ間通知・wake 配送 | transport（renga/broker, push一次/pull fallback, at-most-once） | extract-pattern |
-| フィードバック（self-improving） | org-retro / org-curate / knowledge（raw→curated, 閾値起動） | adapt |
-| 観測・人間ゲート・暴走検知 | attention-watcher / pr-watch / org-escalation / pending_decisions | reuse-as-is / adapt |
-| 終了条件・状態遷移の型 | delegation-lifecycle / state-semantics contract | reference-only |
-| 反復対象の選定 | work-discovery（計算層＋配達層の二層分離） | adapt |
+| Loop state persistence (SoT) | `tools/state_db/` (SQLite + StateWriter transaction + post-commit snapshot) | reuse-as-is / adapt |
+| Inter-loop notification and wake delivery | transport (renga/broker, push primary/pull fallback, at-most-once) | extract-pattern |
+| Feedback (self-improving) | org-retro / org-curate / knowledge (raw -> curated, threshold-triggered) | adapt |
+| Observation, human gates, runaway detection | attention-watcher / pr-watch / org-escalation / pending_decisions | reuse-as-is / adapt |
+| Termination-condition and state-transition types | delegation-lifecycle / state-semantics contract | reference-only |
+| Selection of iteration targets | work-discovery (two-layer separation of computation and delivery) | adapt |
 
-**ロードマップ**: **PoC（最小ループ＋ハード上限）→ MVP（状態機械＋state.db SoT＋二層終了条件＋観測）→ 本格（org のフィードバックループ・transport・人間ゲートを統合した自律 LoopAgent）** の3段階で漸進する。
+**Roadmap**: progress in three phases: **PoC (minimal loop + hard limits) -> MVP (state machine + state.db SoT + two-layer termination conditions + observability) -> full system (autonomous LoopAgent integrating org feedback loops, transport, and human gates)**.
 
 ---
 
-## 1. 背景と目的
+## 1. Background and Purpose
 
-### 1.1 プロジェクトの狙い
+### 1.1 Project Objective
 
-loop-agent は、本格的な **Loop Engineering** を実現する **LoopAgent** の設計・実装プロジェクトである。本レポートはその起点として、
+loop-agent is a design and implementation project for a **LoopAgent** that realizes full-scale **Loop Engineering**. As the starting point, this report:
 
-- Loop Engineering と LoopAgent の概念・系譜・設計論点を web で徹底調査し、
-- 既存資産 claude-org-ja から再利用可能なものを棚卸し・評価し、
-- それらを踏まえた LoopAgent のアーキテクチャ設計と段階ロードマップを提示する。
+- investigates the concepts, lineage, and design issues around Loop Engineering and LoopAgent through extensive web research;
+- inventories and evaluates reusable assets from the existing claude-org-ja project; and
+- presents a LoopAgent architecture design and phased roadmap based on that work.
 
-本フェーズでは**実装は行わない**（設計まで）。
+This phase **does not include implementation**; it covers design only.
 
-### 1.2 用語定義
+### 1.2 Terminology
 
-| 用語 | 定義 | 出典 |
+| Term | Definition | Source |
 |---|---|---|
-| **agent（エージェント）** | ツールをループ内で自律的に使用する LLM（"LLMs autonomously using tools in a loop"）。これが agentic system の最小核。 | Anthropic[^ctx-eng] |
-| **agentic loop** | 各反復で context を集約 → LLM が推論し行動選択 → 実行 → 結果を観測 → 次反復にフィードバック、する反復実行サイクル。 | Oracle[^oracle-loop] |
-| **prompt engineering** | 単一ターンの指示の書き方の設計。 | [^le-stack] |
-| **context engineering** | 推論時にモデルが見るトークン全体（指示・ツール・例・履歴・取得文書）の構成・キュレーション。prompt engineering の自然な発展。 | Anthropic[^ctx-eng] |
-| **loop engineering** | ターンをまたいでエージェントを継続・終了・再実行させる制御層の設計。prompt/context engineering を wrap する。 | [^le-def][^le-stack] |
-| **LoopAgent** | loop engineering を体現する実体。トリガー＋検証可能ゴール＋ガードレールで agentic loop を包んだ自律実行エージェント。本プロジェクトの設計対象。 | 本レポートの定義 |
+| **agent** | An LLM that autonomously uses tools in a loop ("LLMs autonomously using tools in a loop"). This is the minimal core of an agentic system. | Anthropic[^ctx-eng] |
+| **agentic loop** | An iterative execution cycle in which each iteration aggregates context, the LLM reasons and selects an action, the action is executed, the result is observed, and the observation is fed into the next iteration. | Oracle[^oracle-loop] |
+| **prompt engineering** | Designing the wording of single-turn instructions. | [^le-stack] |
+| **context engineering** | Structuring and curating the full set of tokens visible to the model during inference: instructions, tools, examples, history, retrieved documents, and related material. A natural evolution of prompt engineering. | Anthropic[^ctx-eng] |
+| **loop engineering** | Designing the control layer that continues, terminates, and reruns agents across turns. It wraps prompt/context engineering. | [^le-def][^le-stack] |
+| **LoopAgent** | The entity that embodies loop engineering: an autonomous execution agent that wraps an agentic loop with triggers, verifiable goals, and guardrails. This is the design target of this project. | Definition in this report |
 
 ---
 
-## 2. Loop Engineering 徹底調査
+## 2. In-Depth Investigation of Loop Engineering
 
-> 本章は web 調査（fan-out 検索 → 出典精読 → 主張の独立反証検証）に基づく。主要主張には出典 URL を付す。Loop Engineering 系のブログ主張は実務家発の新興概念であり急速に進化中であるため、設計判断は可能な限り Anthropic 公式 docs と査読系論文（ReAct / Reflexion 等）にアンカーした。
+> This chapter is based on web research: fan-out search, close reading of sources, and independent adversarial verification of claims. Source URLs are attached to major claims. Because Loop Engineering blog claims are an emerging practitioner-driven concept and are evolving quickly, design decisions are anchored as much as possible in official Anthropic docs and peer-reviewed or research-paper lineage such as ReAct and Reflexion.
 
-### 2.1 Loop Engineering とは（定義・起源・3層スタック）
+### 2.1 What Loop Engineering Is: Definition, Origin, and Three-Layer Stack
 
-**定義**。Loop Engineering は「エージェントをプロンプト・検証・記憶・再実行するシステム自体を設計する実践」であり、手作業のプロンプト入力を**ゴールベースの自動化**に置き換える[^le-def]。agentic loop 自体は **`trigger`（イベント / スケジュール / 人間の指示）＋ `verifiable goal`（検証可能な目標）** の2要素で構成され、エージェントが start → run → ゴール到達チェック → 未達なら再ループ、を人間の介在なしに回す。単なる自動化（あらかじめ決めた手順の実行）と違い、ループ内に**意思決定（ゴール到達の能動評価）が埋め込まれている**点が本質的差異である[^le-def]。
+**Definition**. Loop Engineering is "the practice of designing the system itself that prompts, verifies, remembers, and reruns agents"; it replaces manual prompt entry with **goal-based automation**[^le-def]. An agentic loop itself consists of two elements: **a `trigger` (event / schedule / human instruction) and a `verifiable goal` (a goal that can be checked)**. The agent cycles through start -> run -> goal-achievement check -> loop again if unmet, without human intervention. Unlike simple automation, which executes predetermined steps, the essential difference is that **decision-making, namely active evaluation of whether the goal has been reached, is embedded inside the loop**[^le-def].
 
-> 独立検証の結果: この定義は SmartScope（"designing the system that prompts, checks, remembers, and re-runs AI agents"）・Firecrawl・MindStudio（"replaces manual prompting with goal-based automation"）など複数の一次・二次ソースでほぼ逐語的に裏付けられ、矛盾するソースは見つからなかった（verdict: **supported**）[^v-le-def]。
+> Independent verification result: this definition is supported almost verbatim by multiple primary and secondary sources, including SmartScope ("designing the system that prompts, checks, remembers, and re-runs AI agents"), Firecrawl, and MindStudio ("replaces manual prompting with goal-based automation"). No contradictory sources were found (verdict: **supported**)[^v-le-def].
 
-**起源**。学術用語ではなく **2025–2026 の実務家由来**の概念である。2026年6月、Boris Cherny（Anthropic, Claude Code 開発責任者）の発言 *"I don't prompt Claude anymore. I have loops running that prompt Claude and figuring out what to do. My job is to write loops."* がインタビュー動画クリップで拡散し（24時間で約70万ビュー、その後数百万ビュー規模）、急速に広まった[^le-origin]。普及には Cherny に加え Addy Osmani（「自分をエージェントにプロンプトする人から外し、それを行うシステムを設計する」という framing）、Peter Steinberger（loop-centric ワークフロー）らが寄与した[^le-origin]。
+**Origin**. This is not an academic term; it is a **practitioner-originated concept from 2025-2026**. In June 2026, a video clip of Boris Cherny (Anthropic, head of Claude Code development) saying *"I don't prompt Claude anymore. I have loops running that prompt Claude and figuring out what to do. My job is to write loops."* spread through interviews and social media, reaching about 700,000 views in 24 hours and later several million views, rapidly popularizing the idea[^le-origin]. Adoption was also influenced by Addy Osmani's framing of taking oneself out of the role of prompting agents and instead designing systems that do it, and by Peter Steinberger's loop-centric workflows[^le-origin].
 
-**3層スタック**。Loop Engineering は次の3層の最上位「制御層」にあたる[^le-stack]:
+**Three-layer stack**. Loop Engineering is the top "control layer" in the following three-layer stack[^le-stack]:
 
-```
+```text
 ┌─────────────────────────────────────────────┐
-│ Loop Layer    : ターンをまたぐ継続・終了・再実行    │ ← loop engineering（制御層）
-│   失敗モード: 誤った方向を追い続ける               │
+│ Loop Layer    : continuation, termination,   │ ← loop engineering (control layer)
+│                 and rerun across turns       │
+│   Failure mode: keeps pursuing the wrong      │
+│                 direction                    │
 ├─────────────────────────────────────────────┤
-│ Context Layer : 任意時点でモデルに見えている情報全体 │ ← context engineering
-│   失敗モード: 古い/肥大したデータ                  │
+│ Context Layer : all information visible to    │ ← context engineering
+│                 the model at a given time     │
+│   Failure mode: stale/bloated data            │
 ├─────────────────────────────────────────────┤
-│ Prompt Layer  : 単一ターンの指示                  │ ← prompt engineering
-│   失敗モード: 制約の誤解                          │
+│ Prompt Layer  : single-turn instructions      │ ← prompt engineering
+│   Failure mode: misunderstanding constraints  │
 └─────────────────────────────────────────────┘
-loop engineering は下2層を「置き換える」のではなく「wrap する」
+loop engineering does not "replace" the two lower layers; it "wraps" them
 ```
 
-Anthropic 自身もエージェントを端的に **"LLMs autonomously using tools in a loop"** と定義し、ループ内で走るエージェントは次の推論ターンに関連しうるデータを生成し続けるため **context の周期的キュレーションが不可欠**だと指摘している[^ctx-eng]。
+Anthropic itself defines agents succinctly as **"LLMs autonomously using tools in a loop"** and notes that agents running inside a loop continually generate data that may be relevant to later reasoning turns, making **periodic curation of context essential**[^ctx-eng].
 
-**人間の役割の上昇**。「コードを書く → プロンプトを書く → ループを設計する → ループを回す工場を作る」へと段階的に上がる[^le-def]。Loop Engineering の本質は人間が継続的介入から **「事前のゴール仕様＋ガードレール設計」** へ移ることにある。なお実装上、while ループ本体は易しい部分であり、難所は **`context` と `stop condition`（終了チェック / コスト上限 budget / 達成 target）**、さらに本番運用には標準フレームワークに欠ける **governed workspace（ID・スコープ付き権限・監査証跡・高速ロールバック）** が第6の必須要素だと指摘されている[^le-stack]。
+**Elevation of the human role**. The human role rises step by step: "write code -> write prompts -> design loops -> build factories that run loops"[^le-def]. The essence of Loop Engineering is the human's move away from continuous intervention and toward **up-front goal specification and guardrail design**. In implementation, the `while` loop body itself is the easy part; the hard parts are **`context` and `stop condition` (termination checks / cost budget / achievement target)**. For production operation, a **governed workspace (identity, scoped permissions, audit trail, fast rollback)** has also been identified as a sixth required element missing from standard frameworks[^le-stack].
 
-### 2.2 agentic loop の系譜（古典）
+### 2.2 Lineage of Agentic Loops: Classical Patterns
 
-古典的な agentic loop は大きく2系統に分かれる。
+Classical agentic loops fall broadly into two families.
 
-**(A) 単一エピソード内で観測しながら進む「推論-行動」ループ系**
+**(A) Reasoning-action loops that proceed through observation inside a single episode**
 
-- **ReAct（Reason + Act, Yao et al., ICLR 2023）**: `Thought → Action → Observation` を interleave するループ。推論が行動計画の誘導・追跡・更新と例外処理を担い、行動が外部知識源（API / 環境）との接続を担う。chain-of-thought で生じる hallucination と誤伝播を、環境との対話で grounding することで抑制する。HotpotQA / Fever / ALFWorld / WebShop で評価し、ALFWorld で +34%、WebShop で +10% の絶対改善。**現代の「tool-in-the-loop」エージェントの直接の祖**である[^react]。
-  > 独立検証: 原論文アブストラクトとほぼ逐語一致（"reasoning traces help the model induce, track, and update action plans as well as handle exceptions" / "actions allow it to interface with ... external sources"）。verdict: **supported**[^v-react]。
-- **Plan-and-Execute**: planner（LLM）が多段計画を生成 → executor（別エージェント/ツール）が各ステップを孤立実行 → 完了後に re-plan プロンプトで「完了 or 追加計画」を判断する明示ループ。利点は (1) 明示的な長期計画、(2) 役割分離（planner に強モデル・executor に弱/小モデルでコスト最適化）[^plan-exec]。
+- **ReAct (Reason + Act, Yao et al., ICLR 2023)**: a loop that interleaves `Thought -> Action -> Observation`. Reasoning guides, tracks, and updates action plans and handles exceptions; action connects the model to external knowledge sources such as APIs or environments. It suppresses hallucination and error propagation from chain-of-thought by grounding the model through interaction with the environment. It was evaluated on HotpotQA / Fever / ALFWorld / WebShop, with absolute improvements of +34% on ALFWorld and +10% on WebShop. It is **the direct ancestor of modern tool-in-the-loop agents**[^react].
+  > Independent verification: the description matches the original paper abstract almost verbatim ("reasoning traces help the model induce, track, and update action plans as well as handle exceptions" / "actions allow it to interface with ... external sources"). Verdict: **supported**[^v-react].
+- **Plan-and-Execute**: an explicit loop in which a planner (LLM) generates a multi-step plan, an executor (another agent or tool) runs each step in isolation, and a re-plan prompt determines after completion whether the work is done or more planning is needed. Its advantages are (1) explicit long-horizon planning and (2) role separation, allowing cost optimization with a stronger model for the planner and a weaker/smaller model for the executor[^plan-exec].
 
-**(B) 複数試行をまたいで自己改善する「反省」ループ系**
+**(B) Reflection loops that improve themselves across multiple attempts**
 
-- **Self-Refine（Madaan et al., NeurIPS 2023）**: 単一 LLM が generator / feedback-provider / refiner を兼ね、`generate → self-feedback → refine` を反復するテスト時手法。追加学習・教師データ・RL 不要。7タスクで平均 ~20% 絶対改善[^self-refine]。
-- **Reflexion（Shinn et al., NeurIPS 2023）**: weight 更新でなく**言語的フィードバック（verbal reinforcement）**で改善するループ。Actor（方策 LLM）/ Evaluator（軌跡の成否判定。別 LLM・ヒューリスティック・**外部実行=unit test**）/ Self-Reflection（失敗の言語的サマリ生成）の3役で、環境報酬を言語的フィードバックに変換し **episodic memory** に蓄積、次試行を改善する。HumanEval pass@1 91%（当時の GPT-4 80% 超）[^reflexion]。
+- **Self-Refine (Madaan et al., NeurIPS 2023)**: a test-time method in which a single LLM acts as generator, feedback provider, and refiner, iterating through `generate -> self-feedback -> refine`. It requires no additional training, teacher data, or RL. It achieved an average absolute improvement of about 20% across seven tasks[^self-refine].
+- **Reflexion (Shinn et al., NeurIPS 2023)**: a loop that improves through **linguistic feedback (verbal reinforcement)** rather than weight updates. It uses three roles: Actor (policy LLM), Evaluator (judges trajectory success using another LLM, heuristics, or **external execution such as unit tests**), and Self-Reflection (generates a linguistic summary of failure). It converts environmental rewards into linguistic feedback, stores them in **episodic memory**, and improves the next attempt. It reached 91% HumanEval pass@1, exceeding GPT-4's then-current 80%[^reflexion].
 
-両系統を包含する上位フレームが軍事起源の **OODA loop（Observe → Orient → Decide → Act, John Boyd）**で、Anthropic の "models using tools in a loop" 定義とよく対応する。ただし Schneier らは各段に固有のセキュリティリスク（Observe=prompt injection、Orient=文脈汚染、Decide=reward hacking、Act=action hijacking）を指摘し、**「速度・知性・セキュリティを同時達成できない security trilemma」**を主張する。ループ設計では各段の入力検証と人間ゲートが本質的である[^ooda]。
+The broader frame that contains both families is the military-origin **OODA loop (Observe -> Orient -> Decide -> Act, John Boyd)**, which maps well to Anthropic's "models using tools in a loop" definition. Schneier and others, however, point out stage-specific security risks: Observe = prompt injection, Orient = context pollution, Decide = reward hacking, Act = action hijacking. They argue for a **security trilemma in which speed, intelligence, and security cannot all be achieved simultaneously**. In loop design, input validation and human gates at each stage are essential[^ooda].
 
-**Self-Refine と Reflexion の反省粒度の違い**は設計上重要: Self-Refine は「同一エピソード内で同じ出力を磨く（即時品質ゲート）」、Reflexion は「試行をまたいで memory に学びを残す（長期改善）」。後述するとおり、claude-org の retro/curate フィードバックループは後者にマッピングできる。
+The difference in reflection granularity between **Self-Refine and Reflexion** is important for design: Self-Refine polishes the same output within the same episode as an immediate quality gate, while Reflexion leaves learning in memory across attempts as long-term improvement. As discussed below, claude-org's retro/curate feedback loops can be mapped to the latter.
 
-### 2.3 自律エージェント第一世代の系譜と教訓（AutoGPT / BabyAGI / AgentGPT）
+### 2.3 First-Generation Autonomous Agents and Lessons Learned: AutoGPT / BabyAGI / AgentGPT
 
-2023年4月前後に登場した第一世代（AutoGPT / BabyAGI / AgentGPT）は、いずれも「タスク生成 → 実行 → 再計画」を `while True` で回す素朴なループを核とした。**そのほとんどが実用で苦戦し、現代のループ設計原則は「その失敗の裏返し」として収束した**。これは loop-agent が踏むべきでない轍の宝庫であり、特に重視する。
+The first generation that emerged around April 2023, including AutoGPT / BabyAGI / AgentGPT, all used a naive `while True` loop around "task generation -> execution -> replanning." **Most struggled in practical use, and modern loop-design principles converged as the inverse of those failures**. This is a valuable catalog of mistakes that loop-agent must avoid.
 
-- **BabyAGI（Yohei Nakajima, 2023/4）**: `while True` 内に3つの LLM コール（Execution / Task Creation / Prioritization）を連鎖させただけの**約105行の PoC**。タスク依存も完了基準もなく、**終了条件を一切持たなかった**（無限ループは意図的設計だった）。さらに、Pinecone ベクトル記憶（ada-002 top-5 検索）の出力が**実行プロンプトに一度も渡されていない**——記憶機構があっても意思決定に「配線」されなければ機能しないという教訓[^babyagi]。
-  > 独立検証: 「105行」「3 LLM コールの連鎖」「終了条件なし」はいずれも複数出典で裏付け（"The loop never terminates. There is no completion condition."）。verdict: **supported**[^v-babyagi]。
-  > BabyAGI はその後9世代の進化で、依存関係・終了条件（全タスク complete で停止）・永続化（SQLite ナレッジグラフ）・並列・コンテキスト予算化・エラー回復を段階的に獲得した（最新 BabyAGI 3 は約33,500行）[^babyagi]。
-- **AutoGPT**: GPT-4 でゴール分解 + ツール実行を回すが、終了ロジックを欠き完了判定を自然言語評価に頼ったため「**常にもっと作業が必要**」へ偏った。根本原因は (1) 測定可能指標のない曖昧な完了基準、(2) 新旧プランを比較しない**進捗検知の欠如**、(3) 完璧主義バイアス、(4) API/時間/コストの追跡もサーキットブレーカもない**リソース無自覚**。具体例: AI史調査で300超 API コール・8反復しても要約を出さない research spiral、Downloads フォルダを15回以上再分類し続ける、8K context を毎回上限まで使う50ステップの小タスクで約 **$14.40**[^autogpt-fail]。
-- **AgentGPT（Reworkd）**: ブラウザで自律ループを回す製品化版。loop limit を唯一の防御線とし、蓄積コンテキストがモデル窓を超えてクラッシュ/無限ループ、セッション跨ぎで記憶喪失、クラウド限定、という制約を抱えた。GitHub リポジトリは **2026年1月にアーカイブ（read-only）化**された[^agentgpt]。
+- **BabyAGI (Yohei Nakajima, 2023/4)**: an **approximately 105-line PoC** that simply chained three LLM calls inside `while True`: Execution / Task Creation / Prioritization. It had no task dependencies, no completion criteria, and **no termination condition at all**; the infinite loop was intentional. In addition, the output of its Pinecone vector memory (ada-002 top-5 search) was **never passed into the execution prompt**. The lesson is that a memory mechanism does not work unless it is wired into decision-making[^babyagi].
+  > Independent verification: "105 lines," "chain of three LLM calls," and "no termination condition" are all supported by multiple sources ("The loop never terminates. There is no completion condition."). Verdict: **supported**[^v-babyagi].
+  > Across nine subsequent generations, BabyAGI gradually acquired dependencies, termination conditions (stop when all tasks are complete), persistence (SQLite knowledge graph), parallelism, context budgeting, and error recovery. The latest BabyAGI 3 is about 33,500 lines[^babyagi].
+- **AutoGPT**: it ran goal decomposition and tool execution with GPT-4, but because it lacked termination logic and relied on natural-language evaluation for completion judgments, it biased toward "**more work is always needed**." The root causes were (1) ambiguous completion criteria without measurable metrics, (2) **lack of progress detection** comparing old and new plans, (3) perfectionism bias, and (4) **resource unawareness**, with no API/time/cost tracking and no circuit breaker. Concrete examples include a research spiral that made over 300 API calls and 8 iterations for an AI-history research task without producing a summary, repeatedly reorganizing a Downloads folder more than 15 times, and a 50-step small task that consumed the 8K context limit every time and cost about **$14.40**[^autogpt-fail].
+- **AgentGPT (Reworkd)**: a productized browser-based autonomous loop. It used a loop limit as its only defense, suffered crashes/infinite loops when accumulated context exceeded the model window, forgot memory across sessions, and was cloud-only. Its GitHub repository was **archived and made read-only in January 2026**[^agentgpt].
 
-**第一世代が残した最大の設計教訓**[^autogpt-fail][^babyagi][^simpler]:
+**Core design lessons from the first generation**[^autogpt-fail][^babyagi][^simpler]:
 
-1. **「無限の再優先化ループ」→「依存関係を持つ有限タスクグラフ + 明示的終了条件」**への転換。
-2. **暴走防止のハード上限とサーキットブレーカー**（イテレーション・累積トークン/コスト・経過時間）。
-3. **進捗検知・重複検知を状態管理に組み込む**（同一行動の反復を検出して打ち切る）。
-4. **記憶は「保持」だけでなく「意思決定への配線」まで検証**する。
-5. **人間ゲートと観測可能性**を初期から組み込む。
-6. **`simpler loops win`**: 凝った多段推論より、少数の信頼できるツール + 良質なコンテキスト管理が勝つ。
+1. Move from **"infinite reprioritization loops" to "finite task graphs with dependencies and explicit termination conditions."**
+2. Add **hard limits and circuit breakers** for runaway prevention: iterations, cumulative tokens/cost, and elapsed time.
+3. Build **progress detection and duplicate detection** into state management so repeated identical actions can be detected and stopped.
+4. Verify not only that memory is retained, but also that it is **wired into decision-making**.
+5. Build in **human gates and observability** from the beginning.
+6. **`simpler loops win`**: a small number of reliable tools plus good context management beats elaborate multi-stage reasoning.
 
-### 2.4 プロダクションの agent harness loop
+### 2.4 Production Agent Harness Loops
 
-**Anthropic の設計指針**は一貫して **「最小構成から始め、必要な時だけ複雑さを足す」** と **「workflow（コードで経路を固定）と agent（LLM が自律的に経路を決定）を区別する」** を中核に据える[^anthropic-bea]。
-> 独立検証: "finding the simplest solution possible, and only increasing complexity when needed" / Workflows = "orchestrated through predefined code paths" / Agents = "dynamically direct their own processes" をいずれも逐語確認。verdict: **supported**[^v-bea]。
+**Anthropic's design guidance** consistently centers on **starting with the simplest possible configuration and adding complexity only when necessary**, and on **distinguishing workflows (paths fixed by code) from agents (LLMs autonomously decide their own paths)**[^anthropic-bea].
+> Independent verification: the phrases "finding the simplest solution possible, and only increasing complexity when needed," Workflows = "orchestrated through predefined code paths," and Agents = "dynamically direct their own processes" were all confirmed verbatim. Verdict: **supported**[^v-bea].
 
-自律 agent の本体は「拡張 LLM（retrieval/tools/memory）が環境フィードバックを得ながらツールを使うループ」であり、**各ステップで環境から ground truth（tool call results / code execution）を得ることが決定的に重要**、かつ**最大反復数などの停止条件を組み込むのが定石**である[^anthropic-bea]。
+The core of an autonomous agent is "a loop in which an augmented LLM (retrieval/tools/memory) uses tools while receiving environmental feedback." It is decisively important to obtain **ground truth from the environment at every step (tool call results / code execution)**, and it is standard practice to build in stopping conditions such as a maximum number of iterations[^anthropic-bea].
 
-**Claude Agent SDK / Claude Code** はこのループを **`gather context → take action → verify work → repeat`** として実装する。turn（ツール呼び出し往復）単位で進み、ツール呼び出しのない応答が出たら終了する。runaway 防止に **`max_turns` / `max_budget_usd`** を持ち（"Setting a budget is a good default for production agents."）、context が上限に近づくと自動 compaction（`compact_boundary` 発火）で要約圧縮する。終了は `ResultMessage` の subtype（`success` / `error_max_turns` / `error_max_budget_usd` / `error_during_execution`）で判別する[^agent-sdk-loop][^agent-sdk-blog]。
+**Claude Agent SDK / Claude Code** implements this loop as **`gather context -> take action -> verify work -> repeat`**. It advances by turns (tool-call round trips) and terminates when a response contains no tool calls. It has **`max_turns` / `max_budget_usd`** to prevent runaway behavior ("Setting a budget is a good default for production agents."). When context approaches the limit, automatic compaction is triggered through `compact_boundary` to summarize and compress it. Termination is distinguished by the `ResultMessage` subtype: `success` / `error_max_turns` / `error_max_budget_usd` / `error_during_execution`[^agent-sdk-loop][^agent-sdk-blog].
 
-**検証（verify）の3方式**: ルールベース（lint/test/typecheck）、視覚フィードバック（screenshot）、LLM-as-judge。**最良はルールを明示し「どのルールがなぜ失敗したか」を返すこと**[^agent-sdk-blog]。
+**Three verification methods**: rule-based checks (lint/test/typecheck), visual feedback (screenshot), and LLM-as-judge. **The best pattern is to make rules explicit and return which rule failed and why**[^agent-sdk-blog].
 
-**長時間稼働 harness** は「1回で完遂」ではなく **「毎セッションでクリーンな状態を残しつつ漸進」** する設計が要。各セッションは前回の記憶を持たない前提で、Initializer/Coding の役割分離、feature list（JSON, pass/fail）・progress ファイル・git 履歴を **SoT 化**、テストによる自己検証を行う。明示しないと未テストで完了扱いするため「Self-verify all features. Only mark as 'passing' after careful testing」を指示する[^harness]。
+**Long-running harnesses** should not be designed to finish everything in one run; they should **progress incrementally while leaving clean state after every session**. Assuming each session has no memory of the previous one, the design separates Initializer and Coding roles, makes the feature list (JSON, pass/fail), progress file, and git history into the **SoT**, and uses tests for self-verification. If not explicit, the agent may mark work complete without testing, so the instruction should say: "Self-verify all features. Only mark as 'passing' after careful testing"[^harness].
 
-**スケジューリングは3層**[^scheduled]:
+**Scheduling has three layers**[^scheduled]:
 
-| 層 | 基盤 | 最小間隔 | ローカルファイル | 用途 |
+| Layer | Foundation | Minimum interval | Local files | Use case |
 |---|---|---|---|---|
-| cloud routines（`/schedule`） | Anthropic 基盤 | 1h | 不可（fresh clone） | 確実な無人実行 |
-| Desktop scheduled task | 自マシン常駐 | 1m | 可 | ローカル資産が要る定期実行 |
-| セッション内 `/loop`（CronCreate/List/Delete） | 開いているセッション | 1m | 可 | セッション中の簡易ポーリング |
+| cloud routines (`/schedule`) | Anthropic infrastructure | 1h | No (fresh clone) | Reliable unattended execution |
+| Desktop scheduled task | Resident process on own machine | 1m | Yes | Periodic execution that needs local assets |
+| In-session `/loop` (CronCreate/List/Delete) | Open session | 1m | Yes | Simple polling during a session |
 
-`/loop` と Cron 系はセッションスコープで、**recurring は作成7日後に最終1回発火して自己削除**し「忘れられたループがどれだけ走り続けうるかを境界付ける」。jitter で API 集中を回避、catch-up なし、`CLAUDE_CODE_DISABLE_CRON=1` で全停止できる。`/loop` の prompt-only モードでは Claude が 1分〜1時間で動的に間隔を選び、provably complete なら自分で打ち切る[^scheduled]。
+`/loop` and Cron features are session-scoped. **Recurring tasks fire one final time seven days after creation and then delete themselves**, bounding how long a forgotten loop can continue running. Jitter prevents API concentration; there is no catch-up; `CLAUDE_CODE_DISABLE_CRON=1` can disable all scheduled tasks. In `/loop` prompt-only mode, Claude dynamically chooses an interval from 1 minute to 1 hour and terminates itself when the task is provably complete[^scheduled].
 
-**Cursor / Devin** も `plan → execute → verify → iterate` の同型ループで、lint/test/型チェックの pass/fail を自己修正信号にする。Cursor は `typecheck && lint` を成功時のみ先へ進めて「error 積み上げ」を防止。Devin は構造化プランを先に作り（50ステップ級）、test 失敗等の full context で dynamic re-planning する[^cursor-devin]。
+**Cursor / Devin** also use isomorphic `plan -> execute -> verify -> iterate` loops, using pass/fail from lint/test/type checks as self-correction signals. Cursor advances only after `typecheck && lint` passes, preventing error accumulation. Devin first creates a structured plan of around 50 steps and dynamically replans with full context such as test failures[^cursor-devin].
 
-### 2.5 フレームワークの LoopAgent 構文
+### 2.5 LoopAgent Syntax in Frameworks
 
-主要フレームワークは「ループ」を2つの設計流派で実現している。
+Major frameworks implement loops through two design styles.
 
-**(1) 宣言的な専用ループ構造**
+**(1) Declarative dedicated loop structures**
 
-- **Google ADK `LoopAgent`**: sub_agents を順に反復実行する**決定論的**ワークフローエージェント。`LoopAgent(name=..., sub_agents=[critic, refiner], max_iterations=5)`。終了は **(a) `max_iterations` 到達**、**(b) いずれかの sub-agent が `escalate=True` を返す（`exit_loop` ツール: `tool_context.actions.escalate = True`）** の2系統。公式 docs は「**LoopAgent 自体は停止タイミングを決めない。終了メカニズムは必ず自分で実装せねばならない**」と明記する[^adk]。
-  > 独立検証: sub_agents 反復・決定論・終了2系統（max_iterations + escalate）を公式 docs で確認。verdict: **supported**（「宣言的」は公式には "deprecated 用語ではなく template/deterministic" がより正確という軽微な留保）[^v-adk]。
-- **AutoGen（v0.4+）**: 合成可能な `termination_condition` オブジェクトでチーム（ループ）を止める。`MaxMessageTermination(10) | TextMentionTermination("APPROVE")` のように **OR `|` / AND `&` で合成可能**。他に TokenUsage / Timeout / Handoff / External / Functional 終了条件がある[^autogen]。
+- **Google ADK `LoopAgent`**: a **deterministic** workflow agent that repeatedly executes `sub_agents` in sequence. Example: `LoopAgent(name=..., sub_agents=[critic, refiner], max_iterations=5)`. It has two termination paths: **(a) reaching `max_iterations`** and **(b) any sub-agent returning `escalate=True` through the `exit_loop` tool (`tool_context.actions.escalate = True`)**. The official docs clearly state that the **LoopAgent itself does not decide when to stop; the termination mechanism must be implemented by the user**[^adk].
+  > Independent verification: repeated sub_agents, determinism, and the two termination paths (max_iterations + escalate) were confirmed in official docs. Verdict: **supported** (minor caveat: "declarative" is less precise than the official "template/deterministic" wording)[^v-adk].
+- **AutoGen (v0.4+)**: stops a team (loop) using composable `termination_condition` objects. Conditions can be combined with **OR `|` / AND `&`**, as in `MaxMessageTermination(10) | TextMentionTermination("APPROVE")`. Other condition types include TokenUsage / Timeout / Handoff / External / Functional[^autogen].
 
-**(2) 明示的グラフ / 状態機械**
+**(2) Explicit graphs / state machines**
 
-- **LangGraph**: 専用ループ構造でなく `StateGraph` 上の `add_conditional_edges` と再帰エッジ（または `Command(goto=...)`）で循環を作り、**`recursion_limit`（デフォルト1000 super-steps）**を安全ネットとする。状態は共有 state を各ノードが update して受け渡す。docs は「recursion_limit は主たる制御フロー手段ではなく、well-designed なグラフロジックの代替ではない」と注意する[^langgraph]。
-- **CrewAI**: Flows の `@router` デコレータ + state のイテレーションカウンタで loop-back を表現。Agent 単体には `max_iter`（デフォルト25）。なお max_iter 到達後も止まらない既知バグ報告があり、**安全網の多層化**が必要[^crewai]。
-- **OpenAI Agents SDK**: 内部 run loop（モデル呼び出し → tool 実行 → handoff → final_output で終了）を `max_turns` で制限し、`error_handlers` で `MaxTurnsExceeded` を**制御された最終出力に変換**できる。前身の Swarm は2025年3月に Agents SDK へ置換され非推奨[^openai-sdk]。
+- **LangGraph**: rather than a dedicated loop structure, it builds cycles on a `StateGraph` using `add_conditional_edges` and recursive edges, or `Command(goto=...)`, with **`recursion_limit` (default 1000 super-steps)** as a safety net. State is passed by having each node update shared state. The docs caution that `recursion_limit` is not the primary control-flow mechanism and is not a substitute for well-designed graph logic[^langgraph].
+- **CrewAI**: represents loop-back with the Flows `@router` decorator plus an iteration counter in state. Individual Agents have `max_iter` (default 25). There are known bug reports in which execution did not stop after reaching `max_iter`, which reinforces the need for **multi-layer safety nets**[^crewai].
+- **OpenAI Agents SDK**: limits its internal run loop (model call -> tool execution -> handoff -> terminate on final_output) with `max_turns`, and can use `error_handlers` to convert `MaxTurnsExceeded` into a **controlled final output**. Its predecessor Swarm was replaced by the Agents SDK and deprecated in March 2025[^openai-sdk].
 
-**全フレームワーク共通の設計原則**: **「意味的終了判定（LLM/critic/特定文字列）」と「機械的上限（回数・トークン・時間）」を分離して両方備える**。ADK は max_iterations を "critical safety net" と呼び escalate と併用、LangGraph は recursion_limit を runaway 防止に位置づけつつ主制御を条件エッジに置く、等[^framework-common]。
-> 独立検証: 各フレームワークが二重構造を持つことを公式 docs で確認。verdict: **supported**[^v-framework]。
+**Design principle common to all frameworks**: **separate "semantic termination judgment (LLM/critic/specific text)" from "mechanical limits (count, tokens, time)" and provide both**. ADK calls `max_iterations` a "critical safety net" and combines it with escalate; LangGraph positions `recursion_limit` as runaway prevention while using conditional edges for primary control, and so on[^framework-common].
+> Independent verification: official docs confirm that each framework has this dual structure. Verdict: **supported**[^v-framework].
 
-### 2.6 ループ制御と安全性（運用ベストプラクティス）
+### 2.6 Loop Control and Safety: Operational Best Practices
 
-実運用の合意は**多層防御**に収束している。
+Operational consensus has converged on **defense in depth**.
 
-- **終了条件（多層）**: (1) 自然完了（ツール呼び出しなしの最終応答）を主軸に、(2) 最大反復数を必須のセーフティネット（実務目安 **5–10 反復**）、(3) 壁時計タイムアウト、(4) 無進捗 / 反復アクション検出（**実行不能アクション連続3回 / 同一反復アクション3回 / 進捗なし20ラウンド**で打ち切り）、(5) 回復不能エラー[^term][^loop-detect]。
-- **収束判定**: evaluator rubric の閾値超え / entropy 等の変化量が閾値未満（頭打ち）/ 反復上限、で判定する。AWS の evaluator reflect-refine パターンは「The loop repeats until the result meets a set of criteria, is approved, or reaches a retry limit」[^converge]。
-- **コスト制御（5層）**: per-request の `max_tokens`、セッション/日次予算、turn カウンタ（例 `MAX_TURNS=25`）、サーキットブレーカ、ゲートウェイ層での強制。試算では無制限ループが10分で$15、100並列/時で約$2100/日に達しうる。**消費レートが直近平均の3xを超えたら自動スロットル + 所有者 alert** が定石[^cost]。
-- **人間ゲート（限定）**: **「不可逆・影響範囲大」のアクションのみ**に絞る。LangGraph の `interrupt()` はノード内でグラフを一時停止し、人間の決定は **approve / edit / reject / respond** の4種。checkpointer が各 super-step で StateSnapshot を永続化し pause/resume を安全化する。ベストプラクティスは "interrupt on irreversible, high-blast-radius actions only — not on every step"[^hitl]。
-  > 独立検証（重要な補正）: 「全ステップで人間介入を組み込むのが標準」という素朴な主張は**反証寄り（partly-supported）**。MindStudio は human-in-the-loop を "optional for high-stakes scenarios only, not standard practice" と明記。標準の終了制御はむしろ自然終了 + max iterations + timeout + cost ceiling + loop detection の defense-in-depth であり、**人間介入は普遍的標準ではなく不可逆操作に限定した条件付き**である[^verify-hitl]。
-- **観測性**: **OpenTelemetry GenAI semantic conventions** に準拠し、各 LLM 呼び出し / ツール実行 / retrieval を child span 化、`gen_ai.*` 標準属性（model, token counts, finish_reason）+ ループ反復番号 / 終了理由を記録する。観測は troubleshoot だけでなく **「品質を継続的に学習・改善する feedback loop の源」** である。ベンダー専用 SDK より OTel 準拠が推奨される[^otel]。
-- **self-improving / eval loop の罠**: Reflexion 型が基本だが、反復で**出力が肥大化・劣化**（3反復で応答が元の4倍に膨張する例）、**reward hacking**（曖昧な報酬で「場合による」等のヘッジ表現が技術的に never wrong で高スコア化）、**毒性フィードバックの memory 汚染**（敵対環境では false lesson 注入の攻撃面）がある。緩和は **早期停止・多様な評価・定期的な実環境テスト・性能測定と本番実行の分離（dual-component）**[^self-improve]。
-- **LLM-as-judge のバイアス**: position bias / self-preference bias が実証されている。**まず安価な ground-truth 検証（テスト・文字列一致 = exact string comparison）を優先**し、judge は rubric + 人間とのキャリブレーション併用に限定する[^judge]。
+- **Termination conditions (multi-layer)**: use (1) natural completion (final response without tool calls) as the main path, (2) maximum iterations as a mandatory safety net, with a practical guideline of **5-10 iterations**, (3) wall-clock timeout, (4) no-progress / repeated-action detection, stopping after **three consecutive infeasible actions / three identical repeated actions / 20 rounds without progress**, and (5) unrecoverable errors[^term][^loop-detect].
+- **Convergence judgment**: determine convergence by exceeding an evaluator-rubric threshold, a change measure such as entropy falling below a threshold (plateau), or an iteration limit. AWS's evaluator reflect-refine pattern states: "The loop repeats until the result meets a set of criteria, is approved, or reaches a retry limit"[^converge].
+- **Cost control (five layers)**: per-request `max_tokens`, session/daily budget, turn counter such as `MAX_TURNS=25`, circuit breaker, and enforcement at the gateway layer. Estimates show that an unbounded loop can cost $15 in 10 minutes and around $2100/day at 100 concurrent loops per hour. The standard pattern is **automatic throttling plus owner alert when consumption rate exceeds 3x the recent average**[^cost].
+- **Human gates (limited)**: restrict them to **irreversible, high-blast-radius actions only**. LangGraph's `interrupt()` pauses the graph inside a node, and human decisions have four forms: **approve / edit / reject / respond**. A checkpointer persists a StateSnapshot at each super-step, making pause/resume safe. The best practice is "interrupt on irreversible, high-blast-radius actions only — not on every step"[^hitl].
+  > Independent verification (important correction): the naive claim that human intervention at every step is the standard is **closer to refuted (partly-supported)**. MindStudio explicitly describes human-in-the-loop as "optional for high-stakes scenarios only, not standard practice." Standard termination control is instead defense in depth through natural completion + max iterations + timeout + cost ceiling + loop detection. **Human intervention is not universal standard practice; it is conditional and limited to irreversible actions**[^verify-hitl].
+- **Observability**: follow **OpenTelemetry GenAI semantic conventions**, making each LLM call / tool execution / retrieval a child span and recording standard `gen_ai.*` attributes (model, token counts, finish_reason) plus loop iteration number and termination reason. Observability is not just for troubleshooting; it is the **source of feedback loops that continuously learn and improve quality**. OTel compliance is recommended over vendor-specific SDKs[^otel].
+- **Pitfalls of self-improving / eval loops**: Reflexion-style loops are the baseline, but repeated iterations can cause **output bloat and degradation** (examples where responses expand to four times their original size after three iterations), **reward hacking** (vague rewards make hedged phrases such as "it depends" technically never wrong and high-scoring), and **memory pollution from toxic feedback** (adversarial environments can inject false lessons). Mitigations are **early stopping, diverse evaluation, regular real-environment tests, and separation of performance measurement from production execution (dual-component)**[^self-improve].
+- **LLM-as-judge bias**: position bias and self-preference bias have been demonstrated. **Prefer cheap ground-truth checks first (tests, exact string comparison)**, and limit judge use to rubric-based evaluation with human calibration[^judge].
 
-### 2.7 調査から抽出した設計原則（distilled principles）
+### 2.7 Distilled Design Principles from the Research
 
-以上を loop-agent の設計原則として10点に蒸留する。
+The above findings distill into the following ten design principles for loop-agent.
 
-1. **LoopAgent = 「ツールをループ内で自律使用する LLM」を、トリガー＋検証可能ゴール＋ガードレールで包む制御層**として位置づける（prompt/context 機構の置き換えでなく wrap）。
-2. **最内ループは `gather → act → verify → repeat`**。検証信号（ground truth）のない反復は作らない。
-3. **終了条件は「意味的判定」と「機械的上限」の二重化を必須化**し、合成可能な condition オブジェクトとして実装する。
-4. **暴走防止のハード上限とサーキットブレーカ**（反復・累積トークン/コスト・時間）をエンジンの**不変条件**として内蔵する。
-5. **進捗検知・重複検知**で同一行動の反復・無進捗を検出し打ち切る。
-6. **状態は context に溜めず外部 SoT に外出し**（feature list / progress / 状態DB）。compaction は補助であり SoT ではない。
-7. **内側 ReAct + 外側 Reflexion の二層**（単一エピソード実行 / 試行間の言語的改善）。記憶は意思決定への「配線」まで eval で担保する。
-8. **人間ゲートは不可逆・影響範囲大のアクションに限定**（approve/edit/reject/respond）し、状態を永続化して pause/resume を安全化する。
-9. **観測可能性は OTel GenAI 準拠**で最初から。ループ各段・終了理由・コストを機械可読イベントで発火する。
-10. **`simpler loops win`**。PoC（~200行の中核ループ）と本番（エラー回復・並行性・永続化を扱う数万行）を分け、段階導入する。
+1. Position **LoopAgent as a control layer that wraps "an LLM autonomously using tools in a loop" with triggers, verifiable goals, and guardrails**. It wraps, rather than replaces, prompt/context mechanisms.
+2. Make the **innermost loop `gather -> act -> verify -> repeat`**. Do not create iterations without a verification signal, or ground truth.
+3. Require the **dual termination condition of semantic judgment and mechanical limits**, implemented as composable condition objects.
+4. Build **hard limits and circuit breakers** for runaway prevention, including iterations, cumulative tokens/cost, and time, as **invariants** of the engine.
+5. Use **progress detection and duplicate detection** to detect and stop repeated identical actions and lack of progress.
+6. **Do not accumulate state in context; externalize it to an external SoT** such as a feature list, progress file, or state DB. Compaction is a helper, not the SoT.
+7. Use **two layers: inner ReAct + outer Reflexion** for single-episode execution and cross-attempt linguistic improvement. Ensure through evals that memory is wired into decision-making.
+8. **Limit human gates to irreversible, high-blast-radius actions** using approve/edit/reject/respond, and persist state to make pause/resume safe.
+9. Build **observability with OTel GenAI compliance** from the beginning. Emit machine-readable events for each loop stage, termination reason, and cost.
+10. **`simpler loops win`**. Separate the PoC, with a roughly 200-line core loop, from production, which handles error recovery, concurrency, and persistence and may be tens of thousands of lines. Introduce capabilities in phases.
 
 ---
 
-## 3. claude-org-ja 資産棚卸し（再利用評価）
+## 3. Inventory of claude-org-ja Assets: Reuse Assessment
 
-> `/home/happy_ryo/work/org/claude-org-ja` を **read-only** で精読し、Loop Engineering / LoopAgent に再利用しうる資産を具体的な file 参照付きで評価した。判定凡例: **reuse-as-is**（ほぼそのまま）/ **adapt**（改変して再利用）/ **extract-pattern**（設計パターンを抽出）/ **reference-only**（参考にする）/ **N-A**（非該当）。
+> `/home/happy_ryo/work/org/claude-org-ja` was reviewed **read-only**, and assets reusable for Loop Engineering / LoopAgent were evaluated with concrete file references. Assessment legend: **reuse-as-is** (almost unchanged) / **adapt** (modify and reuse) / **extract-pattern** (extract the design pattern) / **reference-only** (use as reference) / **N-A** (not applicable).
 
-### 3.1 オーケストレーションループ（secretary / dispatcher / worker / curator）
+### 3.1 Orchestration Loop: secretary / dispatcher / worker / curator
 
-claude-org は **Secretary → Dispatcher → Worker → Curator** の4段階ループを実装する。Secretary（人間接点）→ Dispatcher（常駐監視）→ Worker（実作業）→ Curator（on-demand 知見化）の delegation flow と escalation path を持つ。
+claude-org implements a four-stage loop: **Secretary -> Dispatcher -> Worker -> Curator**. It has a delegation flow and escalation path: Secretary (human contact) -> Dispatcher (resident monitoring) -> Worker (actual work) -> Curator (on-demand knowledge curation).
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| Handover/Resume パターン | `.claude/skills/{secretary,dispatcher}-{handover,resume}/SKILL.md`, `.dispatcher/references/worker-monitoring.md` | **reuse-as-is** | 「ターン境界での状態保存と復帰」=長時間ループの context 管理そのもの。終了条件を保存して再開する模範。 |
-| Role Contract（4役割の責務/境界） | `docs/contracts/role-contract.md`, 各 `CLAUDE.md` | **extract-pattern** | 「誰がループを回すか・どこで責務が切れるか」の骨格。loop-agent は coordinator / loop-agent / eval-agent の3段化が想定。 |
-| Delegation Lifecycle Contract（T1–T9 遷移、E1–E5 エラー） | `docs/contracts/delegation-lifecycle-contract.md` | **reuse-as-is**（型）/ **reference-only**（具体） | 「タスク状態の終了条件」「エラー分岐」を explicit にする。review feedback による再ループ・abort 条件の正式な型。 |
-| Dispatcher monitoring loop（`/loop 3m`） | `.dispatcher/references/worker-monitoring.md` | **adapt** | 「観測→判定→通知」の機械化。stall detection は「forward progress がない」の operational definition。 |
-| On-demand Curator（worker close trigger） | `.claude/skills/org-curate/SKILL.md`, `tools/check_curate_threshold.py` | **adapt** | 「フィードバック→改善」の自動トリガ。閾値超過時のみ起動する非ブロッキング async lifecycle。 |
-| Escalation + pending-decisions register | `.claude/skills/org-escalation/SKILL.md`, `tools/pending_decisions.py` | **reuse-as-is** | 「Agent 間 escalation と人間ゲート」の explicit lifecycle。relay gap 検出の ground truth。 |
+| Handover/Resume pattern | `.claude/skills/{secretary,dispatcher}-{handover,resume}/SKILL.md`, `.dispatcher/references/worker-monitoring.md` | **reuse-as-is** | "State save and restore across turn boundaries" is exactly context management for long-running loops. It is a model for saving termination conditions and resuming. |
+| Role Contract (responsibilities/boundaries of four roles) | `docs/contracts/role-contract.md`, each `CLAUDE.md` | **extract-pattern** | Skeleton for "who runs the loop and where responsibility boundaries sit." loop-agent is expected to use three layers: coordinator / loop-agent / eval-agent. |
+| Delegation Lifecycle Contract (T1-T9 transitions, E1-E5 errors) | `docs/contracts/delegation-lifecycle-contract.md` | **reuse-as-is** (types) / **reference-only** (details) | Makes task-state termination conditions and error branches explicit. Provides formal types for review-feedback reloops and abort conditions. |
+| Dispatcher monitoring loop (`/loop 3m`) | `.dispatcher/references/worker-monitoring.md` | **adapt** | Mechanizes "observe -> judge -> notify." Stall detection gives an operational definition of "no forward progress." |
+| On-demand Curator (worker close trigger) | `.claude/skills/org-curate/SKILL.md`, `tools/check_curate_threshold.py` | **adapt** | Automatic trigger for "feedback -> improvement." A non-blocking async lifecycle launched only when a threshold is exceeded. |
+| Escalation + pending-decisions register | `.claude/skills/org-escalation/SKILL.md`, `tools/pending_decisions.py` | **reuse-as-is** | Explicit lifecycle for inter-agent escalation and human gates. Ground truth for detecting relay gaps. |
 
-### 3.2 自律ループ / ScheduleWakeup / cron
+### 3.2 Autonomous Loops / ScheduleWakeup / cron
 
-claude-org は **`/loop 3m` による時間駆動監視ループ**、worker クローズ時の**条件判定での async on-demand 起動**、**役割別の能動 poll cadence** を実装する。注目すべきは **cron 定常 routine を明示的に不採用**とし、イベント駆動・単発判定・状態保持ファイル・単一実行保証を採っている点である。
+claude-org implements a **time-driven monitoring loop via `/loop 3m`**, **async on-demand startup through conditional checks when a worker closes**, and **role-specific active poll cadences**. Notably, it explicitly avoids steady cron routines and instead uses event-driven behavior, one-shot checks, state-retention files, and single-flight guarantees.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| Role-based passive polling cadence | `knowledge/curated/broker-transport.md`, `.dispatcher/references/worker-monitoring.md` | **extract-pattern** | stateless CLI 環境での自律ループ再入。dispatcher 3m / worker bounded / secretary turn-prologue の非対称設計。 |
-| Deterministic decision tool（exit-code 分岐） | `tools/check_curate_threshold.py`, `tools/work_discovery_scan.py` | **reuse-as-is** | 副作用ゼロの計算ツール。JSON stdout + exit-code（0/10/2）で「条件成立か」を返し判定を配達層へ委譲。loop の冪等な condition evaluation。 |
-| Resume-safe loop state（cursor + metadata JSON） | `.dispatcher/references/worker-monitoring.md`, `.dispatcher/CLAUDE.md` | **reuse-as-is** | event-cursor / idle-state / inflight marker で resume-gap・重複を回避。 |
-| Single-flight / coalesce（重複 spawn 防止） | `.dispatcher/references/pane-close.md` | **reuse-as-is** | event-driven loop で同一トリガが短間隔で火いたときの競合回避。spawn 前 list で既存確認。 |
+| Role-based passive polling cadence | `knowledge/curated/broker-transport.md`, `.dispatcher/references/worker-monitoring.md` | **extract-pattern** | Reentry for autonomous loops in a stateless CLI environment. Asymmetric design: dispatcher 3m / worker bounded / secretary turn-prologue. |
+| Deterministic decision tool (exit-code branching) | `tools/check_curate_threshold.py`, `tools/work_discovery_scan.py` | **reuse-as-is** | Side-effect-free computation tool. Returns whether a condition holds through JSON stdout + exit code (0/10/2), delegating judgment to the delivery layer. Idempotent condition evaluation for loops. |
+| Resume-safe loop state (cursor + metadata JSON) | `.dispatcher/references/worker-monitoring.md`, `.dispatcher/CLAUDE.md` | **reuse-as-is** | Avoids resume gaps and duplicates with event cursor / idle state / inflight marker. |
+| Single-flight / coalesce (duplicate spawn prevention) | `.dispatcher/references/pane-close.md` | **reuse-as-is** | Prevents races when the same trigger fires in short intervals in an event-driven loop. Checks for an existing instance before spawn. |
 
-### 3.3 transport（renga / broker, push 一次 / pull fallback）
+### 3.3 transport: renga / broker, Push Primary / Pull Fallback
 
-エージェント間メッセージング・状態通知の**二重輸送層**。既定 renga（in-band push）と broker（channel sidecar による ~1秒 claim→push + pull fallback）が共存し、**at-most-once 配送**・tier 別構造化アクセス制御を実装する。
+This is a **dual transport layer** for inter-agent messaging and state notifications. Default renga (in-band push) and broker (channel sidecar using approximately one-second claim -> push plus pull fallback) coexist and implement **at-most-once delivery** and tiered structured access control.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| Transport Abstraction Seam | `tools/transport.py` | **extract-pattern** | runtime descriptor を唯一の SoT に backend 切替を抽象化。複数 backend を backend-agnostic に扱う。 |
-| Peer Message Delivery Bridge（best-effort） | `tools/peer_notify.py` | **reuse-as-is** | CLI/背景タスク→メインエージェントの「失敗しない」非同期通知。ループ外からの割り込み通知に適用可。 |
-| Push 一次 / Pull fallback delivery model | `docs/contracts/backend-interface-contract.md`, `docs/operations/broker-dogfood-runbook.md` | **extract-pattern** | push で即応答、pull fallback で backend 不通に耐える。ループ間 wake 配送の中核パターン。 |
-| Tier-Gated 構造化アクセス制御 | `docs/contracts/backend-interface-contract.md` | **adapt** | auth_role（immutable）に基づく capability 制約。spawn 時に caller tier で子を cap=detached agent のサンドボックス化。 |
-| Message at-most-once semantics | 同上 | **adapt** | drain=消費確定・redelivery なし。上位を idempotent handler 前提にする delivery 契約。 |
-| Error code vocabulary（machine-readable） | 同上 | **reference-only** | `[<code>] <message>` 形式 + default-branch tolerance の error handling discipline。 |
+| Transport Abstraction Seam | `tools/transport.py` | **extract-pattern** | Abstracts backend switching with the runtime descriptor as the only SoT. Handles multiple backends backend-agnostically. |
+| Peer Message Delivery Bridge (best-effort) | `tools/peer_notify.py` | **reuse-as-is** | "Non-failing" async notification from CLI/background tasks to the main agent. Applicable to interrupt notifications from outside the loop. |
+| Push primary / Pull fallback delivery model | `docs/contracts/backend-interface-contract.md`, `docs/operations/broker-dogfood-runbook.md` | **extract-pattern** | Push provides immediate response; pull fallback tolerates backend outages. Core pattern for inter-loop wake delivery. |
+| Tier-Gated structured access control | `docs/contracts/backend-interface-contract.md` | **adapt** | Capability constraints based on `auth_role` (immutable). Children can be sandboxed with cap=detached agent based on caller tier at spawn time. |
+| Message at-most-once semantics | same as above | **adapt** | drain means consumption is final and no redelivery occurs. The delivery contract assumes idempotent handlers at higher layers. |
+| Error code vocabulary (machine-readable) | same as above | **reference-only** | Error-handling discipline using `[<code>] <message>` format and default-branch tolerance. |
 
-### 3.4 state.db を SoT とする状態管理
+### 3.4 State Management with state.db as the SoT
 
-**SQLite `state.db`** が runs / org_sessions / events / worker_dirs / projects / workstreams の単一 SoT。markdown / JSON は snapshotter が DB から自動再生成する派生物で、drift_check が手書き編集を検出する。**loop-agent のループ状態（iteration, convergence history, termination 評価）永続化に直接再利用できる**最重要資産。
+**SQLite `state.db`** is the single SoT for runs / org_sessions / events / worker_dirs / projects / workstreams. Markdown / JSON outputs are derived artifacts automatically regenerated from the DB by the snapshotter, and drift_check detects manual edits. This is the most important asset, directly reusable for persisting loop-agent loop state such as iteration, convergence history, and termination evaluation.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| state.db スキーマ & SoT 定義 | `tools/state_db/schema.sql`, `docs/contracts/state-semantics-contract.md`, `docs/org-state-schema.md` | **adapt** | runs 拡張カラム（iteration_count, is_converged, terminated_reason）でループ状態を永続化。events に loop event を journal。 |
-| StateWriter API & Transaction | `tools/state_db/writer.py`, `tools/state_db/__init__.py` | **reuse-as-is** | `transaction()` で atomic 更新 + post-commit hook（markdown/JSON 再生成）。rollback on exception で失敗時の保全。 |
-| Query 層 & State Predicates | `tools/state_db/queries.py` | **adapt** | TERMINAL_STATUSES 等の述語が「終了条件判定」に直結。loop-specific predicate を追加。 |
-| Journal Events Catalog（50+ type） | `docs/journal-events.md`, `tools/journal_append.{sh,py}` | **adapt** | ループ各 cycle step を journal（loop_cycle_begin/convergence_detected/termination_triggered）。complete audit trail。 |
-| WAL Journal Mode & 並行アクセス | `tools/state_db/__init__.py` | **reuse-as-is** | WAL + busy_timeout で concurrent reader（dashboard/observer）と loop writer が共存。観測可能性を enable。 |
-| Snapshotter（post-commit 再生成） | `tools/state_db/snapshotter.py` | **adapt** | ループ observation を `.state/loop-state.md` に human-readable で atomic dump。 |
-| State Semantics Contract（7 status, 4 predicate） | `docs/contracts/state-semantics-contract.md` | **reference-only** | loop の finite state machine（OBSERVING/THINKING/ACTING/CONVERGING/TERMINATED 等）設計の参考。 |
+| state.db schema and SoT definition | `tools/state_db/schema.sql`, `docs/contracts/state-semantics-contract.md`, `docs/org-state-schema.md` | **adapt** | Persist loop state by extending runs columns, such as iteration_count, is_converged, terminated_reason. Journal loop events in events. |
+| StateWriter API and Transaction | `tools/state_db/writer.py`, `tools/state_db/__init__.py` | **reuse-as-is** | Atomic updates with `transaction()` plus post-commit hooks for regenerating markdown/JSON. Rollback on exception protects state on failure. |
+| Query layer and State Predicates | `tools/state_db/queries.py` | **adapt** | Predicates such as TERMINAL_STATUSES map directly to termination-condition judgment. Add loop-specific predicates. |
+| Journal Events Catalog (50+ types) | `docs/journal-events.md`, `tools/journal_append.{sh,py}` | **adapt** | Journal every loop cycle step: loop_cycle_begin/convergence_detected/termination_triggered. Complete audit trail. |
+| WAL Journal Mode and concurrent access | `tools/state_db/__init__.py` | **reuse-as-is** | WAL + busy_timeout allows concurrent readers such as dashboards/observers to coexist with the loop writer. Enables observability. |
+| Snapshotter (post-commit regeneration) | `tools/state_db/snapshotter.py` | **adapt** | Atomic human-readable dumps of loop observations to `.state/loop-state.md`. |
+| State Semantics Contract (7 statuses, 4 predicates) | `docs/contracts/state-semantics-contract.md` | **reference-only** | Reference for designing the loop finite state machine, such as OBSERVING/THINKING/ACTING/CONVERGING/TERMINATED. |
 
 ### 3.5 work-discovery / triage
 
-自律 **work-discovery** は issue tracker を scan・triage し「次の仕事候補（N件 + 推奨1件）」を人間に提案する機構。**計算層（read-only 決定的ツール）と配達層（スキル / dispatcher）の二層構造**で、発見の自律性を上げつつ着手判断は人間ゲートに保つ。Loop Engineering の「次に何を反復するか」の入力選定ループに対応する。
+Autonomous **work-discovery** scans and triages the issue tracker, then proposes "next work candidates (N items + one recommendation)" to a human. It has a **two-layer structure: computation layer (read-only deterministic tool) and delivery layer (skill / dispatcher)**. This increases discovery autonomy while keeping the decision to start work behind a human gate. It corresponds to the Loop Engineering loop that selects what to iterate on next.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| work_discovery_scan.py（計算層） | `tools/work_discovery_scan.py` | **reuse-as-is** | read-only・副作用ゼロ・同一入力同一出力。複数の起動経路が同一ツールを共有。loop 状態に影響しない入力選定。 |
-| work-discovery-triage 設計（二層 / 不変条件 / 段階導入） | `docs/design/work-discovery-triage.md` | **reference-only** | 「発見の自律性は上げるが、判断は人間ゲートに残す」(INV-1〜5) が LoopAgent の人間中心性と直結。 |
-| 完了→次反復の接続（post-merge / pane-close トリガ） | `.claude/skills/org-pull-request/SKILL.md`, `.dispatcher/references/pane-close.md` | **extract-pattern** | 「idle 化した瞬間」を検出して次候補を自動提示する trigger point。提案で停止（人間ゲート維持）。 |
+| work_discovery_scan.py (computation layer) | `tools/work_discovery_scan.py` | **reuse-as-is** | Read-only, side-effect-free, same input -> same output. Multiple launch paths share the same tool. Input selection that does not affect loop state. |
+| work-discovery-triage design (two layers / invariants / phased rollout) | `docs/design/work-discovery-triage.md` | **reference-only** | INV-1 through INV-5, especially "increase discovery autonomy while leaving judgment behind a human gate," directly support LoopAgent's human-centered design. |
+| Connecting completion to the next iteration (post-merge / pane-close trigger) | `.claude/skills/org-pull-request/SKILL.md`, `.dispatcher/references/pane-close.md` | **extract-pattern** | Trigger point that detects when work becomes idle and automatically proposes the next candidate. Stops at proposal, preserving the human gate. |
 
-### 3.6 フィードバックループ（org-delegate / org-retro / org-curate / knowledge）
+### 3.6 Feedback Loops: org-delegate / org-retro / org-curate / knowledge
 
-**Delegation → Retro → Curate → Skill adoption** の完全サイクルを実現。委譲 → 完了後に委譲プロセスを振り返り（5観点）→ 知見を raw/curated（事実/判断/根拠/適用場面の4要素）で構造化 → skill-eligibility-check（5 signals scoring）→ pending≥5 で skill-audit 発火、という **「人間不在の自動フロー + 人間決定ゲート」の二層**。**LoopAgent の self-improving / eval loop に直結する**（Reflexion の「試行間メモリ」にマッピング可能）。
+These implement the full **Delegation -> Retro -> Curate -> Skill adoption** cycle. The flow is: delegate -> retrospect on the delegation process after completion across five dimensions -> structure knowledge as raw/curated with four elements (fact/judgment/evidence/applicability) -> run skill-eligibility-check using five scored signals -> launch skill-audit when pending >= 5. This is a **two-layer design: automated flow without humans + human decision gate**. It directly maps to LoopAgent's self-improving / eval loop, and specifically to Reflexion's cross-attempt memory.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| org-retro（5観点振り返り + skill 化判定） | `.claude/skills/org-retro/SKILL.md` | **adapt** | 多 turn 実行後にプロセス自体を評価し改善点を記録。agent pattern の自動抽出（=eval loop cycle）。 |
-| org-curate（raw→curated 統合, 閾値 on-demand 起動） | `.claude/skills/org-curate/SKILL.md`, `references/knowledge-standards.md` | **adapt** | observation 蓄積→統合→pattern extraction。move-then-mark で immutable raw を保全。 |
-| knowledge 4要素フォーマット（事実/判断/根拠/適用場面） | `org-curate/references/knowledge-standards.md` | **reuse-as-is** | agent reasoning trace の標準記録形式。同種知見3件以上で pattern 化。 |
-| skill-candidates（status machine + batch gate, N=5） | `knowledge/skill-candidates.md` | **reuse-as-is** | pattern recommendation を人間ゲート越しに skill へ昇格。閾値 batch 決定で cognitive load 最適化。 |
-| work-skill template（標準フォーマット, origin record） | `org-retro/references/work-skill-template.md` | **reuse-as-is** | pattern を skill 化する際の traceability（genesis を辿れる）。 |
-| curated 知見 15 ファイル（delegation/broker-transport/codex 等） | `knowledge/curated/*.md` | **reference-only** | ループ実装で踏みやすい failure mode と回避策の先制共有（概念パターンとして transfer）。 |
+| org-retro (five-dimension retrospective + skillization judgment) | `.claude/skills/org-retro/SKILL.md` | **adapt** | Evaluates the process itself after multi-turn execution and records improvements. Automatic extraction of agent patterns, equivalent to an eval-loop cycle. |
+| org-curate (raw -> curated integration, threshold-triggered on-demand startup) | `.claude/skills/org-curate/SKILL.md`, `references/knowledge-standards.md` | **adapt** | Observation accumulation -> integration -> pattern extraction. Preserves immutable raw records with move-then-mark. |
+| Knowledge four-element format (fact/judgment/evidence/applicability) | `org-curate/references/knowledge-standards.md` | **reuse-as-is** | Standard recording format for agent reasoning traces. Converts three or more similar pieces of knowledge into a pattern. |
+| skill-candidates (status machine + batch gate, N=5) | `knowledge/skill-candidates.md` | **reuse-as-is** | Promotes pattern recommendations to skills through a human gate. Optimizes cognitive load through thresholded batch decisions. |
+| work-skill template (standard format, origin record) | `org-retro/references/work-skill-template.md` | **reuse-as-is** | Traceability when turning a pattern into a skill; the genesis can be followed. |
+| 15 curated knowledge files (delegation/broker-transport/codex, etc.) | `knowledge/curated/*.md` | **reference-only** | Preemptive sharing of failure modes and mitigations likely to appear in loop implementation, transferred as conceptual patterns. |
 
-### 3.7 観測・人間ゲート・暴走防止（attention / pr-watch / escalation / suspend）
+### 3.7 Observation, Human Gates, and Runaway Prevention: attention / pr-watch / escalation / suspend
 
-5つの統合スキルで、ワーカー観測・判断仰ぎエスカレーション・pending_decisions register・イベント DB・状態保存を実現する。**LoopAgent の観測可能性・人間ゲート・暴走検知に直接応用できる**。
+Five integrated skills implement worker observation, escalation for judgment, a pending_decisions register, an event DB, and state preservation. They can be applied directly to LoopAgent observability, human gates, and runaway detection.
 
-| 資産 | file | 判定 | loop での意義 |
+| Asset | file | Assessment | Significance for the loop |
 |---|---|---|---|
-| org-attention-start/stop（OS 通知 watcher） | `.claude/skills/org-attention-{start,stop}/SKILL.md` | **adapt** | 承認待ち・CI失敗・想定外を通知音で能動検知。pane_id sidecar で二重起動防止・孤児検知。loop 観測層。 |
-| pr-watch-pane / pr_watch.py（外部イベント監視） | `.claude/skills/pr-watch-pane/SKILL.md`, `tools/pr_watch.py` | **adapt**/**extract-pattern** | 長時間 watcher（CI/merge/webhook 待機）の冪等 spawn + identity 検証 + timeout→escalation。deterministic exit code。 |
-| org-escalation（3層記録: register + journal + markdown） | `.claude/skills/org-escalation/SKILL.md` | **reuse-as-is** | 判断仰ぎ・runaway 検知を人間にエスカレーション。autonomy boundary（自決範囲 vs 承認必須）の実装。 |
-| pending_decisions.py（人間ゲート state machine） | `tools/pending_decisions.py`, `tests/test_pending_decisions.py` | **reuse-as-is** | append→resolve(to_user)→user reply→resolve(to_worker)。relay 忘れを deterministic に検知。 |
-| org-suspend（graceful/force 2-pass shutdown） | `.claude/skills/org-suspend/SKILL.md` | **adapt** | 全 agent 状態の deterministic capture + 2-pass close。loop の suspend/checkpoint。 |
-| journal_append（canonical event log） | `tools/journal_append.{py,sh}`, `docs/journal-events.md` | **reuse-as-is** | loop の全 lifecycle event を canonical log に記録。観測可能性の基盤。 |
+| org-attention-start/stop (OS notification watcher) | `.claude/skills/org-attention-{start,stop}/SKILL.md` | **adapt** | Actively detects approval waits, CI failures, and unexpected states with notification sounds. Uses a pane_id sidecar for duplicate-start prevention and orphan detection. Loop observation layer. |
+| pr-watch-pane / pr_watch.py (external event monitoring) | `.claude/skills/pr-watch-pane/SKILL.md`, `tools/pr_watch.py` | **adapt**/**extract-pattern** | Idempotent spawn + identity verification + timeout -> escalation for long-running watchers such as CI/merge/webhook waiting. Deterministic exit code. |
+| org-escalation (three-layer record: register + journal + markdown) | `.claude/skills/org-escalation/SKILL.md` | **reuse-as-is** | Escalates judgment requests and runaway detection to humans. Implements the autonomy boundary between what the agent may decide and what requires approval. |
+| pending_decisions.py (human gate state machine) | `tools/pending_decisions.py`, `tests/test_pending_decisions.py` | **reuse-as-is** | append -> resolve(to_user) -> user reply -> resolve(to_worker). Deterministically detects forgotten relays. |
+| org-suspend (graceful/force two-pass shutdown) | `.claude/skills/org-suspend/SKILL.md` | **adapt** | Deterministic capture of all agent state plus two-pass close. Loop suspend/checkpoint. |
+| journal_append (canonical event log) | `tools/journal_append.{py,sh}`, `docs/journal-events.md` | **reuse-as-is** | Records all loop lifecycle events in the canonical log. Foundation for observability. |
 
-### 3.8 再利用方針サマリ
+### 3.8 Summary of Reuse Policy
 
-調査原則（§2.7）と資産（§3.1–3.7）の対応:
+Mapping research principles (§2.7) to assets (§3.1-3.7):
 
-- **状態 SoT（原則6）** ← `tools/state_db/`（**最重要・reuse-as-is/adapt**）。ループ iteration・収束履歴・終了評価の永続化に直接転用。
-- **二重終了条件 + ハード上限（原則3,4）** ← state-semantics / delegation-lifecycle contract（型を reference）+ `state_db.queries` の predicate（adapt）。
-- **wake 配送・通知（原則2,8）** ← transport（push一次/pull fallback, at-most-once）を **extract-pattern**。
-- **self-improving（原則7）** ← org-retro/curate/knowledge を **adapt**（Reflexion の試行間メモリに対応）。
-- **観測（原則9）** ← journal_append + attention-watcher（reuse-as-is/adapt）。OTel GenAI への対応付けは新規。
-- **人間ゲート（原則8）** ← org-escalation + pending_decisions（**reuse-as-is**）。
-- **入力選定（次反復対象）** ← work-discovery 二層分離（adapt）。
+- **State SoT (Principle 6)** <- `tools/state_db/` (**most important; reuse-as-is/adapt**). Directly reusable for persisting loop iterations, convergence history, and termination evaluation.
+- **Dual termination conditions + hard limits (Principles 3, 4)** <- state-semantics / delegation-lifecycle contract (reference the types) + predicates in `state_db.queries` (adapt).
+- **Wake delivery and notification (Principles 2, 8)** <- transport (push primary/pull fallback, at-most-once) as **extract-pattern**.
+- **self-improving (Principle 7)** <- org-retro/curate/knowledge as **adapt**, corresponding to Reflexion's cross-attempt memory.
+- **Observation (Principle 9)** <- journal_append + attention-watcher (reuse-as-is/adapt). OTel GenAI mapping is new work.
+- **Human gates (Principle 8)** <- org-escalation + pending_decisions (**reuse-as-is**).
+- **Input selection (next iteration target)** <- work-discovery two-layer separation (adapt).
 
-**最大の発見**: loop-agent が必要とする「終了条件を保存して再開」「状態の正本性」「フィードバック→改善」「観測→人間ゲート」は、**claude-org にすでに本番品質で存在する**。loop-agent は車輪の再発明をせず、これらを **runtime 非依存な抽象（state DB / transport / feedback / gate）として段階的に抽出・再利用**することが最短経路である。
+**Largest finding**: the capabilities loop-agent needs, including saving and resuming termination conditions, authoritative state, feedback-to-improvement, and observation-to-human-gate, **already exist in production-quality form in claude-org**. The shortest path is not to reinvent them, but to **extract and reuse them gradually as runtime-independent abstractions: state DB / transport / feedback / gate**.
 
 ---
 
-## 4. LoopAgent 設計
+## 4. LoopAgent Design
 
-### 4.1 要件と設計原則
+### 4.1 Requirements and Design Principles
 
-§2 の調査と §3 の資産から、loop-agent の LoopAgent が満たすべき要件:
+Based on the research in §2 and the assets in §3, loop-agent's LoopAgent should satisfy the following requirements:
 
-- **R1 検証可能ゴール駆動**: 自然言語の「完了判定」を避け、測定可能な完了基準（テスト green / lint / 状態遷移の収束 / チェックリスト）を必須とする。
-- **R2 二重終了条件**: 意味的判定（critic/eval）＋機械的上限（反復・トークン・時間）を独立に実装し合成可能にする。
-- **R3 暴走防止の不変条件**: per-call max_tokens・セッション/日次予算・turn カウンタ・サーキットブレーカ・無進捗検出をエンジンに内蔵。
-- **R4 状態の外部 SoT**: ループ状態を DB に外出しし、resume・観測・監査を可能にする。
-- **R5 二層ループ**: 内側 ReAct（実行）/ 外側 Reflexion（試行間改善）。記憶は意思決定への配線を eval で担保。
-- **R6 限定的人間ゲート**: 不可逆・影響範囲大のアクションのみ interrupt（approve/edit/reject/respond）。
-- **R7 観測可能性**: OTel GenAI 準拠の構造化イベントをループ各段で発火。
-- **R8 simpler loops win**: PoC と本番を分離し段階導入。
+- **R1 Verifiable-goal driven**: avoid natural-language "completion judgments" and require measurable completion criteria such as tests green / lint / state-transition convergence / checklist.
+- **R2 Dual termination conditions**: implement semantic judgment (critic/eval) and mechanical limits (iterations, tokens, time) independently and make them composable.
+- **R3 Runaway-prevention invariants**: build per-call max_tokens, session/daily budget, turn counter, circuit breaker, and no-progress detection into the engine.
+- **R4 External state SoT**: externalize loop state into a DB to enable resume, observation, and audit.
+- **R5 Two-layer loop**: inner ReAct (execution) / outer Reflexion (cross-attempt improvement). Ensure through evals that memory is wired into decision-making.
+- **R6 Limited human gates**: interrupt only irreversible, high-blast-radius actions with approve/edit/reject/respond.
+- **R7 Observability**: emit OTel GenAI-compliant structured events at each loop stage.
+- **R8 simpler loops win**: separate PoC and production, introducing capabilities in phases.
 
-### 4.2 アーキテクチャ複数案の比較
+### 4.2 Comparison of Architecture Options
 
-3案を比較する。評価軸は **実装コスト / 暴走耐性 / 観測性 / org 資産再利用度 / 適合スコープ**。
+This report compares three options. Evaluation axes are **implementation cost / runaway resistance / observability / org-asset reuse / fit to scope**.
 
-#### 案A: 単一プロセス・インライン LoopAgent（Agent SDK ラップ）
+#### Option A: Single-Process Inline LoopAgent (Agent SDK Wrapper)
 
-Claude Agent SDK の agent loop（`gather → act → verify → repeat`）を薄くラップし、`max_turns` / `max_budget_usd` と簡易 stop condition を載せただけの単一プロセス。状態は progress ファイル + git。
+Thinly wrap the Claude Agent SDK agent loop (`gather -> act -> verify -> repeat`) with `max_turns` / `max_budget_usd` and a simple stop condition. State is a progress file plus git.
 
-- **長所**: 最小実装（"simpler loops win"）。Anthropic 標準ループに完全準拠。即着手可能。
-- **短所**: 試行間メモリ・収束判定・観測・人間ゲートが弱い。マルチエージェント協調や長時間自律には不足。org 資産の活用が限定的。
+- **Pros**: minimal implementation ("simpler loops win"). Fully aligned with Anthropic's standard loop. Can start immediately.
+- **Cons**: weak cross-attempt memory, convergence judgment, observability, and human gates. Insufficient for multi-agent coordination or long-running autonomy. Limited use of org assets.
 
-#### 案B: フルオーケストレーション型（claude-org をほぼそのまま multi-pane で踏襲）
+#### Option B: Full Orchestration Model (Closely Following claude-org in Multi-Pane Form)
 
-secretary/dispatcher/worker/curator の4ペイン構成を loop coordinator/loop-agent/eval-agent 等に読み替え、renga/broker transport・state.db・全フィードバックループを丸ごと採用。
+Reinterpret the four-pane secretary/dispatcher/worker/curator structure as loop coordinator/loop-agent/eval-agent and so on, adopting renga/broker transport, state.db, and all feedback loops wholesale.
 
-- **長所**: org 資産再利用度が最大。観測・人間ゲート・フィードバックが本番品質で揃う。
-- **短所**: **重い**。pane/tmux/renga/broker 等の runtime 依存が大きく、loop-agent 単体プロジェクトには過剰。人間ゲートが組織運用前提で過多になりがち。PoC に向かない。
+- **Pros**: maximum reuse of org assets. Production-quality observability, human gates, and feedback are already present.
+- **Cons**: **heavy**. Large runtime dependencies such as pane/tmux/renga/broker are excessive for a standalone loop-agent project. Human gates tend to be too organization-operation-centric. Poor fit for a PoC.
 
-#### 案C: 単一制御層 + 共有状態機械 + 段階的 org 資産組込（**推奨**）
+#### Option C: Single Control Layer + Shared State Machine + Phased Org Asset Integration (**Recommended**)
 
-LangGraph 風の **状態機械（共有 state を `state.db` 相当の SoT に置く）** を制御層とし、その中で **内側 ReAct ループ + 外側 Reflexion ループ**を回す。終了条件は **合成可能な condition オブジェクト**（MaxIterations / TokenBudget / Timeout / GoalMet / NoProgress / HumanGate）。org 資産は **runtime 非依存な抽象（state DB / transport / feedback / gate）として段階的に抽出・組込**む。マルチエージェントは subagent で context 隔離（必要時のみ）。
+Use a LangGraph-like **state machine, with shared state placed in a `state.db`-equivalent SoT**, as the control layer. Run the **inner ReAct loop + outer Reflexion loop** within it. Termination conditions are **composable condition objects**: MaxIterations / TokenBudget / Timeout / GoalMet / NoProgress / HumanGate. Extract and integrate org assets gradually as **runtime-independent abstractions: state DB / transport / feedback / gate**. Use subagents for context isolation only when needed.
 
-- **長所**: §2.7 の全原則を最も自然に満たす。state.db・feedback・gate・transport の再利用度が高い一方、runtime 依存（pane/tmux）を**疎結合**にできる。PoC（案A 相当）から本格（案B 相当の資産）まで**同一アーキで連続的にスケール**できる。
-- **短所**: 状態機械と condition 合成の初期設計コストが案A より高い。
+- **Pros**: most naturally satisfies all principles in §2.7. High reuse of state.db, feedback, gate, and transport while keeping runtime dependencies such as pane/tmux **loosely coupled**. Scales continuously under one architecture from PoC (equivalent to Option A) to full system (assets equivalent to Option B).
+- **Cons**: higher initial design cost than Option A for the state machine and condition composition.
 
-#### 比較表
+#### Comparison Table
 
-| 評価軸 | 案A（インライン） | 案B（フルオーケストレーション） | 案C（制御層+状態機械）★推奨 |
+| Evaluation axis | Option A (inline) | Option B (full orchestration) | Option C (control layer + state machine) ★ Recommended |
 |---|---|---|---|
-| 実装コスト（初期） | ◎ 最小 | △ 大 | ○ 中 |
-| 暴走耐性 | △ 上限のみ | ◎ | ◎ 二重終了+不変条件 |
-| 観測性 | △ | ◎ | ○→◎（OTel + journal） |
-| org 資産再利用度 | △ 限定 | ◎ 最大（但し runtime 結合） | ◎ 抽象として最大、疎結合 |
-| 試行間学習（Reflexion） | △ | ○ | ◎ 一級機能 |
-| 適合スコープ | PoC | 組織運用 | PoC→本格を連続カバー |
-| runtime 依存（pane/tmux/renga） | 低 | 高 | 低〜中（段階的） |
+| Implementation cost (initial) | ◎ minimal | △ high | ○ medium |
+| Runaway resistance | △ limits only | ◎ | ◎ dual termination + invariants |
+| Observability | △ | ◎ | ○ -> ◎ (OTel + journal) |
+| Org asset reuse | △ limited | ◎ maximum, but runtime-coupled | ◎ maximum as abstractions, loosely coupled |
+| Cross-attempt learning (Reflexion) | △ | ○ | ◎ first-class feature |
+| Fit to scope | PoC | organization operations | Continuous coverage from PoC to full system |
+| runtime dependency (pane/tmux/renga) | low | high | low to medium (phased) |
 
-### 4.3 推奨案と根拠
+### 4.3 Recommendation and Rationale
 
-**案C を推奨する。**
+**This report recommends Option C.**
 
-**根拠**:
-1. 調査が示した業界標準（**二重終了条件**[^framework-common]、**内側ReAct+外側Reflexion**[^react][^reflexion]、**状態の外部 SoT**[^harness]、**合成可能 condition**[^autogen]、**限定的人間ゲート**[^hitl][^verify-hitl]）を**単一アーキで全て自然に満たす**のは案C のみ。
-2. claude-org の最重要資産 `state.db`（SoT・transaction・post-commit snapshot・WAL 並行アクセス）が案C の「共有状態機械」に**ほぼそのまま嵌まる**（§3.4）。
-3. **PoC→本格の連続性**: 案A を案C の最小構成（状態機械1ノード + ハード上限のみ）として実装でき、資産を段階的に足すだけで本格へ到達する。アーキの作り直しが不要（"simpler loops win" と段階導入の両立）。
-4. runtime 依存（pane/tmux/renga/broker）を **transport 抽象 seam**（`tools/transport.py` パターン）で疎結合化でき、案B の重さを回避しつつ本番品質の通知・人間ゲートを後付けできる。
+**Rationale**:
 
-**却下理由**: 案A は試行間学習・観測・人間ゲートが構造的に不足し本格化で作り直しになる。案B は単体プロジェクトに対し runtime 結合が過剰で PoC に不適。
+1. Option C is the only option that naturally satisfies all industry-standard patterns shown by the research under a **single architecture**: **dual termination conditions**[^framework-common], **inner ReAct + outer Reflexion**[^react][^reflexion], **external state SoT**[^harness], **composable conditions**[^autogen], and **limited human gates**[^hitl][^verify-hitl].
+2. claude-org's most important asset, `state.db` (SoT, transactions, post-commit snapshots, WAL concurrent access), fits **almost directly** into Option C's shared state machine (§3.4).
+3. **Continuity from PoC to full system**: Option A can be implemented as the minimal form of Option C, namely a one-node state machine plus hard limits only. Production capability can then be reached by gradually adding assets. No architectural rewrite is required, preserving both "simpler loops win" and phased adoption.
+4. Runtime dependencies such as pane/tmux/renga/broker can be loosely coupled through the **transport abstraction seam** pattern in `tools/transport.py`, avoiding Option B's weight while still allowing production-quality notification and human gates to be added later.
 
-### 4.4 コアループの構造
+**Reasons for rejecting the other options**: Option A structurally lacks cross-attempt learning, observability, and human gates, so it would need to be rebuilt for production. Option B is over-coupled to runtime for a standalone project and is not appropriate for a PoC.
 
-推奨する LoopAgent のコア制御フロー（擬似コード。実装ではなく設計の骨格）:
+### 4.4 Core Loop Structure
+
+Recommended core control flow for LoopAgent (pseudocode; design skeleton, not implementation):
 
 ```text
 LoopAgent.run(goal, guardrails):
-  state = StateDB.load_or_init(run_id)          # R4: 外部SoT。resume 対応
-  conditions = compose(                          # R2/R3: 二重終了条件（合成可能オブジェクト）
-      GoalMet(verifier),                         #   意味的: 検証可能ゴール（test/lint/rubric）
-      MaxIterations(n), TokenBudget(b), Timeout(t),  # 機械的: ハード上限（不変条件）
-      NoProgress(window=N, repeat=3),            #   無進捗/反復検出
-      HumanGate(on=irreversible_actions))        # R6: 不可逆操作のみ
-  emit(otel, "loop_begin", state)               # R7: 観測
+  state = StateDB.load_or_init(run_id)          # R4: external SoT. Supports resume
+  conditions = compose(                          # R2/R3: dual termination conditions (composable objects)
+      GoalMet(verifier),                         #   semantic: verifiable goal (test/lint/rubric)
+      MaxIterations(n), TokenBudget(b), Timeout(t),  # mechanical: hard limits (invariants)
+      NoProgress(window=N, repeat=3),            #   no-progress/repetition detection
+      HumanGate(on=irreversible_actions))        # R6: irreversible operations only
+  emit(otel, "loop_begin", state)               # R7: observation
 
   while not conditions.any_triggered(state):
-    # ── 内側: ReAct エピソード（gather → act → verify）─────────
-    ctx   = curate_context(state)               # context engineering（履歴を SoT から再構成）
-    act   = model.decide(goal, ctx)             # Thought → Action
+    # -- Inner: ReAct episode (gather -> act -> verify) ----------
+    ctx   = curate_context(state)               # context engineering (reconstruct history from SoT)
+    act   = model.decide(goal, ctx)             # Thought -> Action
     if act.is_irreversible and HumanGate.active:
-        decision = human_gate(act)              # approve/edit/reject/respond（state 永続化）
+        decision = human_gate(act)              # approve/edit/reject/respond (state persistence)
         if decision.rejected: state.record(decision); continue
-    obs   = execute(act)                         # Action → Observation
-    signal = verify(obs)                         # R1: ground truth（test/lint/exit-code）
+    obs   = execute(act)                         # Action -> Observation
+    signal = verify(obs)                         # R1: ground truth (test/lint/exit-code)
     state.append_step(act, obs, signal)          # R4: transaction + journal event
     emit(otel, "loop_step", {act, signal, cost})
 
-    # ── 外側: Reflexion（試行をまたぐ言語的自己改善）───────────
+    # -- Outer: Reflexion (linguistic self-improvement across attempts) ----------
     if episode_ended(signal):
-        reflection = reflect(state.trajectory, signal)   # 失敗→言語的指針
-        state.memory.append(reflection)          # R5: episodic memory（次 ctx に「配線」）
+        reflection = reflect(state.trajectory, signal)   # failure -> linguistic guidance
+        state.memory.append(reflection)          # R5: episodic memory (wired into next ctx)
 
   reason = conditions.first_triggered(state)
   emit(otel, "loop_end", {reason, state.metrics})
-  return finalize(state, reason)                 # graceful: 上限到達は例外でなく制御出力
+  return finalize(state, reason)                 # graceful: reaching a limit is control output, not an exception
 ```
 
-要点:
-- **終了条件は while ガードに集約**し、いずれか発火で**理由付き graceful 終了**（OpenAI の error_handlers パターン[^openai-sdk]）。
-- **verify なき step を作らない**（原則2）。verify は安価なルール（test/lint）を一次、LLM-as-judge は限定（原則: ground-truth 優先[^judge]）。
-- **reflection は episode 境界でのみ**走り、反復上限と「改善頭打ちなら停止」で肥大化・劣化を防ぐ[^self-improve]。
-- **state は毎 step transaction で永続化**（resume・観測・監査の単一根拠）。
+Key points:
 
-### 4.5 ループ制御（終了・収束・予算・人間ゲート・暴走・観測）
+- **Aggregate termination conditions in the while guard** and perform **graceful termination with a reason** when any condition fires, following OpenAI's error_handlers pattern[^openai-sdk].
+- **Do not create a step without verify** (Principle 2). Verification should first use cheap rules such as test/lint, and LLM-as-judge should be limited; principle: prefer ground truth[^judge].
+- **Run reflection only at episode boundaries**, and prevent bloat/degradation with iteration limits and "stop when improvement plateaus"[^self-improve].
+- **Persist state in a transaction on every step**, providing the single basis for resume, observation, and audit.
 
-| 制御 | 設計 | 由来資産 / 調査 |
+### 4.5 Loop Control: Termination, Convergence, Budget, Human Gates, Runaway, Observation
+
+| Control | Design | Source asset / research |
 |---|---|---|
-| **終了条件** | GoalMet（意味的）+ MaxIterations/TokenBudget/Timeout（機械的）+ NoProgress を合成オブジェクトで OR 評価 | §2.5,§2.6 / state-semantics contract |
-| **収束判定** | evaluator rubric 閾値超え or スコア改善量が閾値未満（頭打ち）or 反復上限 | §2.6（AWS reflect-refine） |
-| **コスト制御** | per-call max_tokens + セッション/日次予算 + turn カウンタ + サーキットブレーカ。累積を state.db に記録し3xスパイク検知を後付け可能に | §2.6 / state_db |
-| **人間ゲート** | 不可逆・影響範囲大のみ interrupt。approve/edit/reject/respond の4種。状態永続化で pause/resume | §2.6 / org-escalation + pending_decisions |
-| **暴走防止** | 無進捗N・反復アクション3回の打ち切り + ハード上限 + 全停止スイッチ（CLAUDE_CODE_DISABLE_CRON 相当） | §2.3,§2.4 |
-| **観測性** | OTel GenAI span（gen_ai.* + 反復番号 + 終了理由）+ journal_append event + attention watcher 連携 | §2.6 / journal_append + attention |
+| **Termination conditions** | Evaluate GoalMet (semantic) + MaxIterations/TokenBudget/Timeout (mechanical) + NoProgress as OR over composable objects | §2.5, §2.6 / state-semantics contract |
+| **Convergence judgment** | evaluator rubric threshold exceeded, score improvement below threshold (plateau), or iteration limit | §2.6 (AWS reflect-refine) |
+| **Cost control** | per-call max_tokens + session/daily budget + turn counter + circuit breaker. Record cumulative usage in state.db so 3x spike detection can be added later | §2.6 / state_db |
+| **Human gate** | Interrupt only irreversible, high-blast-radius actions. Four decisions: approve/edit/reject/respond. Persist state for pause/resume | §2.6 / org-escalation + pending_decisions |
+| **Runaway prevention** | Stop after no-progress N or three repeated actions + hard limits + global stop switch equivalent to `CLAUDE_CODE_DISABLE_CRON` | §2.3, §2.4 |
+| **Observability** | OTel GenAI spans (`gen_ai.*` + iteration number + termination reason) + journal_append events + attention watcher integration | §2.6 / journal_append + attention |
 
-### 4.6 org 資産の活用方針（対応表）
+### 4.6 Policy for Using org Assets: Mapping Table
 
-| LoopAgent コンポーネント | 採用する org 資産 | 抽出形態 | 段階 |
+| LoopAgent component | org asset to adopt | Extraction form | Phase |
 |---|---|---|---|
-| 共有状態機械の SoT | `tools/state_db/`（schema + StateWriter + queries + snapshotter + WAL） | runtime 非依存ライブラリとして adapt（loop カラム/event 追加） | MVP |
-| 終了条件・状態の型 | state-semantics / delegation-lifecycle contract | reference（Loop State Semantics を新規策定） | MVP |
-| wake 配送・通知 | transport（push一次/pull fallback, at-most-once）, peer_notify | パターン抽出 + transport seam | 本格 |
-| self-improving | org-retro / org-curate / knowledge（4要素, 閾値起動, skill-candidates） | adapt（Reflexion memory + eval loop に接続） | 本格 |
-| 観測・暴走検知 | journal_append, attention-watcher, pr_watch | reuse-as-is / adapt + OTel 追加 | MVP→本格 |
-| 人間ゲート | org-escalation + pending_decisions（state machine） | reuse-as-is（role 読み替え） | MVP |
-| 次反復の入力選定 | work-discovery（計算層 + 配達層二層分離, 決定的ツール） | adapt（計算層 reuse, 配達層は新設計） | 本格 |
-| 状態保存・再開 | handover/resume パターン, resume-safe loop state | reuse-as-is | MVP |
+| SoT for shared state machine | `tools/state_db/` (schema + StateWriter + queries + snapshotter + WAL) | adapt as runtime-independent library, adding loop columns/events | MVP |
+| Termination-condition and state types | state-semantics / delegation-lifecycle contract | reference; create new Loop State Semantics | MVP |
+| Wake delivery and notification | transport (push primary/pull fallback, at-most-once), peer_notify | pattern extraction + transport seam | Full |
+| self-improving | org-retro / org-curate / knowledge (four elements, threshold-triggered, skill-candidates) | adapt and connect to Reflexion memory + eval loop | Full |
+| Observation and runaway detection | journal_append, attention-watcher, pr_watch | reuse-as-is / adapt + add OTel | MVP -> Full |
+| Human gate | org-escalation + pending_decisions (state machine) | reuse-as-is, reinterpret roles | MVP |
+| Input selection for next iteration | work-discovery (two-layer separation of computation layer and delivery layer, deterministic tool) | adapt computation layer; design new delivery layer | Full |
+| State save and resume | handover/resume pattern, resume-safe loop state | reuse-as-is | MVP |
 
 ---
 
-## 5. 段階ロードマップ（PoC → MVP → 本格）
+## 5. Phased Roadmap: PoC -> MVP -> Full System
 
-### Phase 1: PoC — 「最小ループ + ハード上限」
+### Phase 1: PoC — "Minimal Loop + Hard Limits"
 
-- **ゴール**: 案C の最小構成（状態機械1ノード）で `gather → act → verify → repeat` を回し、**機械的上限で確実に止まる**ことを実証する。
-- **スコープ**: 単一エージェント・単一プロセス。verify は1種（例: テスト green）。終了は MaxIterations + TokenBudget + Timeout のみ。状態は最小（progress ファイル or 軽量 SQLite）。人間ゲートなし（不可逆操作を出さないタスクに限定）。
-- **使う資産**: なし〜最小（決定的 exit-code ツールの作法、Agent SDK の `max_turns`/`max_budget_usd`）。
-- **成功条件**: (a) 検証可能ゴール達成で自然終了、(b) 未達でも上限で必ず停止、(c) AutoGPT 的暴走（無限ループ・コスト爆発）を再現しないことを sandbox で確認。
-- **リスク**: スコープを欲張ると "simpler loops win" を破る。1タスク種・1 verify に絞る。
+- **Goal**: demonstrate that the minimal form of Option C, a one-node state machine, can run `gather -> act -> verify -> repeat` and **reliably stop on mechanical limits**.
+- **Scope**: single agent, single process. One verification type, such as tests green. Termination uses only MaxIterations + TokenBudget + Timeout. State is minimal, such as a progress file or lightweight SQLite. No human gate; restrict to tasks that do not emit irreversible actions.
+- **Assets used**: none to minimal, such as deterministic exit-code tool conventions and Agent SDK `max_turns`/`max_budget_usd`.
+- **Success criteria**: (a) natural termination when the verifiable goal is met; (b) guaranteed stop on limits even if the goal is unmet; (c) sandbox confirmation that AutoGPT-style runaway behavior, such as infinite loops or cost explosion, is not reproduced.
+- **Risk**: expanding scope too early breaks "simpler loops win." Restrict to one task type and one verify method.
 
-### Phase 2: MVP — 「状態機械 + state.db SoT + 二重終了条件 + 観測」
+### Phase 2: MVP — "State Machine + state.db SoT + Dual Termination Conditions + Observation"
 
-- **ゴール**: PoC を案C 骨格へ拡張。**状態を state.db に外出し**し、**resume・観測・二重終了条件・限定人間ゲート**を備えた実用ループにする。
-- **スコープ**: 内側 ReAct ループ確立。終了条件を合成オブジェクト化（GoalMet + 機械的上限 + NoProgress）。観測を journal event + OTel span で構造化。人間ゲートを org-escalation + pending_decisions で不可逆操作に限定導入。状態保存/再開（handover/resume）。
-- **使う資産**: `tools/state_db/`（adapt: loop カラム/event 追加）、state/delegation contract（reference）、journal_append（reuse）、org-escalation + pending_decisions（reuse）、handover/resume（reuse）。
-- **成功条件**: (a) 中断→resume が状態欠落なく動く、(b) 全終了理由が journal に残り事後解析できる、(c) 不可逆操作で人間ゲートが発火し approve/reject が反映される、(d) NoProgress 検出で循環を打ち切れる。
-- **リスク**: state.db を runtime 非依存に抽出する際の結合度。最初に「loop 用最小スキーマ」を切り出し、org 本体と疎結合を保つ。
+- **Goal**: extend the PoC into the Option C skeleton. **Externalize state into state.db** and provide a practical loop with **resume, observability, dual termination conditions, and limited human gates**.
+- **Scope**: establish inner ReAct loop. Convert termination conditions into composable objects: GoalMet + mechanical limits + NoProgress. Structure observation as journal events + OTel spans. Introduce a human gate through org-escalation + pending_decisions, limited to irreversible actions. Add state save/resume through handover/resume.
+- **Assets used**: `tools/state_db/` (adapt: add loop columns/events), state/delegation contract (reference), journal_append (reuse), org-escalation + pending_decisions (reuse), handover/resume (reuse).
+- **Success criteria**: (a) interrupt -> resume works without state loss; (b) all termination reasons remain in the journal for later analysis; (c) human gate fires for irreversible operations and approve/reject is reflected; (d) NoProgress detection can stop cycles.
+- **Risk**: coupling when extracting state.db as runtime-independent. First extract a minimal schema for loops and keep it loosely coupled to the org body.
 
-### Phase 3: 本格 — 「フィードバックループ + transport + 入力選定を統合した自律 LoopAgent」
+### Phase 3: Full System — "Autonomous LoopAgent Integrating Feedback Loops + transport + Input Selection"
 
-- **ゴール**: 外側 Reflexion ループと self-improving、wake 配送、次反復の自律的入力選定を統合し、**長時間・複数タスクを自律で回す** LoopAgent にする。
-- **スコープ**: 外側 Reflexion（試行間 episodic memory）を org-retro/curate/knowledge に接続（eval→反映→再評価を有限回）。transport（push一次/pull fallback）で wake/通知を二重化。work-discovery で次反復対象を提案（人間ゲート維持）。subagent で context 隔離した並行サブタスク。OTel 観測の dashboard 化と3xスパイク自動スロットル。
-- **使う資産**: transport + peer_notify（extract-pattern）、org-retro/curate/knowledge（adapt）、work-discovery（adapt）、attention-watcher/pr_watch（adapt）、suspend（adapt）。
-- **成功条件**: (a) 失敗トラジェクトリからの学びが次ループの context に「配線」され eval で改善が確認できる、(b) backend 不通でも pull fallback で配送が継続、(c) 暴走時に自動スロットル + 人間 alert、(d) 完了→次反復の接続が人間ゲート越しに自律で回る。
-- **リスク**: self-improving の罠（出力肥大化・reward hacking・memory 汚染）。**早期停止・多様評価・性能測定と本番実行の分離（dual-component）・memory 取込前検証**を必須化する[^self-improve]。
+- **Goal**: integrate the outer Reflexion loop, self-improving, wake delivery, and autonomous selection of the next iteration target into a LoopAgent that **runs long-duration, multi-task work autonomously**.
+- **Scope**: connect outer Reflexion, or cross-attempt episodic memory, to org-retro/curate/knowledge with finite eval -> reflect -> re-evaluate cycles. Use transport (push primary/pull fallback) to duplicate wake/notification delivery. Use work-discovery to propose next iteration targets while maintaining the human gate. Use subagents for parallel subtasks with isolated context. Add dashboards for OTel observation and automatic throttling on 3x spikes.
+- **Assets used**: transport + peer_notify (extract-pattern), org-retro/curate/knowledge (adapt), work-discovery (adapt), attention-watcher/pr_watch (adapt), suspend (adapt).
+- **Success criteria**: (a) learning from failed trajectories is wired into the next loop's context and improvement is confirmed through eval; (b) delivery continues through pull fallback even when the backend is unavailable; (c) runaway behavior triggers automatic throttling plus human alert; (d) completion -> next iteration connection runs autonomously through the human gate.
+- **Risk**: self-improving traps: output bloat, reward hacking, and memory pollution. Make **early stopping, diverse evaluation, separation of performance measurement from production execution (dual-component), and validation before memory ingestion** mandatory invariants[^self-improve].
 
-```
-Phase 1 (PoC)      Phase 2 (MVP)              Phase 3 (本格)
+```text
+Phase 1 (PoC)      Phase 2 (MVP)              Phase 3 (Full)
 ─────────────      ─────────────              ──────────────
-最小ループ      →  状態機械+state.db SoT   →  +Reflexion/feedback
-ハード上限         二重終了条件+観測          +transport(wake)
-(案A相当)          限定人間ゲート/resume      +work-discovery(入力選定)
-                   (案C骨格)                  (案C+org資産フル/案B級の堅牢性)
+minimal loop    -> state machine+state.db SoT -> +Reflexion/feedback
+hard limits        dual termination+observ.      +transport(wake)
+(Option A equiv.)  limited human gate/resume      +work-discovery(input selection)
+                   (Option C skeleton)            (Option C+full org assets/Option B-grade robustness)
 ```
 
 ---
 
-## 6. リスクと未解決論点
+## 6. Risks and Open Questions
 
-- **self-improving の安全性**: reflection の出力肥大化・劣化、reward hacking、memory 汚染（敵対環境での false lesson 注入）[^self-improve][^ooda]。→ Phase 3 で dual-component 分離・早期停止・取込前検証を不変条件化。
-- **LLM-as-judge の信頼性**: position/self-preference バイアス[^judge]。→ ground-truth 検証（test/lint/string match）を一次、judge は rubric + キャリブレーション限定。
-- **state.db の抽出度**: org 本体との結合。→ loop 用最小スキーマを切り出し疎結合化。SQLite は swap 可だが transaction SoT 性は維持必須。
-- **transport の runtime 依存**: broker sidecar 等は runtime 所属で直接再利用不可[^framework-common]。→ パターン（push一次/pull fallback, at-most-once, role 別 cadence）のみ抽出し、loop-agent 側の配送実体は別実装。
-- **概念の流動性**: Loop Engineering は2026年時点で急進化中の実務概念。→ 設計判断は Anthropic 公式 docs と論文系譜にアンカーし、ブログ主張は二次情報として扱う（本レポートの方針）。
-- **governed workspace**: 本番自律には ID・スコープ権限・監査証跡・高速ロールバックが第6要素[^le-stack]。→ Phase 2 以降で監査ログ（journal）と rollback を設計に織り込む。
-
----
-
-## 7. 付録
-
-### 7.1 用語集
-
-- **ground truth**: 各ステップで環境から得る客観的検証信号（tool 実行結果・テスト/lint の exit code 等）。
-- **二重終了条件**: 意味的判定（critic/eval/特定文字列）と機械的上限（反復・トークン・時間）を独立に併設する設計。
-- **at-most-once**: メッセージを drain したら消費確定し redelivery しない配送保証。受信側は idempotent handler を前提とする。
-- **SoT（Source of Truth）**: 状態の唯一の正本。claude-org では `state.db`、派生物（markdown/JSON）は自動再生成。
-- **Reflexion 型外側ループ**: 試行をまたいで失敗を言語的フィードバックに変換し episodic memory に蓄積して次試行を改善するループ。
-- **escalate シグナル**: sub-agent が共有 state/event 経由でループ制御層に停止を通知する疎結合な終了プロトコル（ADK 由来）。
-
-### 7.2 主要出典一覧
-
-調査の主要出典（各主張の脚注に対応）。Loop Engineering 系のブログは実務家発の二次情報、Anthropic 公式 docs・arXiv 論文は一次アンカーとして扱った。
-
-[^le-def]: Loop Engineering の定義（goal-based automation / trigger + verifiable goal）。 https://www.mindstudio.ai/blog/what-is-loop-engineering-ai-coding-agents , https://datasciencedojo.com/blog/agentic-loops-explained-from-react-to-loop-engineering-2026-guide/
-[^le-origin]: 用語の起源（Boris Cherny 発言の拡散、Addy Osmani / Peter Steinberger）。 https://www.productmarketfit.tech/p/stop-prompting-ai-and-start-building , https://datasciencedojo.com/blog/agentic-loops-explained-from-react-to-loop-engineering-2026-guide/
-[^le-stack]: prompt→context→loop の3層スタックと governed workspace。 https://www.puppyone.ai/en/blog/what-is-loop-engineering-5-building-blocks-missing-one
-[^ctx-eng]: Anthropic「Effective context engineering for AI agents」（agents = LLMs using tools in a loop）。 https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
-[^oracle-loop]: Oracle「What is the AI agent loop」。 https://blogs.oracle.com/developers/what-is-the-ai-agent-loop-the-core-architecture-behind-autonomous-ai-systems
-[^react]: ReAct（Yao et al., ICLR 2023, arXiv:2210.03629）。 https://arxiv.org/abs/2210.03629 , https://react-lm.github.io/
-[^reflexion]: Reflexion（Shinn et al., NeurIPS 2023, arXiv:2303.11366）。 https://arxiv.org/abs/2303.11366
-[^self-refine]: Self-Refine（Madaan et al., NeurIPS 2023, arXiv:2303.17651）。 https://arxiv.org/abs/2303.17651
-[^plan-exec]: Plan-and-Execute（LangChain/LangGraph）。 https://www.langchain.com/blog/planning-agents
-[^ooda]: OODA loop と security trilemma（Schneier）。 https://www.schneier.com/blog/archives/2025/10/agentic-ais-ooda-loop-problem.html
-[^babyagi]: BabyAGI の系譜（105行 PoC・終了条件なし・9世代進化）。 https://babyagi.wiki/ , https://yoheinakajima.com/birth-of-babyagi/
-[^autogpt-fail]: AutoGPT の失敗ケーススタディ。 https://github.com/vectara/awesome-agent-failures/blob/main/docs/case-studies/autogpt-planning-failures.md , https://en.wikipedia.org/wiki/AutoGPT
-[^agentgpt]: AgentGPT（Reworkd）。 https://www.datacamp.com/tutorial/agentgpt , https://github.com/reworkd/agentgpt
-[^simpler]: 「simpler loops win」/ notorious agent loops。 https://techtalkwithsriks.medium.com/notorious-agent-loops-c4cc05b859b5 , https://www.ibm.com/think/topics/babyagi
-[^anthropic-bea]: Anthropic「Building Effective Agents」。 https://www.anthropic.com/engineering/building-effective-agents , https://www.anthropic.com/research/building-effective-agents
-[^agent-sdk-loop]: Claude Agent SDK agent loop（gather→act→verify→repeat, max_turns/max_budget_usd）。 https://code.claude.com/docs/en/agent-sdk/agent-loop
-[^agent-sdk-blog]: Building agents with the Claude Agent SDK（verify 3方式）。 https://claude.com/blog/building-agents-with-the-claude-agent-sdk
-[^harness]: Anthropic「Effective harnesses for long-running agents」。 https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
-[^scheduled]: Claude Code scheduled tasks（cloud/Desktop//loop の3層, 7日失効）。 https://code.claude.com/docs/en/scheduled-tasks
-[^cursor-devin]: Cursor / Devin の自律ループ。 https://cursor.com/blog/agent-best-practices , https://cognition.ai/blog/devin-annual-performance-review-2025
-[^adk]: Google ADK LoopAgent。 https://adk.dev/agents/workflow-agents/loop-agents/ , https://google.github.io/adk-docs/agents/workflow-agents/loop-agents/
-[^autogen]: AutoGen termination conditions。 https://microsoft.github.io/autogen/stable//user-guide/agentchat-user-guide/tutorial/termination.html
-[^langgraph]: LangGraph graph API / recursion_limit。 https://docs.langchain.com/oss/python/langgraph/graph-api
-[^crewai]: CrewAI Flows / max_iter。 https://docs.crewai.com/en/concepts/flows , https://github.com/crewAIInc/crewAI/issues/3847
-[^openai-sdk]: OpenAI Agents SDK running agents（max_turns/error_handlers）。 https://openai.github.io/openai-agents-python/running_agents/
-[^framework-common]: フレームワーク共通の二重終了構造。 https://adk.dev/agents/workflow-agents/loop-agents/ , https://rajatpandit.com/ai-engineering/optimizing-langgraph-cycles/
-[^term]: 終了戦略（自然完了/最大反復/目標達成/エラー, 5–10反復目安）。 https://www.mindstudio.ai/blog/what-is-an-agentic-loop-ai-coding-agents
-[^loop-detect]: 無限会話防止（無進捗/反復検出の閾値）。 https://dev.to/alessandro_pignati/stop-the-loop-how-to-prevent-infinite-conversations-in-your-ai-agents-ekj
-[^converge]: AWS evaluator reflect-refine loop。 https://docs.aws.amazon.com/prescriptive-guidance/latest/agentic-ai-patterns/evaluator-reflect-refine-loop-patterns.html
-[^cost]: エージェント暴走コスト対策。 https://relayplane.com/blog/agent-runaway-costs-2026 , https://www.truefoundry.com/blog/rate-limiting-ai-agents-preventing-llm-api-exhaustion
-[^hitl]: LangGraph human-in-the-loop（interrupt, approve/edit/reject/respond）。 https://docs.langchain.com/oss/python/langchain/human-in-the-loop
-[^otel]: OpenTelemetry GenAI observability。 https://opentelemetry.io/blog/2025/ai-agent-observability/ , https://greptime.com/blogs/2026-05-09-opentelemetry-genai-semantic-conventions
-[^self-improve]: self-improving agent の罠と緩和。 https://www.buildmvpfast.com/blog/ai-agent-self-improvement-recursive-accuracy-production-2026 , https://datagrid.com/blog/7-tips-build-self-improving-ai-agents-feedback-loops
-[^judge]: LLM-as-judge のバイアス。 https://arxiv.org/abs/2406.07791 , https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
-[^v-le-def]: 独立検証（Loop Engineering 定義, supported）。 https://smartscope.blog/en/generative-ai/methodology/loop-engineering-agent-loops-2026/ , https://www.firecrawl.dev/blog/loop-engineering
-[^v-react]: 独立検証（ReAct, supported, 原論文逐語一致）。 https://arxiv.org/abs/2210.03629 , https://www.promptingguide.ai/techniques/react
-[^v-babyagi]: 独立検証（BabyAGI 105行・終了条件なし, supported）。 https://babyagi.wiki/ , https://github.com/yoheinakajima/babyagi
-[^v-bea]: 独立検証（Anthropic 最小構成 + workflow/agent 区別, supported）。 https://www.anthropic.com/research/building-effective-agents
-[^v-adk]: 独立検証（ADK LoopAgent 終了2系統, supported）。 https://adk.dev/agents/workflow-agents/loop-agents/
-[^v-framework]: 独立検証（フレームワーク共通の二重終了, supported）。 https://microsoft.github.io/autogen/stable//user-guide/agentchat-user-guide/tutorial/termination.html
-[^verify-hitl]: 独立検証（人間ゲートは「全ステップ標準」でなく不可逆操作限定, partly-supported の補正）。 https://www.mindstudio.ai/blog/how-to-build-agentic-loop-claude-code , https://stevekinney.com/writing/agent-loops
+- **Safety of self-improving**: reflection output bloat/degradation, reward hacking, and memory pollution, including false-lesson injection in adversarial environments[^self-improve][^ooda]. -> In Phase 3, make dual-component separation, early stopping, and validation before ingestion invariants.
+- **Reliability of LLM-as-judge**: position/self-preference bias[^judge]. -> Use ground-truth verification (test/lint/string match) first, and limit judge use to rubric + calibration.
+- **Extraction level of state.db**: coupling with the org body. -> Extract a minimal schema for loops and keep it loosely coupled. SQLite can be swapped, but transactional SoT properties must be preserved.
+- **Runtime dependency of transport**: broker sidecars and similar pieces belong to the runtime and cannot be reused directly[^framework-common]. -> Extract only the patterns: push primary/pull fallback, at-most-once, role-specific cadence. Implement the actual delivery mechanism separately on the loop-agent side.
+- **Fluidity of the concept**: Loop Engineering is a rapidly evolving practitioner concept as of 2026. -> Anchor design decisions in official Anthropic docs and the research-paper lineage, treating blog claims as secondary information, as this report does.
+- **governed workspace**: production autonomy requires identity, scoped permissions, audit trails, and fast rollback as a sixth element[^le-stack]. -> From Phase 2 onward, include audit logs (journal) and rollback in the design.
 
 ---
 
-*本レポートは loop-agent の調査・設計フェーズ成果物（v1.0, 2026-06-27）。調査は ultracode workflow による fan-out（19 エージェント: org 資産棚卸し7サブシステム + web 調査6サブ問 + 独立反証検証6件）で実施し、主張は上記出典で裏付け、主要主張は独立エージェントで反証検証した。*
+## 7. Appendix
+
+### 7.1 Glossary
+
+- **ground truth**: objective verification signal obtained from the environment at each step, such as tool execution results or test/lint exit codes.
+- **dual termination conditions**: a design that independently combines semantic judgment (critic/eval/specific text) and mechanical limits (iterations, tokens, time).
+- **at-most-once**: a delivery guarantee where a message is consumed once drained and is not redelivered. The receiver is assumed to use an idempotent handler.
+- **SoT (Source of Truth)**: the single authoritative copy of state. In claude-org, this is `state.db`; derived artifacts such as markdown/JSON are automatically regenerated.
+- **Reflexion-style outer loop**: a loop that converts failure across attempts into linguistic feedback, stores it in episodic memory, and improves the next attempt.
+- **escalate signal**: a loosely coupled termination protocol, derived from ADK, through which a sub-agent notifies the loop control layer to stop via shared state/events.
+
+### 7.2 Main Sources
+
+Main sources used in the research, corresponding to footnotes for each claim. Loop Engineering blogs are treated as practitioner-originated secondary information, while official Anthropic docs and arXiv papers are treated as primary anchors.
+
+[^le-def]: Definition of Loop Engineering (goal-based automation / trigger + verifiable goal). https://www.mindstudio.ai/blog/what-is-loop-engineering-ai-coding-agents , https://datasciencedojo.com/blog/agentic-loops-explained-from-react-to-loop-engineering-2026-guide/
+[^le-origin]: Origin of the term (spread of Boris Cherny's comments, Addy Osmani / Peter Steinberger). https://www.productmarketfit.tech/p/stop-prompting-ai-and-start-building , https://datasciencedojo.com/blog/agentic-loops-explained-from-react-to-loop-engineering-2026-guide/
+[^le-stack]: Three-layer prompt -> context -> loop stack and governed workspace. https://www.puppyone.ai/en/blog/what-is-loop-engineering-5-building-blocks-missing-one
+[^ctx-eng]: Anthropic, "Effective context engineering for AI agents" (agents = LLMs using tools in a loop). https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+[^oracle-loop]: Oracle, "What is the AI agent loop." https://blogs.oracle.com/developers/what-is-the-ai-agent-loop-the-core-architecture-behind-autonomous-ai-systems
+[^react]: ReAct (Yao et al., ICLR 2023, arXiv:2210.03629). https://arxiv.org/abs/2210.03629 , https://react-lm.github.io/
+[^reflexion]: Reflexion (Shinn et al., NeurIPS 2023, arXiv:2303.11366). https://arxiv.org/abs/2303.11366
+[^self-refine]: Self-Refine (Madaan et al., NeurIPS 2023, arXiv:2303.17651). https://arxiv.org/abs/2303.17651
+[^plan-exec]: Plan-and-Execute (LangChain/LangGraph). https://www.langchain.com/blog/planning-agents
+[^ooda]: OODA loop and security trilemma (Schneier). https://www.schneier.com/blog/archives/2025/10/agentic-ais-ooda-loop-problem.html
+[^babyagi]: BabyAGI lineage (105-line PoC, no termination condition, nine-generation evolution). https://babyagi.wiki/ , https://yoheinakajima.com/birth-of-babyagi/
+[^autogpt-fail]: AutoGPT failure case study. https://github.com/vectara/awesome-agent-failures/blob/main/docs/case-studies/autogpt-planning-failures.md , https://en.wikipedia.org/wiki/AutoGPT
+[^agentgpt]: AgentGPT (Reworkd). https://www.datacamp.com/tutorial/agentgpt , https://github.com/reworkd/agentgpt
+[^simpler]: "simpler loops win" / notorious agent loops. https://techtalkwithsriks.medium.com/notorious-agent-loops-c4cc05b859b5 , https://www.ibm.com/think/topics/babyagi
+[^anthropic-bea]: Anthropic, "Building Effective Agents." https://www.anthropic.com/engineering/building-effective-agents , https://www.anthropic.com/research/building-effective-agents
+[^agent-sdk-loop]: Claude Agent SDK agent loop (gather -> act -> verify -> repeat, max_turns/max_budget_usd). https://code.claude.com/docs/en/agent-sdk/agent-loop
+[^agent-sdk-blog]: Building agents with the Claude Agent SDK (three verification methods). https://claude.com/blog/building-agents-with-the-claude-agent-sdk
+[^harness]: Anthropic, "Effective harnesses for long-running agents." https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+[^scheduled]: Claude Code scheduled tasks (three layers: cloud/Desktop//loop, seven-day expiration). https://code.claude.com/docs/en/scheduled-tasks
+[^cursor-devin]: Autonomous loops in Cursor / Devin. https://cursor.com/blog/agent-best-practices , https://cognition.ai/blog/devin-annual-performance-review-2025
+[^adk]: Google ADK LoopAgent. https://adk.dev/agents/workflow-agents/loop-agents/ , https://google.github.io/adk-docs/agents/workflow-agents/loop-agents/
+[^autogen]: AutoGen termination conditions. https://microsoft.github.io/autogen/stable//user-guide/agentchat-user-guide/tutorial/termination.html
+[^langgraph]: LangGraph graph API / recursion_limit. https://docs.langchain.com/oss/python/langgraph/graph-api
+[^crewai]: CrewAI Flows / max_iter. https://docs.crewai.com/en/concepts/flows , https://github.com/crewAIInc/crewAI/issues/3847
+[^openai-sdk]: OpenAI Agents SDK running agents (max_turns/error_handlers). https://openai.github.io/openai-agents-python/running_agents/
+[^framework-common]: Dual termination structure common to frameworks. https://adk.dev/agents/workflow-agents/loop-agents/ , https://rajatpandit.com/ai-engineering/optimizing-langgraph-cycles/
+[^term]: Termination strategies (natural completion / max iterations / goal achievement / error, 5-10 iteration guideline). https://www.mindstudio.ai/blog/what-is-an-agentic-loop-ai-coding-agents
+[^loop-detect]: Preventing infinite conversations (thresholds for no-progress/repetition detection). https://dev.to/alessandro_pignati/stop-the-loop-how-to-prevent-infinite-conversations-in-your-ai-agents-ekj
+[^converge]: AWS evaluator reflect-refine loop. https://docs.aws.amazon.com/prescriptive-guidance/latest/agentic-ai-patterns/evaluator-reflect-refine-loop-patterns.html
+[^cost]: Measures against runaway agent costs. https://relayplane.com/blog/agent-runaway-costs-2026 , https://www.truefoundry.com/blog/rate-limiting-ai-agents-preventing-llm-api-exhaustion
+[^hitl]: LangGraph human-in-the-loop (interrupt, approve/edit/reject/respond). https://docs.langchain.com/oss/python/langchain/human-in-the-loop
+[^otel]: OpenTelemetry GenAI observability. https://opentelemetry.io/blog/2025/ai-agent-observability/ , https://greptime.com/blogs/2026-05-09-opentelemetry-genai-semantic-conventions
+[^self-improve]: Pitfalls and mitigations for self-improving agents. https://www.buildmvpfast.com/blog/ai-agent-self-improvement-recursive-accuracy-production-2026 , https://datagrid.com/blog/7-tips-build-self-improving-ai-agents-feedback-loops
+[^judge]: LLM-as-judge bias. https://arxiv.org/abs/2406.07791 , https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+[^v-le-def]: Independent verification (Loop Engineering definition, supported). https://smartscope.blog/en/generative-ai/methodology/loop-engineering-agent-loops-2026/ , https://www.firecrawl.dev/blog/loop-engineering
+[^v-react]: Independent verification (ReAct, supported, verbatim match to original paper). https://arxiv.org/abs/2210.03629 , https://www.promptingguide.ai/techniques/react
+[^v-babyagi]: Independent verification (BabyAGI 105 lines, no termination condition, supported). https://babyagi.wiki/ , https://github.com/yoheinakajima/babyagi
+[^v-bea]: Independent verification (Anthropic minimal configuration + workflow/agent distinction, supported). https://www.anthropic.com/research/building-effective-agents
+[^v-adk]: Independent verification (ADK LoopAgent two termination paths, supported). https://adk.dev/agents/workflow-agents/loop-agents/
+[^v-framework]: Independent verification (dual termination common to frameworks, supported). https://microsoft.github.io/autogen/stable//user-guide/agentchat-user-guide/tutorial/termination.html
+[^verify-hitl]: Independent verification (human gates are limited to irreversible operations, not standard for every step; correction of partly-supported claim). https://www.mindstudio.ai/blog/how-to-build-agentic-loop-claude-code , https://stevekinney.com/writing/agent-loops
+
+---
+
+*This report is the deliverable for the research and design phase of loop-agent (v1.0, 2026-06-27). The investigation was conducted through an ultracode workflow fan-out (19 agents: 7 subsystems for org asset inventory + 6 web-research subquestions + 6 independent adversarial verification tasks). Claims are supported by the sources above, and major claims were adversarially verified by independent agents.*
