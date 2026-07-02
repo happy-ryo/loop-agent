@@ -110,3 +110,34 @@ loop-agent translated its own 10 files (290 total Japanese hits) into English wi
 - **Reflexion is often unnecessary for stochastic misses**: Initial failures in this translation task were often *stochastic*, such as haiku dropping one trailing comment in a long file, and a blind retry could pass by resampling. Run 1 (no Reflexion) and Run 2 (Reflexion) had nearly the same cost and result.
 - **Use Reflexion or deterministic pre-processing for repeated structural failures**: If review or verify reports the same issue repeatedly, such as broken generated anchors, unstable link fragments, or the same file receiving the same rejected edit, treat it as systematic. Stop the inner loop with `NoProgress`, turn the failure into a lesson or deterministic normalizer, and resume from persisted state.
 - **Fair scheduling**: Use file-level round robin, starting with the fewest attempts, so one difficult file does not monopolize all iterations.
+
+## Efficient Harness Shape
+
+For large translation jobs, do not let a coding agent repeatedly inspect the
+repository. Use deterministic scanning and patching, and keep the LLM call scoped
+to one chunk:
+
+```bash
+python scripts/efficient_translation_harness.py --dry-run --target docs
+python scripts/efficient_translation_harness.py --codex --target docs --run-id docs-translation \
+  --manifest efficient-translation-manifest.json --batch-size 8
+```
+
+The harness in `scripts/efficient_translation_harness.py` uses this split:
+
+| Stage | Responsibility |
+|---|---|
+| `scan_japanese_chunks` | Find Japanese-containing Markdown lines, Python comments, and Python docstrings without LLM calls. |
+| manifest | Save the initial chunk list so resume replays the same work items instead of re-scanning a changed tree. |
+| `WorkListGather` | Schedule manifest chunks fairly and cap attempts per chunk. |
+| `CodexChunkTranslator` | Send one chunk, or a same-file text chunk batch, and compact constraints to Codex; require JSON output. |
+| `apply_translation` | Patch the line/column-anchored old chunk locally and parse Python after docstring edits. |
+| `verify_patch` | Record a machine-readable patch result; `WorkListDrained` decides completion. |
+
+Use `--batch-size` to amortize the fixed cost of model startup across nearby
+Markdown/text chunks. Keep Python comments and docstrings as single chunks unless
+you add stronger code-aware batching. This keeps loop-agent in charge of state,
+fairness, retry, token budget, and stuck detection while removing repository
+exploration from the model call. It is the preferred starting shape when token
+efficiency matters. For a production translation pipeline, add domain-specific
+normalizers for Markdown anchors and project-specific glossary enforcement.
